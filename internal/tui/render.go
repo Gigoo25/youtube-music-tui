@@ -206,8 +206,7 @@ func (m *model) renderAlbum(w, h int) string {
 		return lipgloss.JoinVertical(lipgloss.Left, heading, styleDim.Render("Album not found."))
 	}
 
-	footer := styleDim.Render("Enter play album from here • p play whole album • a album of track")
-	listH := h - lipgloss.Height(heading) - lipgloss.Height(footer)
+	listH := h - lipgloss.Height(heading)
 	if listH < 1 {
 		listH = 1
 	}
@@ -217,7 +216,7 @@ func (m *model) renderAlbum(w, h int) string {
 	for i := start; i < end; i++ {
 		rows = append(rows, m.renderResultRow(i+1, m.albumTracks[i], i == m.albumCursor, focused, w, false))
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, heading, strings.Join(rows, "\n"), footer)
+	return lipgloss.JoinVertical(lipgloss.Left, heading, strings.Join(rows, "\n"))
 }
 
 // renderBrowse renders an async browse view (Trending / New Releases / Explore).
@@ -237,8 +236,7 @@ func (m *model) renderBrowse(v view, w, h int) string {
 		return lipgloss.JoinVertical(lipgloss.Left, heading, styleDim.Render("Nothing here yet."))
 	}
 
-	footer := styleDim.Render("j/k navigate • Enter queue • p play-now • g refresh")
-	listH := h - lipgloss.Height(heading) - lipgloss.Height(footer)
+	listH := h - lipgloss.Height(heading)
 	if listH < 1 {
 		listH = 1
 	}
@@ -247,7 +245,7 @@ func (m *model) renderBrowse(v view, w, h int) string {
 	for i := start; i < end; i++ {
 		rows = append(rows, m.renderResultRow(i+1, bs.tracks[i], i == bs.cursor, m.focus == focusPanel, w, false))
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, heading, strings.Join(rows, "\n"), footer)
+	return lipgloss.JoinVertical(lipgloss.Left, heading, strings.Join(rows, "\n"))
 }
 
 // ─── Status line ───────────────────────────────────────────────────────────────
@@ -265,54 +263,134 @@ func (m *model) renderStatusLine(w int) string {
 
 // ─── Shortcuts bar ─────────────────────────────────────────────────────────────
 
+// shortcut is one [key] label hint shown in the bottom bar. on highlights an
+// active toggle (e.g. shuffle on) in the success colour.
+type shortcut struct {
+	key   string
+	label string
+	on    bool
+}
+
+// renderShortcutsBar shows every shortcut available in the current context as
+// [key] label hints, wrapping across as many lines as needed.
 func (m *model) renderShortcutsBar(w int) string {
-	playing := !m.playerState.Paused
-	playGlyph := iconPlay
-	if playing {
-		playGlyph = iconPause
-	}
-
-	shuffleStyle := styleDim
-	if m.shuffle {
-		shuffleStyle = stylePrimary
-	}
-
-	repeatGlyph := iconRepeatAll
-	if m.repeat == repeatOne {
-		repeatGlyph = iconRepeatOne
-	}
-	repeatStyle := styleDim
-	if m.repeat != repeatOff {
-		repeatStyle = styleSecondary
-	}
-
-	sep := styleDim.Render(" • ")
-	left := stylePrimary.Render(playGlyph) + styleDim.Render(" [space]") + sep +
-		stylePrimary.Render(iconPrev) + styleDim.Render(" [b]") + sep +
-		stylePrimary.Render(iconNext) + styleDim.Render(" [n]") + sep +
-		shuffleStyle.Render(iconShuffle) + styleDim.Render(" [s]") + sep +
-		repeatStyle.Render(repeatGlyph) + styleDim.Render(" [r]") + sep +
-		stylePrimary.Render(iconSearch) + styleDim.Render(" [/]") + sep +
-		stylePrimary.Render(iconHelp) + styleDim.Render(" [?]")
-
-	vol := int(m.playerState.Volume)
-	right := shuffleStyle.Render(iconShuffle) + " " +
-		repeatStyle.Render(repeatGlyph) + " " +
-		styleDim.Render(iconAutoplay) + "   " +
-		stylePrimary.Render(iconVolume) + styleDim.Render(" [+/-] ") +
-		stylePrimary.Render(fmt.Sprintf("%d%%", vol))
-
-	inner := w - 2 // shortcuts box has a single border
+	inner := w - 2 // box has a single border
 	if inner < 1 {
 		inner = 1
 	}
-	gap := inner - lipgloss.Width(left) - lipgloss.Width(right)
-	if gap < 1 {
-		gap = 1
-	}
-	line := left + strings.Repeat(" ", gap) + right
 
-	return styleShortcutsBox.Width(inner).Render(line)
+	var segs []shortcut
+
+	// Typing in the search box: only the input controls apply.
+	if m.typing() {
+		segs = append(segs,
+			shortcut{"enter", "search", false},
+			shortcut{"esc", "cancel", false},
+			shortcut{"tab", "menu", false},
+		)
+		return styleShortcutsBox.Width(inner).Render(wrapShortcuts(segs, inner))
+	}
+
+	// Playback globals (always available).
+	pp := "play"
+	if m.current != nil && !m.playerState.Paused {
+		pp = "pause"
+	}
+	segs = append(segs,
+		shortcut{"space", pp, false},
+		shortcut{"b", "prev", false},
+		shortcut{"n", "next", false},
+		shortcut{"< >", "seek", false},
+		shortcut{"+/-", fmt.Sprintf("vol %d%%", int(m.playerState.Volume)), false},
+		shortcut{"s", "shuffle", m.shuffle},
+	)
+	repLabel := "repeat"
+	switch m.repeat {
+	case repeatAll:
+		repLabel = "repeat all"
+	case repeatOne:
+		repLabel = "repeat 1"
+	}
+	segs = append(segs, shortcut{"r", repLabel, m.repeat != repeatOff})
+
+	// Context-specific actions.
+	if m.focus == focusSidebar {
+		segs = append(segs,
+			shortcut{"j/k", "move", false},
+			shortcut{"enter", "open", false},
+		)
+	} else {
+		switch m.activeView {
+		case viewSearch:
+			segs = append(segs, shortcut{"j/k", "move", false},
+				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
+				shortcut{"f", "fav", false}, shortcut{"a", "album", false})
+		case viewQueue:
+			segs = append(segs, shortcut{"j/k", "move", false},
+				shortcut{"enter", "play", false}, shortcut{"d", "remove", false},
+				shortcut{"c", "clear", false}, shortcut{"f", "fav", false},
+				shortcut{"a", "album", false})
+		case viewFavorites, viewHistory:
+			segs = append(segs, shortcut{"j/k", "move", false},
+				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
+				shortcut{"f", "fav", false}, shortcut{"a", "album", false})
+		case viewTrending, viewNewReleases, viewExplore:
+			segs = append(segs, shortcut{"j/k", "move", false},
+				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
+				shortcut{"f", "fav", false}, shortcut{"a", "album", false},
+				shortcut{"g", "refresh", false})
+		case viewAlbum:
+			segs = append(segs, shortcut{"j/k", "move", false},
+				shortcut{"enter", "play album", false}, shortcut{"p", "play all", false},
+				shortcut{"f", "fav", false})
+		}
+		segs = append(segs, shortcut{"h", "menu", false})
+	}
+
+	// More globals.
+	segs = append(segs,
+		shortcut{"z", "random", false},
+		shortcut{"R", "radio", false},
+		shortcut{"/", "search", false},
+		shortcut{"?", "help", false},
+		shortcut{"q", "quit", false},
+	)
+
+	return styleShortcutsBox.Width(inner).Render(wrapShortcuts(segs, inner))
+}
+
+// wrapShortcuts renders [key] label segments, greedily wrapping into lines that
+// fit within width.
+func wrapShortcuts(segs []shortcut, width int) string {
+	sep := "  "
+	sepW := lipgloss.Width(sep)
+
+	var lines []string
+	cur := ""
+	curW := 0
+	for _, s := range segs {
+		labelStyle := styleDim
+		if s.on {
+			labelStyle = styleSuccess
+		}
+		seg := stylePrimary.Render("["+s.key+"]") + " " + labelStyle.Render(s.label)
+		segW := lipgloss.Width(seg)
+
+		switch {
+		case cur == "":
+			cur, curW = seg, segW
+		case curW+sepW+segW <= width:
+			cur += sep + seg
+			curW += sepW + segW
+		default:
+			lines = append(lines, cur)
+			cur, curW = seg, segW
+		}
+	}
+	if cur != "" {
+		lines = append(lines, cur)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // ─── Persistent now-playing bar ──────────────────────────────────────────────────
@@ -411,23 +489,12 @@ func (m *model) renderSearch(w, h int) string {
 		used++
 	}
 
-	// Footer hint
-	var hint string
-	if m.searchTyping {
-		hint = "Type to search, Enter to start, Esc to clear"
-	} else {
-		hint = "j/k navigate, Enter play, p play-now, f favorite, / search again"
-	}
-	footer := styleDim.Render(truncate(hint, w))
-
-	// Results list, clamped to remaining height
-	listH := h - used - lipgloss.Height(footer)
+	// Results list fills the remaining height (shortcuts live in the bottom bar).
+	listH := h - used
 	if listH < 1 {
 		listH = 1
 	}
-	list := m.renderResultList(w, listH)
-
-	blocks = append(blocks, list, footer)
+	blocks = append(blocks, m.renderResultList(w, listH))
 	return lipgloss.JoinVertical(lipgloss.Left, blocks...)
 }
 
@@ -600,8 +667,7 @@ func (m *model) renderHistory(w, h int) string {
 		)
 	}
 
-	footer := styleDim.Render("j/k navigate • Enter queue • p play-now")
-	listH := h - lipgloss.Height(heading) - lipgloss.Height(footer)
+	listH := h - lipgloss.Height(heading)
 	if listH < 1 {
 		listH = 1
 	}
@@ -641,7 +707,6 @@ func (m *model) renderHistory(w, h int) string {
 	return lipgloss.JoinVertical(lipgloss.Left,
 		heading,
 		strings.Join(rows, "\n"),
-		footer,
 	)
 }
 
