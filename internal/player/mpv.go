@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -51,13 +52,20 @@ type ipcResp struct {
 func New() (*Player, error) {
 	os.Remove(socketPath)
 
-	cmd := exec.Command("mpv",
+	args := []string{
 		"--no-video",
 		"--idle=yes",
-		"--input-ipc-server="+socketPath,
+		"--input-ipc-server=" + socketPath,
 		"--really-quiet",
 		"--no-terminal",
-	)
+	}
+	// Load mpv-mpris plugin if available so MPRIS-aware shells (noctalia,
+	// playerctl, GNOME, KDE) show the now-playing track and accept controls.
+	if script := findMprisScript(); script != "" {
+		args = append(args, "--script="+script)
+	}
+
+	cmd := exec.Command("mpv", args...)
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start mpv: %w", err)
 	}
@@ -214,6 +222,55 @@ func (p *Player) VolumeDown() error {
 
 func (p *Player) Stop() error {
 	return p.send([]any{"stop"})
+}
+
+// SetTitle sets mpv's force-media-title so MPRIS metadata (xesam:title) shows
+// a clean track name in shells like noctalia instead of the raw stream URL.
+func (p *Player) SetTitle(title string) error {
+	if title == "" {
+		return nil
+	}
+	return p.send([]any{"set_property", "force-media-title", title})
+}
+
+// findMprisScript locates the mpv-mpris plugin (mpris.so). Returns "" if not
+// found, in which case mpv runs without MPRIS support.
+func findMprisScript() string {
+	if p := os.Getenv("YTMUSIC_MPRIS_SCRIPT"); p != "" && fileExists(p) {
+		return p
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		if p := filepath.Join(home, ".config", "mpv", "scripts", "mpris.so"); fileExists(p) {
+			return p
+		}
+	}
+	candidates := []string{
+		"/usr/lib/mpv-mpris/mpris.so",
+		"/usr/lib/x86_64-linux-gnu/mpv-mpris/mpris.so",
+		"/usr/lib/x86_64-linux-gnu/mpris.so",
+		"/usr/local/lib/mpv-mpris/mpris.so",
+		"/etc/mpv/scripts/mpris.so",
+	}
+	for _, p := range candidates {
+		if fileExists(p) {
+			return p
+		}
+	}
+	// NixOS: mpvScripts.mpris lands in the nix store.
+	for _, pat := range []string{
+		"/nix/store/*mpv-mpris*/share/mpv/scripts/mpris.so",
+		"/nix/store/*/share/mpv/scripts/mpris.so",
+	} {
+		if m, _ := filepath.Glob(pat); len(m) > 0 {
+			return m[len(m)-1]
+		}
+	}
+	return ""
+}
+
+func fileExists(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && !info.IsDir()
 }
 
 func (p *Player) State() State {

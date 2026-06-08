@@ -4,13 +4,24 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/rob/ytmusic/internal/api"
 )
 
+const maxHistory = 500
+
+// HistoryEntry records a single play with its timestamp (mirrors the original's
+// history store: newest first, capped, duplicates allowed).
+type HistoryEntry struct {
+	Track    api.Track `json:"track"`
+	PlayedAt time.Time `json:"playedAt"`
+}
+
 type Config struct {
-	Favorites []api.Track `json:"favorites"`
-	Volume    float64     `json:"volume"`
+	Favorites []api.Track    `json:"favorites"`
+	History   []HistoryEntry `json:"history"`
+	Volume    float64        `json:"volume"`
 	path      string
 }
 
@@ -69,4 +80,17 @@ func (c *Config) ToggleFavorite(t api.Track) bool {
 	}
 	c.Favorites = append(c.Favorites, t)
 	return true
+}
+
+// AddHistory records a play at the front of the history list (newest first),
+// capped at maxHistory. Matches the original: each play is its own entry.
+func (c *Config) AddHistory(t api.Track) {
+	if t.ID == "" {
+		return
+	}
+	entry := HistoryEntry{Track: t, PlayedAt: time.Now()}
+	c.History = append([]HistoryEntry{entry}, c.History...)
+	if len(c.History) > maxHistory {
+		c.History = c.History[:maxHistory]
+	}
 }
