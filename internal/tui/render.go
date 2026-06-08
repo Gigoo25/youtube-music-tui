@@ -7,6 +7,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/rob/ytmusic/internal/api"
+	"github.com/rob/ytmusic/internal/player"
 )
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -101,6 +102,7 @@ func (m *model) View() string {
 	if contentH < 1 {
 		contentH = 1
 	}
+	m.viewportH = contentH // remember for page-scroll key handling
 
 	// Two-column layout: Quick Links sidebar | main content panel.
 	sidebarW := innerW / 4
@@ -201,7 +203,7 @@ func (m *model) renderPanel(w, h int) string {
 
 // renderAlbum renders the album-of-a-track view.
 func (m *model) renderAlbum(w, h int) string {
-	heading := stylePrimaryBold.Render("Album: " + m.albumTitle)
+	heading := styleSecondaryBold.Render(iconPlaylist + " Album: " + m.albumTitle)
 
 	switch {
 	case m.albumLoading:
@@ -231,7 +233,7 @@ func (m *model) renderBrowse(v view, w, h int) string {
 	if !ok {
 		return ""
 	}
-	heading := stylePrimaryBold.Render(bs.title)
+	heading := styleSecondaryBold.Render(iconPlaylist + " " + bs.title)
 
 	switch {
 	case bs.loading || !bs.loaded:
@@ -333,6 +335,7 @@ func (m *model) renderShortcutsBar(w int) string {
 				shortcut{"f", "fav", false}, shortcut{"a", "album", false})
 		case viewQueue:
 			segs = append(segs, shortcut{"j/k", "move", false},
+				shortcut{"J/K", "reorder", false},
 				shortcut{"enter", "play", false}, shortcut{"d", "remove", false},
 				shortcut{"c", "clear", false}, shortcut{"f", "fav", false},
 				shortcut{"a", "album", false})
@@ -344,7 +347,7 @@ func (m *model) renderShortcutsBar(w int) string {
 			segs = append(segs, shortcut{"j/k", "move", false},
 				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
 				shortcut{"f", "fav", false}, shortcut{"a", "album", false},
-				shortcut{"g", "refresh", false})
+				shortcut{"ctrl+r", "refresh", false})
 		case viewAlbum:
 			segs = append(segs, shortcut{"j/k", "move", false},
 				shortcut{"enter", "play album", false}, shortcut{"p", "play all", false},
@@ -453,7 +456,32 @@ func (m *model) renderNowBar(w int) string {
 			gap = 1
 		}
 	}
-	return left + strings.Repeat(" ", gap) + right
+	info := left + strings.Repeat(" ", gap) + right
+	return info + "\n" + m.renderProgressBar(w, s)
+}
+
+// renderProgressBar draws a full-width track progress bar (filled blocks for the
+// elapsed fraction, shaded blocks for the rest).
+func (m *model) renderProgressBar(w int, s player.State) string {
+	if w < 1 {
+		w = 1
+	}
+	frac := 0.0
+	if s.Duration > 0 {
+		frac = s.Position / s.Duration
+	}
+	if frac < 0 {
+		frac = 0
+	}
+	if frac > 1 {
+		frac = 1
+	}
+	filled := int(frac * float64(w))
+	if filled > w {
+		filled = w
+	}
+	return stylePrimary.Render(strings.Repeat("█", filled)) +
+		styleDim.Render(strings.Repeat("░", w-filled))
 }
 
 // ─── Search screen ─────────────────────────────────────────────────────────────
@@ -462,6 +490,10 @@ func (m *model) renderSearch(w, h int) string {
 	var blocks []string
 	used := 0
 	// (now-playing is shown in the persistent bottom bar)
+
+	heading := styleSecondaryBold.Render(iconSearch + " Search")
+	blocks = append(blocks, heading)
+	used += lipgloss.Height(heading)
 
 	// Search bar
 	searchInner := w - 4 // single border + padding
@@ -573,11 +605,14 @@ func (m *model) renderResultRow(n int, t api.Track, selected, focused bool, w in
 // ─── Queue screen ──────────────────────────────────────────────────────────────
 
 func (m *model) renderQueue(w, h int) string {
+	header := styleSecondaryBold.Render(fmt.Sprintf("%s Up next (%d tracks)", iconPlaylist, len(m.queue)))
 	if len(m.queue) == 0 {
-		return styleDim.Render("Queue is empty — search and press Enter to add.")
+		return lipgloss.JoinVertical(lipgloss.Left,
+			header,
+			styleDim.Render("Queue is empty — search and press Enter to add."),
+		)
 	}
 
-	header := styleDim.Render(fmt.Sprintf("Up next (%d tracks)", len(m.queue)))
 	listH := h - lipgloss.Height(header)
 	if listH < 1 {
 		listH = 1
@@ -652,7 +687,7 @@ func (m *model) renderFavorites(w, h int) string {
 // ─── History screen ────────────────────────────────────────────────────────────
 
 func (m *model) renderHistory(w, h int) string {
-	heading := stylePrimaryBold.Render("Recently Played")
+	heading := styleSecondaryBold.Render(iconPlaylist + " Recently Played")
 	hist := m.cfg.History
 	if len(hist) == 0 {
 		return lipgloss.JoinVertical(lipgloss.Left,
@@ -722,10 +757,14 @@ func (m *model) renderHelp(w, h int) string {
 		{"enter", "queue / play selected"},
 		{"p", "play now"},
 		{"d / x", "remove from queue"},
+		{"J / K", "move track down / up in queue"},
 		{"c", "clear queue"},
-		{"g", "refresh browse feed"},
+		{"ctrl+r", "refresh browse feed"},
 		{"/", "search"},
 		{"j / k", "navigate list"},
+		{"ctrl+d / ctrl+u", "scroll half page down / up"},
+		{"ctrl+f / ctrl+b", "scroll full page down / up"},
+		{"gg / G", "jump to top / bottom"},
 		{"h / esc", "back to menu / previous"},
 		{"tab", "toggle sidebar / panel focus"},
 		{"1-7", "jump to view (Search…Explore)"},

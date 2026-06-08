@@ -12,7 +12,7 @@ const (
 	iconShuffle   = "⇄"
 	iconRepeatAll = "↻"
 	iconRepeatOne = "↺"
-	iconPlaylist  = "☰"
+	iconPlaylist  = "♫"
 	iconSearch    = "/"
 	iconHelp      = "?"
 	iconDownload  = "↓"

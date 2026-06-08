@@ -81,6 +81,8 @@ type model struct {
 	navCursor  int
 	width      int
 	height     int
+	viewportH  int  // visible list height (set during render), for page scrolling
+	pendingG   bool // first 'g' of a 'gg' (go-to-top) chord was pressed
 
 	// search
 	searchInput   textinput.Model
@@ -118,10 +120,14 @@ type model struct {
 	current     api.Track // the track currently loaded (value copy, not a slice ptr)
 	hasCurrent  bool
 
-	// transient status line
+	// transient status line (auto-clears after statusTTL)
 	status    string
 	statusErr bool
+	statusAt  time.Time
 }
+
+// statusTTL is how long a transient status message stays on screen.
+const statusTTL = 5 * time.Second
 
 type searchDoneMsg struct {
 	tracks []api.Track
@@ -219,6 +225,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.playerState = m.player.State()
 		if m.player.TrackEnded() {
 			m.nextTrack()
+		}
+		// Auto-clear a transient status message once it has been shown long enough.
+		if m.status != "" && time.Since(m.statusAt) >= statusTTL {
+			m.status = ""
+			m.statusErr = false
 		}
 		// Lazily load the active browse view the first time it's opened.
 		if bs, ok := m.browse[m.activeView]; ok && !bs.loaded && !bs.loading {
@@ -354,6 +365,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.searchInput, cmd = m.searchInput.Update(msg)
 		return m, cmd
+	}
+
+	// gg chord: any key other than a second 'g' cancels a pending go-to-top.
+	if msg.String() != "g" {
+		m.pendingG = false
 	}
 
 	// ── Global keys (active in every view when not typing) ──
@@ -542,16 +558,68 @@ func (m *model) goToAlbum() tea.Cmd {
 	}
 }
 
-func (m *model) handleAlbumKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
+// pageSize returns the number of list rows that fit in the panel, used for
+// half/full-page scrolling. Falls back to a sane minimum before the first render.
+func (m *model) pageSize() int {
+	n := m.viewportH - 1 // minus the list header row
+	if n < 1 {
+		n = 10
+	}
+	return n
+}
+
+// vimMove applies vim-style list navigation to a cursor over `total` items and
+// reports whether the key was a navigation key. Handles j/k (and arrows), ctrl+d/
+// ctrl+u (half page), ctrl+f/ctrl+b (full page), G (bottom), and the gg chord
+// (top) via m.pendingG. The returned cursor is clamped to [0, total-1].
+func (m *model) vimMove(key string, cursor, total int) (int, bool) {
+	page := m.pageSize()
+	half := page / 2
+	if half < 1 {
+		half = 1
+	}
+	switch key {
 	case "j", "down":
-		if m.albumCursor < len(m.albumTracks)-1 {
-			m.albumCursor++
-		}
+		cursor++
 	case "k", "up":
-		if m.albumCursor > 0 {
-			m.albumCursor--
+		cursor--
+	case "ctrl+d":
+		cursor += half
+	case "ctrl+u":
+		cursor -= half
+	case "ctrl+f", "pgdown":
+		cursor += page
+	case "ctrl+b", "pgup":
+		cursor -= page
+	case "G", "end":
+		cursor = total - 1
+	case "home":
+		cursor = 0
+	case "g":
+		if !m.pendingG {
+			m.pendingG = true // first 'g'; wait for the second
+			return cursor, true
 		}
+		cursor = 0
+	default:
+		return cursor, false
+	}
+	m.pendingG = false
+	if cursor > total-1 {
+		cursor = total - 1
+	}
+	if cursor < 0 {
+		cursor = 0
+	}
+	return cursor, true
+}
+
+func (m *model) handleAlbumKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if nc, ok := m.vimMove(msg.String(), m.albumCursor, len(m.albumTracks)); ok {
+		m.albumCursor = nc
+		return m, nil
+	}
+	switch msg.String() {
 	case "enter":
 		// Play the whole album starting from the selected track.
 		m.playAlbumFrom(m.albumCursor)
@@ -593,15 +661,11 @@ func (m *model) handleBrowseKey(v view, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if !ok {
 		return m, nil
 	}
+	if nc, ok := m.vimMove(msg.String(), bs.cursor, len(bs.tracks)); ok {
+		bs.cursor = nc
+		return m, nil
+	}
 	switch msg.String() {
-	case "j", "down":
-		if bs.cursor < len(bs.tracks)-1 {
-			bs.cursor++
-		}
-	case "k", "up":
-		if bs.cursor > 0 {
-			bs.cursor--
-		}
 	case "enter":
 		if bs.cursor < len(bs.tracks) {
 			m.enqueue(bs.tracks[bs.cursor])
@@ -610,7 +674,7 @@ func (m *model) handleBrowseKey(v view, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if bs.cursor < len(bs.tracks) {
 			m.playNow(bs.tracks[bs.cursor])
 		}
-	case "g":
+	case "ctrl+r":
 		// reload the feed
 		bs.loaded = false
 		bs.loading = false
@@ -647,15 +711,11 @@ func (m *model) startRadio() tea.Cmd {
 
 func (m *model) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	hist := m.cfg.History
+	if nc, ok := m.vimMove(msg.String(), m.historyCursor, len(hist)); ok {
+		m.historyCursor = nc
+		return m, nil
+	}
 	switch msg.String() {
-	case "j", "down":
-		if m.historyCursor < len(hist)-1 {
-			m.historyCursor++
-		}
-	case "k", "up":
-		if m.historyCursor > 0 {
-			m.historyCursor--
-		}
 	case "enter":
 		if m.historyCursor < len(hist) {
 			m.enqueue(hist[m.historyCursor].Track)
@@ -678,17 +738,11 @@ func (m *model) activateView(v view) {
 
 // handleSidebarKey processes navigation while the Quick Links sidebar is focused.
 func (m *model) handleSidebarKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if nc, ok := m.vimMove(msg.String(), m.navCursor, len(navEntries)); ok {
+		m.navCursor = nc
+		return m, nil
+	}
 	switch msg.String() {
-	case "j", "down":
-		if m.navCursor < len(navEntries)-1 {
-			m.navCursor++
-		}
-		return m, nil
-	case "k", "up":
-		if m.navCursor > 0 {
-			m.navCursor--
-		}
-		return m, nil
 	case "enter", "l", "right":
 		target := navEntries[m.navCursor].view
 		m.activeView = target
@@ -704,15 +758,11 @@ func (m *model) handleSidebarKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if nc, ok := m.vimMove(msg.String(), m.searchCursor, len(m.searchResults)); ok {
+		m.searchCursor = nc
+		return m, nil
+	}
 	switch msg.String() {
-	case "j", "down":
-		if m.searchCursor < len(m.searchResults)-1 {
-			m.searchCursor++
-		}
-	case "k", "up":
-		if m.searchCursor > 0 {
-			m.searchCursor--
-		}
 	case "enter":
 		if len(m.searchResults) > 0 {
 			m.enqueue(m.searchResults[m.searchCursor])
@@ -731,15 +781,15 @@ func (m *model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if nc, ok := m.vimMove(msg.String(), m.queueCursor, len(m.queue)); ok {
+		m.queueCursor = nc
+		return m, nil
+	}
 	switch msg.String() {
-	case "j", "down":
-		if m.queueCursor < len(m.queue)-1 {
-			m.queueCursor++
-		}
-	case "k", "up":
-		if m.queueCursor > 0 {
-			m.queueCursor--
-		}
+	case "J":
+		m.moveQueueItem(m.queueCursor, m.queueCursor+1)
+	case "K":
+		m.moveQueueItem(m.queueCursor, m.queueCursor-1)
 	case "enter", "p":
 		if len(m.queue) > 0 {
 			m.queuePos = m.queueCursor
@@ -778,17 +828,30 @@ func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// moveQueueItem swaps the track at from with the one at to, keeping the cursor on
+// the moved track and queuePos pointing at the still-playing entry. No-op if
+// either index is out of range.
+func (m *model) moveQueueItem(from, to int) {
+	if from < 0 || from >= len(m.queue) || to < 0 || to >= len(m.queue) {
+		return
+	}
+	m.queue[from], m.queue[to] = m.queue[to], m.queue[from]
+	switch m.queuePos {
+	case from:
+		m.queuePos = to
+	case to:
+		m.queuePos = from
+	}
+	m.queueCursor = to
+}
+
 func (m *model) handleFavKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	favs := m.cfg.Favorites
+	if nc, ok := m.vimMove(msg.String(), m.favCursor, len(favs)); ok {
+		m.favCursor = nc
+		return m, nil
+	}
 	switch msg.String() {
-	case "j", "down":
-		if m.favCursor < len(favs)-1 {
-			m.favCursor++
-		}
-	case "k", "up":
-		if m.favCursor > 0 {
-			m.favCursor--
-		}
 	case "enter":
 		if m.favCursor < len(favs) {
 			m.enqueue(favs[m.favCursor])
@@ -964,9 +1027,11 @@ func (m *model) doSearch(query string) tea.Cmd {
 func (m *model) setStatus(s string) {
 	m.status = s
 	m.statusErr = false
+	m.statusAt = time.Now()
 }
 
 func (m *model) setError(s string) {
 	m.status = s
 	m.statusErr = true
+	m.statusAt = time.Now()
 }
