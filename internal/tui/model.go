@@ -23,6 +23,7 @@ const (
 	viewTrending
 	viewNewReleases
 	viewExplore
+	viewAlbum
 	viewHelp
 )
 
@@ -104,6 +105,13 @@ type model struct {
 	// async browse views (Trending / New Releases / Explore)
 	browse map[view]*browseState
 
+	// album view (the album a track belongs to)
+	albumTracks  []api.Track
+	albumCursor  int
+	albumTitle   string
+	albumLoading bool
+	albumErr     string
+
 	// player snapshot (refreshed each tick)
 	playerState player.State
 	current     *api.Track
@@ -145,6 +153,12 @@ type randomDoneMsg struct {
 
 type radioDoneMsg struct {
 	tracks []api.Track
+	err    error
+}
+
+type albumDoneMsg struct {
+	tracks []api.Track
+	title  string
 	err    error
 }
 
@@ -247,6 +261,23 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case albumDoneMsg:
+		m.albumLoading = false
+		m.albumCursor = 0
+		if msg.err != nil {
+			m.albumErr = msg.err.Error()
+		} else {
+			m.albumErr = ""
+			m.albumTracks = msg.tracks
+			if msg.title != "" {
+				m.albumTitle = msg.title
+			}
+			if len(msg.tracks) == 0 {
+				m.setStatus("album not found")
+			}
+		}
+		return m, nil
+
 	case searchDoneMsg:
 		m.searching = false
 		if msg.err != nil {
@@ -301,8 +332,21 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.setStatus("searching...")
 			return m, m.doSearch(query)
 		case "esc":
+			// Stop typing. If there are results, browse them; otherwise (e.g. on
+			// first open with an empty query) move focus to the Quick Links sidebar.
 			m.searchTyping = false
 			m.searchInput.Blur()
+			if len(m.searchResults) == 0 {
+				m.focus = focusSidebar
+				m.navCursor = navIndexOf(m.activeView)
+			}
+			return m, nil
+		case "tab", "shift+tab":
+			// Jump straight to the sidebar from the search box.
+			m.searchTyping = false
+			m.searchInput.Blur()
+			m.focus = focusSidebar
+			m.navCursor = navIndexOf(m.activeView)
 			return m, nil
 		}
 		var cmd tea.Cmd
@@ -355,6 +399,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "f":
 		m.toggleFavoriteContext()
 		return m, nil
+	case "a":
+		return m, m.goToAlbum()
 	case "/":
 		m.activateView(viewSearch)
 		m.searchTyping = true
@@ -445,10 +491,74 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleHistoryKey(msg)
 	case viewTrending, viewNewReleases, viewExplore:
 		return m.handleBrowseKey(m.activeView, msg)
+	case viewAlbum:
+		return m.handleAlbumKey(msg)
 	case viewHelp:
 		return m, nil
 	}
 	return m, nil
+}
+
+// goToAlbum opens the album the selected/playing track belongs to and loads it.
+func (m *model) goToAlbum() tea.Cmd {
+	t := m.contextTrack()
+	if t == nil {
+		m.setError("no track selected")
+		return nil
+	}
+	m.activeView = viewAlbum
+	m.focus = focusPanel
+	m.albumLoading = true
+	m.albumErr = ""
+	m.albumTracks = nil
+	m.albumCursor = 0
+	name := t.Album
+	if name == "" {
+		name = t.Title
+	}
+	m.albumTitle = name
+	m.setStatus("loading album…")
+
+	album, artist := t.Album, t.Artist
+	if album == "" {
+		album = t.Title
+	}
+	client := m.api
+	return func() tea.Msg {
+		tracks, title, err := api.AlbumByQuery(client, album, artist)
+		return albumDoneMsg{tracks: tracks, title: title, err: err}
+	}
+}
+
+func (m *model) handleAlbumKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "j", "down":
+		if m.albumCursor < len(m.albumTracks)-1 {
+			m.albumCursor++
+		}
+	case "k", "up":
+		if m.albumCursor > 0 {
+			m.albumCursor--
+		}
+	case "enter":
+		// Play the whole album starting from the selected track.
+		m.playAlbumFrom(m.albumCursor)
+	case "p":
+		// Play the whole album from the top.
+		m.playAlbumFrom(0)
+	}
+	return m, nil
+}
+
+// playAlbumFrom replaces the queue with the loaded album and plays from idx.
+func (m *model) playAlbumFrom(idx int) {
+	if idx < 0 || idx >= len(m.albumTracks) {
+		return
+	}
+	m.queue = append([]api.Track(nil), m.albumTracks...)
+	m.queueCursor = idx
+	m.playAt(idx)
+	m.setStatus("playing album: " + m.albumTitle)
 }
 
 // loadBrowse kicks off the async API call for a browse view.
@@ -715,8 +825,23 @@ func (m *model) contextTrack() *api.Track {
 			t := m.cfg.Favorites[m.favCursor]
 			return &t
 		}
+	case viewHistory:
+		if m.historyCursor < len(m.cfg.History) {
+			t := m.cfg.History[m.historyCursor].Track
+			return &t
+		}
+	case viewTrending, viewNewReleases, viewExplore:
+		if bs, ok := m.browse[m.activeView]; ok && bs.cursor < len(bs.tracks) {
+			t := bs.tracks[bs.cursor]
+			return &t
+		}
+	case viewAlbum:
+		if m.albumCursor < len(m.albumTracks) {
+			t := m.albumTracks[m.albumCursor]
+			return &t
+		}
 	}
-	// Fall back to the currently playing track (Home/Help and empty lists).
+	// Fall back to the currently playing track (Help and empty lists).
 	return m.current
 }
 
@@ -752,7 +877,7 @@ func (m *model) playAt(idx int) {
 	}
 	m.player.SetTitle(title)
 	m.player.Load(t.ID)
-	m.setStatus("loading: " + t.Title)
+	// No transient "loading" status — the now-playing bar shows load state.
 
 	// Record the play in history (newest first) and persist.
 	m.cfg.AddHistory(t)

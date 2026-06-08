@@ -42,6 +42,20 @@ func max(a, b int) int {
 	return b
 }
 
+// padRight pads s with spaces (or crops it) so its display width is exactly n.
+// Display-width aware, so glyphs like ▸/♪ don't cause a background-filled style
+// to overflow onto a second line.
+func padRight(s string, n int) string {
+	if n < 0 {
+		n = 0
+	}
+	w := lipgloss.Width(s)
+	if w > n {
+		return truncate2(s, n)
+	}
+	return s + strings.Repeat(" ", n-w)
+}
+
 // padToHeight pads s with blank lines (or truncates) so it occupies exactly
 // n terminal rows. Used to push the bottom bars flush against the frame.
 func padToHeight(s string, n int) string {
@@ -136,19 +150,21 @@ func (m *model) renderSidebar(w, h int) string {
 	}
 
 	var rows []string
-	rows = append(rows, stylePrimaryBold.Render(truncate(iconVolume+" ytmusic", inner)))
+	rows = append(rows, stylePrimaryBold.Render(truncate2(iconVolume+" ytmusic", inner)))
 	rows = append(rows, styleSecondaryBold.Render("Quick Links"))
 	sidebarFocused := m.focus == focusSidebar
 	for i, e := range navEntries {
 		switch {
 		case sidebarFocused && i == m.navCursor:
-			// Strong cursor highlight only when the sidebar has focus.
-			rows = append(rows, styleSelected.Width(inner).Render(truncate("▸ "+e.label, inner)))
+			// Strong cursor highlight only when the sidebar has focus. Pad with a
+			// display-width-aware helper so the background fills exactly one line
+			// (a rune-count truncate miscounts glyphs like ▸ and wraps).
+			rows = append(rows, styleSelected.Render(padRight("> "+e.label, inner)))
 		case e.view == m.activeView:
 			// Marks the active view while the panel is focused.
-			rows = append(rows, stylePrimary.Render(truncate("▸ "+e.label, inner)))
+			rows = append(rows, stylePrimary.Render(truncate2("> "+e.label, inner)))
 		default:
-			rows = append(rows, styleText.Render(truncate("  "+e.label, inner)))
+			rows = append(rows, styleText.Render(truncate2("  "+e.label, inner)))
 		}
 	}
 
@@ -169,10 +185,39 @@ func (m *model) renderPanel(w, h int) string {
 		return m.renderHistory(w, h)
 	case viewTrending, viewNewReleases, viewExplore:
 		return m.renderBrowse(m.activeView, w, h)
+	case viewAlbum:
+		return m.renderAlbum(w, h)
 	case viewHelp:
 		return m.renderHelp(w, h)
 	}
 	return ""
+}
+
+// renderAlbum renders the album-of-a-track view.
+func (m *model) renderAlbum(w, h int) string {
+	heading := stylePrimaryBold.Render("Album: " + m.albumTitle)
+
+	switch {
+	case m.albumLoading:
+		return lipgloss.JoinVertical(lipgloss.Left, heading, styleAccent.Render("Loading…"))
+	case m.albumErr != "":
+		return lipgloss.JoinVertical(lipgloss.Left, heading, styleError.Render(m.albumErr))
+	case len(m.albumTracks) == 0:
+		return lipgloss.JoinVertical(lipgloss.Left, heading, styleDim.Render("Album not found."))
+	}
+
+	footer := styleDim.Render("Enter play album from here • p play whole album • a album of track")
+	listH := h - lipgloss.Height(heading) - lipgloss.Height(footer)
+	if listH < 1 {
+		listH = 1
+	}
+	focused := m.focus == focusPanel
+	start, end := windowBounds(m.albumCursor, len(m.albumTracks), listH)
+	var rows []string
+	for i := start; i < end; i++ {
+		rows = append(rows, m.renderResultRow(i+1, m.albumTracks[i], i == m.albumCursor, focused, w, false))
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, heading, strings.Join(rows, "\n"), footer)
 }
 
 // renderBrowse renders an async browse view (Trending / New Releases / Explore).
@@ -612,6 +657,7 @@ func (m *model) renderHelp(w, h int) string {
 		{"s", "toggle shuffle"},
 		{"r", "cycle repeat mode"},
 		{"f", "toggle favorite"},
+		{"a", "open the track's album (Enter to play it)"},
 		{"z", "play a random song"},
 		{"R", "start radio from current track"},
 		{"/", "search"},
