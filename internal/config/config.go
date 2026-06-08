@@ -23,6 +23,7 @@ type Config struct {
 	Favorites []api.Track    `json:"favorites"`
 	History   []HistoryEntry `json:"history"`
 	Volume    float64        `json:"volume"`
+	Theme     string         `json:"theme"`
 	path      string
 	favSet    map[string]struct{} // favorite IDs, for O(1) IsFavorite lookups
 }

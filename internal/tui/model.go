@@ -87,6 +87,7 @@ type model struct {
 	height     int
 	viewportH  int  // visible list height (set during render), for page scrolling
 	pendingG   bool // first 'g' of a 'gg' (go-to-top) chord was pressed
+	themeIdx   int  // index into themes of the active color theme
 
 	// home (drop-in view): Listen Again (from local history) + Quick Picks
 	// (related to most-recent play, falling back to Trending). The cursor spans
@@ -252,6 +253,13 @@ func New(p *player.Player, cfg *config.Config) *model {
 	client := api.NewClient()
 	client.SetTimeout(api.RequestTimeout)
 
+	// Restore the saved color theme (default to the first if unset/unknown).
+	themeIdx := 0
+	if i := themeIndex(cfg.Theme); i >= 0 {
+		themeIdx = i
+	}
+	applyTheme(themes[themeIdx])
+
 	return &model{
 		player:       p,
 		cfg:          cfg,
@@ -262,6 +270,7 @@ func New(p *player.Player, cfg *config.Config) *model {
 		searchInput:  ti,
 		filterInput:  fi,
 		searchTyping: false,
+		themeIdx:     themeIdx,
 		playerState:  player.State{Volume: cfg.Volume},
 		browse: map[view]*browseState{
 			viewTrending:    {title: "Trending", load: (*api.Client).Trending},
@@ -269,6 +278,18 @@ func New(p *player.Player, cfg *config.Config) *model {
 			viewExplore:     {title: "Explore", load: (*api.Client).Explore},
 		},
 	}
+}
+
+// cycleTheme advances to the next color theme, persists it, and invalidates the
+// render caches so re-themed styles take effect immediately.
+func (m *model) cycleTheme() {
+	m.themeIdx = (m.themeIdx + 1) % len(themes)
+	t := themes[m.themeIdx]
+	applyTheme(t)
+	m.cfg.Theme = t.name
+	m.markConfigDirty()
+	m.sbCache, m.scCache = "", "" // cached sidebar/shortcuts use the old palette
+	m.setStatus("theme: " + t.name)
 }
 
 func (m *model) Init() tea.Cmd {
@@ -773,6 +794,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.playRandom()
 	case "R":
 		return m, m.startRadio()
+	case "T":
+		m.cycleTheme()
+		return m, nil
 	case "?":
 		if m.activeView == viewHelp {
 			m.activateView(viewHome)

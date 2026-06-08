@@ -246,6 +246,19 @@ func TestFirstArtistOf(t *testing.T) {
 	}
 }
 
+// TestThemeCycle: 'T' advances and persists the color theme.
+func TestThemeCycle(t *testing.T) {
+	m := newTestModel()
+	start := m.themeIdx
+	press(m, "T")
+	if m.themeIdx != (start+1)%len(themes) {
+		t.Fatalf("themeIdx = %d, want %d", m.themeIdx, (start+1)%len(themes))
+	}
+	if m.cfg.Theme != themes[m.themeIdx].name {
+		t.Fatalf("cfg.Theme = %q, want %q", m.cfg.Theme, themes[m.themeIdx].name)
+	}
+}
+
 // TestViewsRenderWithoutPanic: every view renders.
 func TestViewsRenderWithoutPanic(t *testing.T) {
 	m := newTestModel()

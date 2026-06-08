@@ -623,6 +623,7 @@ func (m *model) buildShortcutsBar(w int) string {
 	segs = append(segs,
 		shortcut{"z", "random", false},
 		shortcut{"R", "radio", false},
+		shortcut{"T", "theme", false},
 		shortcut{"?", "help", false},
 		shortcut{"q", "quit", false},
 	)
@@ -1030,6 +1031,7 @@ func (m *model) renderHelp(w, h int) string {
 		{"A", "open the track's artist (top songs + albums)"},
 		{"z", "play a random song"},
 		{"R", "start radio from current track"},
+		{"T", "cycle color theme"},
 		{"enter", "queue / play selected"},
 		{"p", "play now"},
 		{"d / x", "remove from queue"},
