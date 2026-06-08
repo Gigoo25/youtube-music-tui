@@ -164,8 +164,8 @@ func (m *model) renderSidebar(w, h int) string {
 	for i, e := range navEntries {
 		switch {
 		case sidebarFocused && i == m.navCursor:
-			// Strong cursor highlight only when the sidebar has focus.
-			rows = append(rows, styleSelected.Render(padRight("> "+e.label, textW)))
+			// Background highlight already marks the cursor — no ">" needed.
+			rows = append(rows, styleSelected.Render(padRight("  "+e.label, textW)))
 		case e.view == m.activeView:
 			// Marks the active view while the panel is focused.
 			rows = append(rows, stylePrimary.Render(truncate2("> "+e.label, textW)))
