@@ -48,7 +48,7 @@ func ArtistByQuery(c *Client, name string) (ArtistResult, error) {
 	if res.Name == "" {
 		res.Name = name
 	}
-	res.Songs = parseArtistSongs(broot)
+	res.Songs = CleanTracks(parseArtistSongs(broot))
 	res.Albums = parseArtistAlbums(broot)
 	return res, nil
 }
@@ -111,11 +111,20 @@ func parseArtistSongs(root any) []Track {
 		if t.ID == "" || t.Title == "" || seen[t.ID] {
 			return
 		}
-		t.Artist = cleanArtist(t.Artist)
 		seen[t.ID] = true
 		out = append(out, t)
 	})
 	return out
+}
+
+// CleanTracks strips byline separator artifacts from every track's artist (see
+// cleanArtist). Applied to each track list the API returns so no view renders
+// "Title • &".
+func CleanTracks(ts []Track) []Track {
+	for i := range ts {
+		ts[i].Artist = cleanArtist(ts[i].Artist)
+	}
+	return ts
 }
 
 // cleanArtist removes byline artifacts left by multi-artist parsing — e.g. a

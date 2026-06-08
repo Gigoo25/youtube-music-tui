@@ -66,7 +66,7 @@ func (c *Client) Trending() ([]Track, error) {
 	// Fallback: also include playable carousel items (music videos).
 	tracks = append(tracks, twoRowTracks...)
 
-	return dedupeTracks(tracks), nil
+	return CleanTracks(dedupeTracks(tracks)), nil
 }
 
 // NewReleases returns newly released songs from YouTube Music via the Innertube
@@ -90,7 +90,7 @@ func (c *Client) NewReleases() ([]Track, error) {
 	tracks := collectTwoRowTracks(root)
 	tracks = append(tracks, collectListItemTracks(root)...)
 
-	return dedupeTracks(tracks), nil
+	return CleanTracks(dedupeTracks(tracks)), nil
 }
 
 // parseJSON unmarshals an Innertube response body into a generic map.

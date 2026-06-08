@@ -30,7 +30,7 @@ func (c *Client) Explore() ([]Track, error) {
 	if len(tracks) > 50 {
 		tracks = tracks[:50]
 	}
-	return tracks, nil
+	return CleanTracks(tracks), nil
 }
 
 // collectBrowseTracks walks an arbitrary Innertube browse response and pulls
@@ -165,5 +165,5 @@ func (c *Client) Related(videoID string) ([]Track, error) {
 	if len(tracks) > 50 {
 		tracks = tracks[:50]
 	}
-	return tracks, nil
+	return CleanTracks(tracks), nil
 }

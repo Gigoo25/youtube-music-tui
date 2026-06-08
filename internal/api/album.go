@@ -59,7 +59,7 @@ func (c *Client) albumByID(browseID, fallbackArtist string) ([]Track, string, er
 	if albumArtist == "" {
 		albumArtist = fallbackArtist
 	}
-	tracks := parseAlbumTracks(broot, albumArtist)
+	tracks := CleanTracks(parseAlbumTracks(broot, albumArtist))
 	return tracks, title, nil
 }
 

@@ -365,12 +365,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case randomDoneMsg:
+		// Search (the random source) lives in the secret-blocked ytmusic.go, so its
+		// results are cleaned here rather than at the API boundary.
+		tracks := api.CleanTracks(msg.tracks)
 		if msg.err != nil {
 			m.setError("random failed: " + msg.err.Error())
-		} else if len(msg.tracks) == 0 {
+		} else if len(tracks) == 0 {
 			m.setError("no random track found")
 		} else {
-			m.playNow(msg.tracks[rand.Intn(len(msg.tracks))])
+			m.playNow(tracks[rand.Intn(len(tracks))])
 		}
 		return m, nil
 
@@ -440,7 +443,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.setError("search failed: " + msg.err.Error())
 		} else {
-			m.searchResults = msg.tracks
+			// Search lives in the secret-blocked ytmusic.go; clean its results here.
+			m.searchResults = api.CleanTracks(msg.tracks)
 			m.searchCursor = 0
 			if len(msg.tracks) == 0 {
 				m.setStatus("no results")
