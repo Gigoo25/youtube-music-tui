@@ -25,7 +25,7 @@ func run() error {
 		return fmt.Errorf("config: %w", err)
 	}
 
-	p, err := player.New()
+	p, err := player.New(cfg.Volume)
 	if err != nil {
 		return fmt.Errorf("player: %w\n  (requires mpv + yt-dlp)", err)
 	}

@@ -57,7 +57,8 @@ type ipcResp struct {
 	Reason    string `json:"reason"`
 }
 
-func New() (*Player, error) {
+// New starts mpv and restores the given initial volume (0–150) once connected.
+func New(volume float64) (*Player, error) {
 	sockPath := socketPathFor()
 	os.Remove(sockPath)
 
@@ -86,7 +87,7 @@ func New() (*Player, error) {
 		done:     make(chan struct{}, 1),
 		closed:   make(chan struct{}),
 		state: State{
-			Volume: 100,
+			Volume: volume,
 			Idle:   true,
 		},
 	}
@@ -106,6 +107,9 @@ func New() (*Player, error) {
 	p.send([]any{"observe_property", 3, "pause"})
 	p.send([]any{"observe_property", 4, "volume"})
 	p.send([]any{"observe_property", 5, "idle-active"})
+
+	// Restore the saved volume (mpv starts at 100 by default).
+	p.SetVolume(volume)
 
 	return p, nil
 }
@@ -433,6 +437,12 @@ func (p *Player) readLoop() {
 		p.send([]any{"observe_property", 3, "pause"})
 		p.send([]any{"observe_property", 4, "volume"})
 		p.send([]any{"observe_property", 5, "idle-active"})
+
+		// Re-apply the last known volume so it survives an mpv restart.
+		p.mu.Lock()
+		vol := p.state.Volume
+		p.mu.Unlock()
+		p.SetVolume(vol)
 	}
 }
 
