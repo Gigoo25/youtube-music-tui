@@ -111,10 +111,23 @@ func parseArtistSongs(root any) []Track {
 		if t.ID == "" || t.Title == "" || seen[t.ID] {
 			return
 		}
+		t.Artist = cleanArtist(t.Artist)
 		seen[t.ID] = true
 		out = append(out, t)
 	})
 	return out
+}
+
+// cleanArtist removes byline artifacts left by multi-artist parsing — e.g. a
+// collaboration row whose artist comes back as a lone separator like "&" — so
+// rows don't render "Title • &". A genuine "A & B" is left intact.
+func cleanArtist(s string) string {
+	s = strings.Trim(strings.TrimSpace(s), " &,·•-")
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "feat", "feat.", "and", "x", "&amp;":
+		return ""
+	}
+	return strings.TrimSpace(s)
 }
 
 // parseArtistAlbums extracts the artist's album/single cards (cap 20), deduped by
