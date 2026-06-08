@@ -35,12 +35,51 @@ const (
 	repeatOne
 )
 
+type focusArea int
+
+const (
+	focusSidebar focusArea = iota
+	focusPanel
+)
+
+// navEntry is a single Quick Links sidebar item.
+type navEntry struct {
+	label string
+	view  view
+}
+
+// navEntries lists the sidebar Quick Links in display order. The selected
+// entry stays in sync with activeView.
+var navEntries = []navEntry{
+	{"Home", viewHome},
+	{"Search", viewSearch},
+	{"Queue", viewQueue},
+	{"Favorites", viewFavorites},
+	{"History", viewHistory},
+	{"Trending", viewTrending},
+	{"New Releases", viewNewReleases},
+	{"Explore", viewExplore},
+	{"Help", viewHelp},
+}
+
+// navIndexOf returns the sidebar index for a view (0 if not found).
+func navIndexOf(v view) int {
+	for i, e := range navEntries {
+		if e.view == v {
+			return i
+		}
+	}
+	return 0
+}
+
 type model struct {
 	player *player.Player
 	cfg    *config.Config
 	api    *api.Client
 
 	activeView view
+	focus      focusArea
+	navCursor  int
 	width      int
 	height     int
 
@@ -152,6 +191,8 @@ func New(p *player.Player, cfg *config.Config) *model {
 		cfg:          cfg,
 		api:          api.NewClient(),
 		activeView:   viewHome,
+		focus:        focusSidebar,
+		navCursor:    0,
 		searchInput:  ti,
 		searchTyping: true,
 		playerState:  player.State{Volume: cfg.Volume},
@@ -340,39 +381,48 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.toggleFavoriteContext()
 		return m, nil
 	case "/":
-		m.activeView = viewSearch
+		m.activateView(viewSearch)
 		m.searchTyping = true
 		m.searchInput.Focus()
 		return m, textinput.Blink
 	case "tab":
-		m.cycleView(1)
+		// Toggle focus between sidebar and panel.
+		if m.focus == focusSidebar {
+			m.focus = focusPanel
+		} else {
+			m.focus = focusSidebar
+		}
 		return m, nil
 	case "shift+tab":
-		m.cycleView(-1)
+		if m.focus == focusSidebar {
+			m.focus = focusPanel
+		} else {
+			m.focus = focusSidebar
+		}
 		return m, nil
 	case "1":
-		m.activeView = viewHome
+		m.activateView(viewHome)
 		return m, nil
 	case "2":
-		m.activeView = viewSearch
+		m.activateView(viewSearch)
 		return m, nil
 	case "3":
-		m.activeView = viewQueue
+		m.activateView(viewQueue)
 		return m, nil
 	case "4":
-		m.activeView = viewFavorites
+		m.activateView(viewFavorites)
 		return m, nil
 	case "5":
-		m.activeView = viewHistory
+		m.activateView(viewHistory)
 		return m, nil
 	case "6":
-		m.activeView = viewTrending
+		m.activateView(viewTrending)
 		return m, nil
 	case "7":
-		m.activeView = viewNewReleases
+		m.activateView(viewNewReleases)
 		return m, nil
 	case "8":
-		m.activeView = viewExplore
+		m.activateView(viewExplore)
 		return m, nil
 	case "z":
 		return m, m.playRandom()
@@ -380,14 +430,38 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.startRadio()
 	case "?":
 		if m.activeView == viewHelp {
-			m.activeView = viewHome
+			m.activateView(viewHome)
 		} else {
-			m.activeView = viewHelp
+			m.activateView(viewHelp)
 		}
 		return m, nil
 	}
 
-	// ── View-specific keys ──
+	// ── Sidebar focus owns navigation ──
+	if m.focus == focusSidebar {
+		return m.handleSidebarKey(msg)
+	}
+
+	// ── Panel focus: return-to-sidebar keys ──
+	switch msg.String() {
+	case "h", "left":
+		m.focus = focusSidebar
+		m.navCursor = navIndexOf(m.activeView)
+		return m, nil
+	case "esc":
+		// In search results, esc clears results first; a second esc returns focus.
+		if m.activeView == viewSearch && len(m.searchResults) > 0 {
+			m.searchResults = nil
+			m.searchCursor = 0
+			m.searchInput.SetValue("")
+			return m, nil
+		}
+		m.focus = focusSidebar
+		m.navCursor = navIndexOf(m.activeView)
+		return m, nil
+	}
+
+	// ── Panel focus: view-specific keys ──
 	switch m.activeView {
 	case viewHome:
 		return m.handleHomeKey(msg)
@@ -502,17 +576,39 @@ func (m *model) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// cycleView advances the active view through viewCycle by dir (+1 / -1).
-func (m *model) cycleView(dir int) {
-	idx := 0
-	for i, v := range viewCycle {
-		if v == m.activeView {
-			idx = i
-			break
+// activateView switches to v, syncs the sidebar selection, and moves focus to
+// the panel. Used by quick-jump keys and sidebar activation.
+func (m *model) activateView(v view) {
+	m.activeView = v
+	m.navCursor = navIndexOf(v)
+	m.focus = focusPanel
+}
+
+// handleSidebarKey processes navigation while the Quick Links sidebar is focused.
+func (m *model) handleSidebarKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "j", "down":
+		if m.navCursor < len(navEntries)-1 {
+			m.navCursor++
 		}
+		return m, nil
+	case "k", "up":
+		if m.navCursor > 0 {
+			m.navCursor--
+		}
+		return m, nil
+	case "enter", "l", "right":
+		target := navEntries[m.navCursor].view
+		m.activeView = target
+		m.focus = focusPanel
+		if target == viewSearch {
+			m.searchTyping = true
+			m.searchInput.Focus()
+			return m, textinput.Blink
+		}
+		return m, nil
 	}
-	idx = (idx + dir + len(viewCycle)) % len(viewCycle)
-	m.activeView = viewCycle[idx]
+	return m, nil
 }
 
 func (m *model) handleHomeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {

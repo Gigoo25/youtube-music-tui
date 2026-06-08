@@ -91,6 +91,18 @@ var (
 			BorderForeground(colorDim).
 			Padding(0, 1)
 
+	// Sidebar (Quick Links) box: rounded border in dim.
+	styleSidebarBox = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colorDim).
+			Padding(0, 1)
+
+	// Sub-panel box inside the Home dashboard: rounded border in dim.
+	styleSubPanelBox = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(colorDim).
+				Padding(0, 1)
+
 	// Search bar box: single border in secondary, horizontal padding.
 	styleSearchBox = lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder()).

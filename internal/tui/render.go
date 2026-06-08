@@ -84,9 +84,30 @@ func (m *model) View() string {
 		contentH = 1
 	}
 
-	// Pad content to the full height budget so the shortcuts bar sits flush
-	// at the bottom of the terminal instead of floating up under the content.
-	content := padToHeight(m.renderView(innerW, contentH), contentH)
+	// Two-column layout: Quick Links sidebar | main content panel.
+	sidebarW := innerW / 4
+	if sidebarW < 18 {
+		sidebarW = 18
+	}
+	if sidebarW > 30 {
+		sidebarW = 30
+	}
+	if sidebarW > innerW-10 {
+		sidebarW = innerW - 10
+		if sidebarW < 1 {
+			sidebarW = 1
+		}
+	}
+	panelW := innerW - sidebarW
+	if panelW < 1 {
+		panelW = 1
+	}
+
+	sidebar := m.renderSidebar(sidebarW, contentH)
+	panel := padToHeight(m.renderPanel(panelW, contentH), contentH)
+	body := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, panel)
+
+	content := padToHeight(body, contentH)
 
 	var inner string
 	if status != "" {
@@ -99,7 +120,29 @@ func (m *model) View() string {
 	return styleShell.Width(innerW).Height(m.height - 2).Render(inner)
 }
 
-func (m *model) renderView(w, h int) string {
+// renderSidebar renders the persistent Quick Links navigation column.
+func (m *model) renderSidebar(w, h int) string {
+	inner := w - 4 // rounded border (2) + padding (2)
+	if inner < 1 {
+		inner = 1
+	}
+
+	var rows []string
+	rows = append(rows, styleSecondaryBold.Render("Quick Links"))
+	for i, e := range navEntries {
+		if i == m.navCursor {
+			rows = append(rows, styleSelected.Render(truncate("> "+e.label, inner)))
+		} else {
+			rows = append(rows, "  "+styleText.Render(truncate(e.label, inner-2)))
+		}
+	}
+
+	body := padToHeight(strings.Join(rows, "\n"), h-2)
+	return styleSidebarBox.Width(inner).Height(h - 2).Render(body)
+}
+
+// renderPanel renders the active view's content into the main panel.
+func (m *model) renderPanel(w, h int) string {
 	switch m.activeView {
 	case viewHome:
 		return m.renderHome(w, h)
@@ -289,6 +332,8 @@ func (m *model) renderNowPlaying(w int) string {
 
 // ─── Home screen ───────────────────────────────────────────────────────────────
 
+// renderHome renders the multi-panel Home dashboard: header, NowPlaying,
+// Recently Played, and Recent Favorites stacked sub-panels.
 func (m *model) renderHome(w, h int) string {
 	headerInner := w - 2 // double border
 	if headerInner < 1 {
@@ -299,25 +344,61 @@ func (m *model) renderHome(w, h int) string {
 	)
 
 	np := m.renderNowPlaying(w)
+	recent := m.renderHomeRecent(w)
+	favs := m.renderHomeFavorites(w)
 
-	// Quick Links menu
-	entries := []string{"Search", "Queue", "Favorites", "Help"}
+	return lipgloss.JoinVertical(lipgloss.Left, header, np, recent, favs)
+}
+
+// renderHomeRecent renders the "Recently Played" sub-panel (newest first, ~5).
+func (m *model) renderHomeRecent(w int) string {
+	inner := w - 4 // rounded border + padding
+	if inner < 1 {
+		inner = 1
+	}
 	var rows []string
-	rows = append(rows, styleSecondaryBold.Render("Quick Links"))
-	for i, e := range entries {
-		if i == m.homeCursor {
-			rows = append(rows, styleSelected.Render("> "+e))
-		} else {
-			rows = append(rows, "  "+styleText.Render(e))
+	rows = append(rows, styleSecondaryBold.Render("Recently Played"))
+	hist := m.cfg.History
+	if len(hist) == 0 {
+		rows = append(rows, styleDim.Render("No listening history yet."))
+	} else {
+		n := len(hist)
+		if n > 5 {
+			n = 5
+		}
+		for i := 0; i < n; i++ {
+			e := hist[i]
+			line := styleText.Render(e.Track.Title) + styleDim.Render(" • "+e.Track.Artist)
+			rows = append(rows, truncate2(line, inner))
 		}
 	}
-	menuInner := w - 4 // rounded border + padding
-	if menuInner < 1 {
-		menuInner = 1
-	}
-	menu := styleMenuBox.Width(menuInner).Render(strings.Join(rows, "\n"))
+	return styleSubPanelBox.Width(inner).Render(strings.Join(rows, "\n"))
+}
 
-	return lipgloss.JoinVertical(lipgloss.Left, header, np, menu)
+// renderHomeFavorites renders the "Recent Favorites" sub-panel (~5 rows).
+func (m *model) renderHomeFavorites(w int) string {
+	inner := w - 4
+	if inner < 1 {
+		inner = 1
+	}
+	var rows []string
+	rows = append(rows, styleSecondaryBold.Render(iconHeart+" Recent Favorites"))
+	favs := m.cfg.Favorites
+	if len(favs) == 0 {
+		rows = append(rows, styleDim.Render("No favorites yet (press f while playing)."))
+	} else {
+		n := len(favs)
+		if n > 5 {
+			n = 5
+		}
+		for i := 0; i < n; i++ {
+			t := favs[i]
+			line := styleHeart.Render(iconHeart) + " " +
+				styleText.Render(t.Title) + styleDim.Render(" • "+t.Artist)
+			rows = append(rows, truncate2(line, inner))
+		}
+	}
+	return styleSubPanelBox.Width(inner).Render(strings.Join(rows, "\n"))
 }
 
 // ─── Search screen ─────────────────────────────────────────────────────────────
