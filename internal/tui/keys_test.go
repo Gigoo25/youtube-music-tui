@@ -34,28 +34,28 @@ func press(m *model, s string) {
 	m.handleKey(key(s))
 }
 
-// TestViewSwitching: number keys + tab route to views when not typing.
+// TestViewSwitching: number keys route to views when not typing.
 func TestViewSwitching(t *testing.T) {
 	m := newTestModel()
-	// leave the search-typing state by jumping to Home first
-	press(m, "1")
-	if m.activeView != viewHome {
-		t.Fatalf("expected viewHome, got %v", m.activeView)
-	}
-	press(m, "3")
+	press(m, "esc") // leave the default search-typing state
+	press(m, "2")
 	if m.activeView != viewQueue {
 		t.Fatalf("expected viewQueue, got %v", m.activeView)
 	}
-	press(m, "4")
+	press(m, "3")
 	if m.activeView != viewFavorites {
 		t.Fatalf("expected viewFavorites, got %v", m.activeView)
+	}
+	press(m, "4")
+	if m.activeView != viewHistory {
+		t.Fatalf("expected viewHistory, got %v", m.activeView)
 	}
 }
 
 // TestShuffleRepeatToggle: s/r work outside the search input.
 func TestShuffleRepeatToggle(t *testing.T) {
 	m := newTestModel()
-	press(m, "1") // Home, not typing
+	press(m, "esc") // leave typing
 	if m.shuffle {
 		t.Fatal("shuffle should start off")
 	}
@@ -82,21 +82,28 @@ func TestPlaybackKeysDoNotFireWhileTyping(t *testing.T) {
 	}
 }
 
+// TestStartsAtSearch: the app opens on the Search view.
+func TestStartsAtSearch(t *testing.T) {
+	m := newTestModel()
+	if m.activeView != viewSearch {
+		t.Fatalf("expected to start on viewSearch, got %v", m.activeView)
+	}
+}
+
 // TestViewsRenderWithoutPanic: every view renders.
 func TestViewsRenderWithoutPanic(t *testing.T) {
 	m := newTestModel()
 	m.queue = []api.Track{{ID: "x", Title: "Song A", Artist: "Artist A", Duration: "3:21"}}
 	m.searchResults = m.queue
-	for _, v := range []view{viewHome, viewSearch, viewQueue, viewFavorites, viewHelp} {
+	for _, v := range []view{viewSearch, viewQueue, viewFavorites, viewHistory, viewTrending, viewHelp} {
 		m.activeView = v
 		out := m.View()
 		if out == "" {
 			t.Fatalf("view %v rendered empty", v)
 		}
 	}
-	// Home header should reference the app name.
-	m.activeView = viewHome
-	if !strings.Contains(m.View(), "youtube-music-cli") {
-		t.Error("home view missing app title")
+	// The persistent sidebar should always be present.
+	if !strings.Contains(m.View(), "Quick Links") {
+		t.Error("sidebar missing from view")
 	}
 }

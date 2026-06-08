@@ -16,8 +16,7 @@ import (
 type view int
 
 const (
-	viewHome view = iota
-	viewSearch
+	viewSearch view = iota
 	viewQueue
 	viewFavorites
 	viewHistory
@@ -51,7 +50,6 @@ type navEntry struct {
 // navEntries lists the sidebar Quick Links in display order. The selected
 // entry stays in sync with activeView.
 var navEntries = []navEntry{
-	{"Home", viewHome},
 	{"Search", viewSearch},
 	{"Queue", viewQueue},
 	{"Favorites", viewFavorites},
@@ -106,9 +104,6 @@ type model struct {
 	// async browse views (Trending / New Releases / Explore)
 	browse map[view]*browseState
 
-	// home menu
-	homeCursor int
-
 	// player snapshot (refreshed each tick)
 	playerState player.State
 	current     *api.Track
@@ -160,39 +155,19 @@ var randomSeeds = []string{
 	"classical", "indie", "chill", "80s", "90s", "metal", "r&b", "funk",
 }
 
-// homeMenu lists the entries shown on the Home view, in cursor order.
-var homeMenu = []struct {
-	label string
-	view  view
-}{
-	{"Search", viewSearch},
-	{"Queue", viewQueue},
-	{"Favorites", viewFavorites},
-	{"History", viewHistory},
-	{"Trending", viewTrending},
-	{"New Releases", viewNewReleases},
-	{"Explore", viewExplore},
-	{"Help", viewHelp},
-}
-
-// viewCycle is the tab-order of top-level views (Help excluded from cycling).
-var viewCycle = []view{
-	viewHome, viewSearch, viewQueue, viewFavorites, viewHistory,
-	viewTrending, viewNewReleases, viewExplore,
-}
-
 func New(p *player.Player, cfg *config.Config) *model {
 	ti := textinput.New()
 	ti.Placeholder = "Search YouTube Music..."
 	ti.CharLimit = 200
+	ti.Focus()
 
 	return &model{
 		player:       p,
 		cfg:          cfg,
 		api:          api.NewClient(),
-		activeView:   viewHome,
-		focus:        focusSidebar,
-		navCursor:    0,
+		activeView:   viewSearch,
+		focus:        focusPanel,
+		navCursor:    navIndexOf(viewSearch),
 		searchInput:  ti,
 		searchTyping: true,
 		playerState:  player.State{Volume: cfg.Volume},
@@ -401,27 +376,24 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "1":
-		m.activateView(viewHome)
-		return m, nil
-	case "2":
 		m.activateView(viewSearch)
 		return m, nil
-	case "3":
+	case "2":
 		m.activateView(viewQueue)
 		return m, nil
-	case "4":
+	case "3":
 		m.activateView(viewFavorites)
 		return m, nil
-	case "5":
+	case "4":
 		m.activateView(viewHistory)
 		return m, nil
-	case "6":
+	case "5":
 		m.activateView(viewTrending)
 		return m, nil
-	case "7":
+	case "6":
 		m.activateView(viewNewReleases)
 		return m, nil
-	case "8":
+	case "7":
 		m.activateView(viewExplore)
 		return m, nil
 	case "z":
@@ -430,7 +402,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.startRadio()
 	case "?":
 		if m.activeView == viewHelp {
-			m.activateView(viewHome)
+			m.activateView(viewSearch)
 		} else {
 			m.activateView(viewHelp)
 		}
@@ -463,8 +435,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// ── Panel focus: view-specific keys ──
 	switch m.activeView {
-	case viewHome:
-		return m.handleHomeKey(msg)
 	case viewSearch:
 		return m.handleSearchKey(msg)
 	case viewQueue:
@@ -607,28 +577,6 @@ func (m *model) handleSidebarKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, textinput.Blink
 		}
 		return m, nil
-	}
-	return m, nil
-}
-
-func (m *model) handleHomeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "j", "down":
-		if m.homeCursor < len(homeMenu)-1 {
-			m.homeCursor++
-		}
-	case "k", "up":
-		if m.homeCursor > 0 {
-			m.homeCursor--
-		}
-	case "enter":
-		target := homeMenu[m.homeCursor]
-		m.activeView = target.view
-		if target.view == viewSearch {
-			m.searchTyping = true
-			m.searchInput.Focus()
-			return m, textinput.Blink
-		}
 	}
 	return m, nil
 }

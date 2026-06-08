@@ -67,41 +67,11 @@ var (
 			Border(lipgloss.NormalBorder()).
 			BorderForeground(colorPrimary)
 
-	// Header box: double border in primary.
-	styleHeaderBox = lipgloss.NewStyle().
-			Border(lipgloss.DoubleBorder()).
-			BorderForeground(colorPrimary).
-			Align(lipgloss.Center)
-
-	// NowPlaying box: rounded border in primary, horizontal padding.
-	styleNowPlayingBox = lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(colorPrimary).
-				Padding(0, 1)
-
-	// Empty / placeholder rounded box in dim.
-	styleDimBox = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorDim).
-			Padding(0, 1)
-
-	// Quick Links menu box: rounded border in dim.
-	styleMenuBox = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorDim).
-			Padding(0, 1)
-
 	// Sidebar (Quick Links) box: rounded border in dim.
 	styleSidebarBox = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(colorDim).
 			Padding(0, 1)
-
-	// Sub-panel box inside the Home dashboard: rounded border in dim.
-	styleSubPanelBox = lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(colorDim).
-				Padding(0, 1)
 
 	// Search bar box: single border in secondary, horizontal padding.
 	styleSearchBox = lipgloss.NewStyle().
