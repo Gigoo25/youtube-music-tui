@@ -34,6 +34,63 @@ func press(m *model, s string) {
 	m.handleKey(key(s))
 }
 
+// TestQueueRemovalKeepsPlayingTrack: deleting a track above the playing one
+// shifts queuePos so the now-playing marker stays on the same song.
+func TestQueueRemovalKeepsPlayingTrack(t *testing.T) {
+	m := newTestModel()
+	m.activeView = viewQueue
+	m.focus = focusPanel
+	m.queue = []api.Track{{ID: "a", Title: "A"}, {ID: "b", Title: "B"}, {ID: "c", Title: "C"}}
+	m.queuePos = 1 // B is playing
+	m.hasCurrent = true
+	m.queueCursor = 0 // cursor on A
+
+	press(m, "d") // remove A
+
+	if len(m.queue) != 2 || m.queue[m.queuePos].ID != "b" {
+		t.Fatalf("expected B still at queuePos after removing A, got pos=%d queue=%v", m.queuePos, m.queue)
+	}
+	if !m.hasCurrent {
+		t.Fatal("removing a non-playing track should keep hasCurrent")
+	}
+}
+
+// TestQueueRemovePlayingTrackDropsMarker: removing the playing track clears the
+// now-playing marker (audio keeps going, but it's no longer in the queue).
+func TestQueueRemovePlayingTrackDropsMarker(t *testing.T) {
+	m := newTestModel()
+	m.activeView = viewQueue
+	m.focus = focusPanel
+	m.queue = []api.Track{{ID: "a", Title: "A"}, {ID: "b", Title: "B"}}
+	m.queuePos = 1
+	m.hasCurrent = true
+	m.queueCursor = 1 // cursor on the playing track
+
+	press(m, "d")
+
+	if m.hasCurrent {
+		t.Fatal("removing the playing track should clear hasCurrent")
+	}
+	if m.queuePos >= len(m.queue) {
+		t.Fatalf("queuePos %d out of range after removal (len %d)", m.queuePos, len(m.queue))
+	}
+}
+
+// TestCurrentIsValueNotSlicePointer: m.current must survive queue reallocation.
+func TestCurrentIsValueNotSlicePointer(t *testing.T) {
+	m := newTestModel()
+	m.queue = []api.Track{{ID: "x", Title: "X", Artist: "Ax"}}
+	m.current = m.queue[0]
+	m.hasCurrent = true
+	// Force a reallocation of the queue backing array.
+	for i := 0; i < 100; i++ {
+		m.queue = append(m.queue, api.Track{ID: "n", Title: "N"})
+	}
+	if m.current.Title != "X" || m.current.Artist != "Ax" {
+		t.Fatalf("current changed after queue growth: %+v", m.current)
+	}
+}
+
 // TestViewSwitching: number keys route to views when not typing.
 func TestViewSwitching(t *testing.T) {
 	m := newTestModel()

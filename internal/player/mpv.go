@@ -14,7 +14,10 @@ import (
 	"time"
 )
 
-const socketPath = "/tmp/ytmusic-mpv.sock"
+// socketPath is per-process so multiple instances don't collide on /tmp.
+func socketPathFor() string {
+	return filepath.Join(os.TempDir(), fmt.Sprintf("ytmusic-mpv-%d.sock", os.Getpid()))
+}
 
 type State struct {
 	Position float64
@@ -26,13 +29,17 @@ type State struct {
 }
 
 type Player struct {
-	cmd    *exec.Cmd
-	conn   net.Conn
-	mu     sync.Mutex    // protects state and conn field
-	sendCh chan []byte    // serialized writes
-	reqID  int
-	state  State
-	done   chan struct{} // closed when end-file received
+	cmd       *exec.Cmd
+	sockPath  string
+	conn      net.Conn
+	mu        sync.Mutex    // protects state, conn, reqID, loadGen
+	sendCh    chan []byte   // serialized writes
+	reqID     int
+	loadGen   int           // epoch token: cancels stale async loads
+	state     State
+	done      chan struct{} // signalled on natural end-of-file
+	closed    chan struct{} // closed once on shutdown
+	closeOnce sync.Once
 }
 
 type ipcCmd struct {
@@ -51,12 +58,13 @@ type ipcResp struct {
 }
 
 func New() (*Player, error) {
-	os.Remove(socketPath)
+	sockPath := socketPathFor()
+	os.Remove(sockPath)
 
 	args := []string{
 		"--no-video",
 		"--idle=yes",
-		"--input-ipc-server=" + socketPath,
+		"--input-ipc-server=" + sockPath,
 		"--really-quiet",
 		"--no-terminal",
 	}
@@ -72,16 +80,18 @@ func New() (*Player, error) {
 	}
 
 	p := &Player{
-		cmd:    cmd,
-		sendCh: make(chan []byte, 64),
-		done:   make(chan struct{}, 1),
+		cmd:      cmd,
+		sockPath: sockPath,
+		sendCh:   make(chan []byte, 64),
+		done:     make(chan struct{}, 1),
+		closed:   make(chan struct{}),
 		state: State{
 			Volume: 100,
 			Idle:   true,
 		},
 	}
 
-	conn, err := dialWithRetry(socketPath, 30, 100*time.Millisecond)
+	conn, err := dialWithRetry(sockPath, 30, 100*time.Millisecond)
 	if err != nil {
 		cmd.Process.Kill()
 		return nil, fmt.Errorf("connect mpv IPC: %w", err)
@@ -116,38 +126,57 @@ func dialWithRetry(path string, attempts int, delay time.Duration) (net.Conn, er
 }
 
 func (p *Player) writeLoop() {
-	for b := range p.sendCh {
-		p.mu.Lock()
-		conn := p.conn
-		p.mu.Unlock()
-		if conn == nil {
-			continue
+	for {
+		select {
+		case <-p.closed:
+			return
+		case b := <-p.sendCh:
+			p.mu.Lock()
+			conn := p.conn
+			p.mu.Unlock()
+			if conn != nil {
+				conn.Write(b) //nolint:errcheck
+			}
 		}
-		conn.Write(b) //nolint:errcheck
 	}
 }
 
-func (p *Player) Load(videoID string) error {
+// beginLoad resets playback state and returns the new load epoch. A later load
+// (or skip) bumps the epoch so a slow yt-dlp extraction can detect it is stale.
+func (p *Player) beginLoad() int {
 	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.loadGen++
 	p.state.Position = 0
 	p.state.Duration = 0
 	p.state.Idle = false
 	p.state.Loading = true
-	// drain done channel
 	select {
 	case <-p.done:
 	default:
 	}
-	p.mu.Unlock()
+	return p.loadGen
+}
+
+func (p *Player) Load(videoID string) error {
+	gen := p.beginLoad()
 
 	go func() {
 		url, err := extractURL(videoID)
+
+		p.mu.Lock()
+		stale := gen != p.loadGen
+		if stale {
+			p.mu.Unlock()
+			return // a newer load superseded this one
+		}
 		if err != nil {
-			p.mu.Lock()
 			p.state.Loading = false
 			p.mu.Unlock()
 			return
 		}
+		p.mu.Unlock()
+
 		p.send([]any{"loadfile", url, "replace"})
 	}()
 	return nil
@@ -155,17 +184,7 @@ func (p *Player) Load(videoID string) error {
 
 // LoadURL sends a pre-resolved URL directly to mpv without yt-dlp extraction.
 func (p *Player) LoadURL(url string) error {
-	p.mu.Lock()
-	p.state.Position = 0
-	p.state.Duration = 0
-	p.state.Idle = false
-	p.state.Loading = true
-	select {
-	case <-p.done:
-	default:
-	}
-	p.mu.Unlock()
-
+	p.beginLoad()
 	return p.send([]any{"loadfile", url, "replace"})
 }
 
@@ -300,7 +319,10 @@ func (p *Player) send(cmd []any) error {
 	b, _ := json.Marshal(msg)
 	b = append(b, '\n')
 
+	// sendCh is never closed; the closed channel guards against enqueueing after
+	// shutdown (and unblocks if writeLoop has already exited with a full buffer).
 	select {
+	case <-p.closed:
 	case p.sendCh <- b:
 	default:
 		// channel full; drop command
@@ -377,13 +399,23 @@ func (p *Player) readLoop() {
 			}
 		}
 
-		// scanner exited — connection lost
+		// scanner exited — connection lost. Stop if we're shutting down.
+		select {
+		case <-p.closed:
+			return
+		default:
+		}
 		if attempt == maxReconnects {
 			break
 		}
 		time.Sleep(500 * time.Millisecond)
+		select {
+		case <-p.closed:
+			return
+		default:
+		}
 
-		newConn, err := net.Dial("unix", socketPath)
+		newConn, err := net.Dial("unix", p.sockPath)
 		if err != nil {
 			continue
 		}
@@ -404,22 +436,23 @@ func (p *Player) readLoop() {
 	}
 }
 
+// Close shuts the player down. Safe to call more than once.
 func (p *Player) Close() {
-	// drain sendCh then close it to stop writeLoop
-	p.mu.Lock()
-	conn := p.conn
-	p.conn = nil
-	p.mu.Unlock()
+	p.closeOnce.Do(func() {
+		close(p.closed) // stops writeLoop and the reconnect loop; gates send()
 
-	// close sendCh; writeLoop exits when channel drained and closed
-	close(p.sendCh)
+		p.mu.Lock()
+		conn := p.conn
+		p.conn = nil
+		p.mu.Unlock()
 
-	if conn != nil {
-		conn.Close()
-	}
-	if p.cmd != nil && p.cmd.Process != nil {
-		p.cmd.Process.Kill()
-		p.cmd.Wait()
-	}
-	os.Remove(socketPath)
+		if conn != nil {
+			conn.Close()
+		}
+		if p.cmd != nil && p.cmd.Process != nil {
+			p.cmd.Process.Kill()
+			p.cmd.Wait()
+		}
+		os.Remove(p.sockPath)
+	})
 }

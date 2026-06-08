@@ -48,18 +48,27 @@ func Load() (*Config, error) {
 	}
 
 	if err := json.Unmarshal(data, cfg); err != nil {
-		return cfg, nil
+		// Don't silently wipe a corrupt config — preserve it for recovery and
+		// start fresh.
+		os.Rename(path, path+".corrupt")
+		return &Config{path: path, Volume: 100}, nil
 	}
 	cfg.path = path
 	return cfg, nil
 }
 
+// Save writes the config atomically (temp file + rename) so a crash mid-write
+// can't truncate and lose the user's favorites/history.
 func (c *Config) Save() error {
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(c.path, data, 0644)
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, c.path)
 }
 
 func (c *Config) IsFavorite(id string) bool {

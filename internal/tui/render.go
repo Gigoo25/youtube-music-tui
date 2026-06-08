@@ -299,7 +299,7 @@ func (m *model) renderShortcutsBar(w int) string {
 
 	// Playback globals (always available).
 	pp := "play"
-	if m.current != nil && !m.playerState.Paused {
+	if m.hasCurrent && !m.playerState.Paused {
 		pp = "pause"
 	}
 	segs = append(segs,
@@ -405,7 +405,7 @@ func wrapShortcuts(segs []shortcut, width int) string {
 // bottom (above the shortcuts bar) whenever a track is loaded. Returns "" when
 // nothing is playing.
 func (m *model) renderNowBar(w int) string {
-	if m.current == nil {
+	if !m.hasCurrent {
 		return ""
 	}
 	s := m.playerState
@@ -461,19 +461,7 @@ func (m *model) renderNowBar(w int) string {
 func (m *model) renderSearch(w, h int) string {
 	var blocks []string
 	used := 0
-
-	// One-line now-playing indicator
-	if m.current != nil {
-		glyph := iconPlay
-		if m.playerState.Paused {
-			glyph = iconPause
-		}
-		line := styleDim.Render(glyph+" ") +
-			stylePrimaryBold.Render(m.current.Title) +
-			styleSecondary.Render(" • "+m.current.Artist)
-		blocks = append(blocks, truncate2(line, w))
-		used++
-	}
+	// (now-playing is shown in the persistent bottom bar)
 
 	// Search bar
 	searchInner := w - 4 // single border + padding
@@ -731,11 +719,17 @@ func (m *model) renderHelp(w, h int) string {
 		{"a", "open the track's album (Enter to play it)"},
 		{"z", "play a random song"},
 		{"R", "start radio from current track"},
+		{"enter", "queue / play selected"},
+		{"p", "play now"},
+		{"d / x", "remove from queue"},
+		{"c", "clear queue"},
+		{"g", "refresh browse feed"},
 		{"/", "search"},
 		{"j / k", "navigate list"},
-		{"tab", "switch view"},
-		{"1-8", "jump to view (Home…Explore)"},
-		{"g", "refresh browse feed"},
+		{"h / esc", "back to menu / previous"},
+		{"tab", "toggle sidebar / panel focus"},
+		{"1-7", "jump to view (Search…Explore)"},
+		{"? ", "this help"},
 		{"q", "quit"},
 	}
 

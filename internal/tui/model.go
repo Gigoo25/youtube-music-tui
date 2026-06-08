@@ -115,7 +115,8 @@ type model struct {
 
 	// player snapshot (refreshed each tick)
 	playerState player.State
-	current     *api.Track
+	current     api.Track // the track currently loaded (value copy, not a slice ptr)
+	hasCurrent  bool
 
 	// transient status line
 	status    string
@@ -631,7 +632,7 @@ func (m *model) playRandom() tea.Cmd {
 
 // startRadio enqueues tracks related to the currently playing song.
 func (m *model) startRadio() tea.Cmd {
-	if m.current == nil {
+	if !m.hasCurrent {
 		m.setError("nothing playing to start radio from")
 		return nil
 	}
@@ -746,12 +747,23 @@ func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "d", "x":
 		if len(m.queue) > 0 {
-			m.queue = append(m.queue[:m.queueCursor], m.queue[m.queueCursor+1:]...)
-			if m.queueCursor > 0 && m.queueCursor >= len(m.queue) {
+			removed := m.queueCursor
+			m.queue = append(m.queue[:removed], m.queue[removed+1:]...)
+			// Keep the cursor in range.
+			if m.queueCursor >= len(m.queue) && m.queueCursor > 0 {
 				m.queueCursor--
 			}
-			if m.queuePos > m.queueCursor {
+			// Keep queuePos pointing at the same playing track.
+			switch {
+			case removed < m.queuePos:
 				m.queuePos--
+			case removed == m.queuePos:
+				// The currently-playing entry was removed: it keeps playing, but it
+				// is no longer in the queue, so drop the now-playing marker.
+				m.hasCurrent = false
+				if m.queuePos >= len(m.queue) {
+					m.queuePos = 0
+				}
 			}
 			m.setStatus("removed from queue")
 		}
@@ -760,7 +772,7 @@ func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.queueCursor = 0
 		m.queuePos = 0
 		m.player.Stop()
-		m.current = nil
+		m.hasCurrent = false
 		m.setStatus("queue cleared")
 	}
 	return m, nil
@@ -853,7 +865,11 @@ func (m *model) contextTrack() *api.Track {
 		}
 	}
 	// Fall back to the currently playing track (Help and empty lists).
-	return m.current
+	if m.hasCurrent {
+		t := m.current
+		return &t
+	}
+	return nil
 }
 
 // ── Action methods ──
@@ -861,7 +877,7 @@ func (m *model) contextTrack() *api.Track {
 func (m *model) enqueue(t api.Track) {
 	m.queue = append(m.queue, t)
 	m.setStatus("queued: " + t.Title)
-	if m.current == nil {
+	if !m.hasCurrent {
 		m.playAt(len(m.queue) - 1)
 	}
 }
@@ -879,8 +895,9 @@ func (m *model) playAt(idx int) {
 		return
 	}
 	m.queuePos = idx
-	m.current = &m.queue[idx]
 	t := m.queue[idx]
+	m.current = t
+	m.hasCurrent = true
 	// Set MPRIS title so shells (noctalia/playerctl) show the song, not the URL.
 	title := t.Title
 	if t.Artist != "" {
@@ -915,7 +932,7 @@ func (m *model) nextTrack() {
 		} else if m.queuePos+1 < len(m.queue) {
 			m.playAt(m.queuePos + 1)
 		} else {
-			m.current = nil
+			m.hasCurrent = false
 			m.setStatus("queue ended")
 		}
 	}
