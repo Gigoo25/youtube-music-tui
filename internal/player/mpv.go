@@ -47,6 +47,7 @@ type ipcResp struct {
 	Event     string `json:"event"`
 	ID        int    `json:"id"`
 	Name      string `json:"name"`
+	Reason    string `json:"reason"`
 }
 
 func New() (*Player, error) {
@@ -328,9 +329,14 @@ func (p *Player) readLoop() {
 
 			switch resp.Event {
 			case "end-file":
-				select {
-				case p.done <- struct{}{}:
-				default:
+				// Only a natural end-of-file means the track finished. Loading a new
+				// file emits end-file with reason "stop"/"redirect" for the previous
+				// one — ignore those so we don't falsely advance the queue.
+				if resp.Reason == "eof" {
+					select {
+					case p.done <- struct{}{}:
+					default:
+					}
 				}
 				continue
 

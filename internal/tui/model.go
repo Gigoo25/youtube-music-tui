@@ -111,6 +111,7 @@ type model struct {
 	albumTitle   string
 	albumLoading bool
 	albumErr     string
+	prevView     view // the view to return to from the album view
 
 	// player snapshot (refreshed each tick)
 	playerState player.State
@@ -467,6 +468,13 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.navCursor = navIndexOf(m.activeView)
 		return m, nil
 	case "esc":
+		// From the album view, esc returns to the screen it was opened from.
+		if m.activeView == viewAlbum {
+			m.activeView = m.prevView
+			m.navCursor = navIndexOf(m.activeView)
+			m.focus = focusPanel
+			return m, nil
+		}
 		// In search results, esc clears results first; a second esc returns focus.
 		if m.activeView == viewSearch && len(m.searchResults) > 0 {
 			m.searchResults = nil
@@ -505,6 +513,9 @@ func (m *model) goToAlbum() tea.Cmd {
 	if t == nil {
 		m.setError("no track selected")
 		return nil
+	}
+	if m.activeView != viewAlbum {
+		m.prevView = m.activeView
 	}
 	m.activeView = viewAlbum
 	m.focus = focusPanel
