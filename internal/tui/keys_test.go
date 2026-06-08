@@ -94,16 +94,19 @@ func TestCurrentIsValueNotSlicePointer(t *testing.T) {
 // TestViewSwitching: number keys route to views when not typing.
 func TestViewSwitching(t *testing.T) {
 	m := newTestModel()
-	press(m, "esc") // leave the default search-typing state
-	press(m, "2")
+	press(m, "1")
+	if m.activeView != viewHome {
+		t.Fatalf("expected viewHome, got %v", m.activeView)
+	}
+	press(m, "3")
 	if m.activeView != viewQueue {
 		t.Fatalf("expected viewQueue, got %v", m.activeView)
 	}
-	press(m, "3")
+	press(m, "4")
 	if m.activeView != viewFavorites {
 		t.Fatalf("expected viewFavorites, got %v", m.activeView)
 	}
-	press(m, "4")
+	press(m, "5")
 	if m.activeView != viewHistory {
 		t.Fatalf("expected viewHistory, got %v", m.activeView)
 	}
@@ -126,12 +129,14 @@ func TestShuffleRepeatToggle(t *testing.T) {
 	}
 }
 
-// TestPlaybackKeysDoNotFireWhileTyping: 's' typed into search must not toggle shuffle.
+// TestPlaybackKeysDoNotFireWhileTyping: 's' typed into the global search box must
+// not toggle shuffle.
 func TestPlaybackKeysDoNotFireWhileTyping(t *testing.T) {
 	m := newTestModel()
-	press(m, "/") // focus search input -> typing
+	press(m, "2") // global Search view
+	press(m, "/") // focus the query input -> typing
 	if !m.typing() {
-		t.Fatal("expected typing mode after '/'")
+		t.Fatal("expected typing mode after '/' in Search view")
 	}
 	press(m, "s")
 	if m.shuffle {
@@ -139,11 +144,105 @@ func TestPlaybackKeysDoNotFireWhileTyping(t *testing.T) {
 	}
 }
 
-// TestStartsAtSearch: the app opens on the Search view.
-func TestStartsAtSearch(t *testing.T) {
+// TestLocalFilterCapturesKeys: '/' filters the current pane; typed keys go to the
+// filter (not playback) and narrow the list.
+func TestLocalFilterCapturesKeys(t *testing.T) {
 	m := newTestModel()
+	m.activeView = viewQueue
+	m.focus = focusPanel
+	m.queue = []api.Track{
+		{ID: "a", Title: "Yellow", Artist: "Coldplay"},
+		{ID: "b", Title: "Bohemian Rhapsody", Artist: "Queen"},
+	}
+	press(m, "/")
+	if !m.filtering {
+		t.Fatal("expected filtering mode after '/'")
+	}
+	press(m, "s") // goes to the filter, not shuffle
+	if m.shuffle {
+		t.Fatal("'s' while filtering must not toggle shuffle")
+	}
+	press(m, "p") // build filter "sp"... actually type to match Coldplay
+	m.filter = "cold"
+	if got := m.activeFilteredLen(); got != 1 {
+		t.Fatalf("filtered queue len = %d, want 1", got)
+	}
+	press(m, "esc") // clears filter
+	if m.filter != "" || m.filtering {
+		t.Fatal("esc should clear the filter")
+	}
+}
+
+// TestStartsAtHome: the app opens on the Home view (not typing).
+func TestStartsAtHome(t *testing.T) {
+	m := newTestModel()
+	if m.activeView != viewHome {
+		t.Fatalf("expected to start on viewHome, got %v", m.activeView)
+	}
+	if m.typing() {
+		t.Fatal("should not start in search-typing mode")
+	}
+}
+
+// TestHomeNavSpansSections: the Home cursor moves across Listen Again into
+// Quick Picks as one flat list, and contextTrack resolves the right track.
+func TestHomeNavSpansSections(t *testing.T) {
+	m := newTestModel()
+	m.activeView = viewHome
+	m.focus = focusPanel
+	m.homeListenAgain = []api.Track{{ID: "la1", Title: "LA1", Artist: "X"}}
+	m.homeQuickPicks = []api.Track{{ID: "qp1", Title: "QP1", Artist: "Y"}}
+
+	if got := m.homeLen(); got != 2 {
+		t.Fatalf("homeLen = %d, want 2", got)
+	}
+	press(m, "j") // into Quick Picks
+	if m.homeCursor != 1 {
+		t.Fatalf("homeCursor = %d, want 1", m.homeCursor)
+	}
+	if ct := m.contextTrack(); ct == nil || ct.ID != "qp1" {
+		t.Fatalf("contextTrack = %v, want qp1", ct)
+	}
+}
+
+// TestGoToArtistRouting: 'A' opens the artist view for the selection's primary
+// artist and remembers where to return.
+func TestGoToArtistRouting(t *testing.T) {
+	m := newTestModel()
+	m.activeView = viewSearch
+	m.focus = focusPanel
+	m.searchResults = []api.Track{{ID: "s1", Title: "Song", Artist: "Foo & Bar"}}
+	m.searchCursor = 0
+
+	press(m, "A")
+	if m.activeView != viewArtist {
+		t.Fatalf("activeView = %v, want viewArtist", m.activeView)
+	}
+	if m.artistName != "Foo" {
+		t.Fatalf("artistName = %q, want Foo", m.artistName)
+	}
+	if m.prevView != viewSearch {
+		t.Fatalf("prevView = %v, want viewSearch", m.prevView)
+	}
+
+	press(m, "esc") // contextual back
 	if m.activeView != viewSearch {
-		t.Fatalf("expected to start on viewSearch, got %v", m.activeView)
+		t.Fatalf("after esc activeView = %v, want viewSearch", m.activeView)
+	}
+}
+
+func TestFirstArtistOf(t *testing.T) {
+	cases := map[string]string{
+		"Foo":           "Foo",
+		"Foo & Bar":     "Foo",
+		"Foo, Bar":      "Foo",
+		"Foo feat. Baz": "Foo",
+		"Foo x Bar":     "Foo",
+	}
+	for in, want := range cases {
+		if got := firstArtistOf(in); got != want {
+			t.Errorf("firstArtistOf(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
@@ -152,7 +251,11 @@ func TestViewsRenderWithoutPanic(t *testing.T) {
 	m := newTestModel()
 	m.queue = []api.Track{{ID: "x", Title: "Song A", Artist: "Artist A", Duration: "3:21"}}
 	m.searchResults = m.queue
-	for _, v := range []view{viewSearch, viewQueue, viewFavorites, viewHistory, viewTrending, viewHelp} {
+	m.homeListenAgain = m.queue
+	m.artistName = "Artist A"
+	m.artistSongs = m.queue
+	m.artistAlbums = []api.AlbumRef{{ID: "MPREb1", Title: "Album One", Year: "2020"}}
+	for _, v := range []view{viewHome, viewSearch, viewQueue, viewFavorites, viewHistory, viewTrending, viewAlbum, viewArtist, viewHelp} {
 		m.activeView = v
 		out := m.View()
 		if out == "" {

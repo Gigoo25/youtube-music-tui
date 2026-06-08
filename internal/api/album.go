@@ -31,7 +31,18 @@ func AlbumByQuery(c *Client, album, artist string) ([]Track, string, error) {
 		return nil, "", nil
 	}
 
-	// Step 3: browse the album and parse its tracks.
+	// Step 3: browse the album by its id, falling back to the search-supplied
+	// artist when the album header doesn't name one.
+	return c.albumByID(browseID, artist)
+}
+
+// AlbumByID browses an album directly by its browse id (MPREb…) — used when the
+// id is already known (e.g. an album card on the artist page).
+func AlbumByID(c *Client, browseID string) ([]Track, string, error) {
+	return c.albumByID(browseID, "")
+}
+
+func (c *Client) albumByID(browseID, fallbackArtist string) ([]Track, string, error) {
 	bp := c.clientCtx()
 	bp["browseId"] = browseID
 	bbody, err := c.post("browse", bp)
@@ -46,7 +57,7 @@ func AlbumByQuery(c *Client, album, artist string) ([]Track, string, error) {
 	title := albumTitle(broot)
 	albumArtist := albumHeaderArtist(broot)
 	if albumArtist == "" {
-		albumArtist = artist
+		albumArtist = fallbackArtist
 	}
 	tracks := parseAlbumTracks(broot, albumArtist)
 	return tracks, title, nil

@@ -25,10 +25,35 @@ func (c *Client) Trending() ([]Track, error) {
 		return nil, err
 	}
 
-	tracks := collectListItemTracks(root)
+	// Single traversal of the (large) response: collect direct song rows and
+	// carousel items, and detect a chart playlist, all in one pass instead of
+	// three. Results are concatenated below in the original priority order
+	// (list rows → chart playlist → carousel) so dedupe/cap behaviour is
+	// unchanged.
+	var listTracks, twoRowTracks []Track
+	var picked, fallback string
+	walkRenderersMulti(root, map[string]func(map[string]any){
+		"musicResponsiveListItemRenderer": func(r map[string]any) {
+			if t := extractTrack(r); t.ID != "" && t.Title != "" {
+				listTracks = append(listTracks, t)
+			}
+		},
+		"musicTwoRowItemRenderer": func(r map[string]any) {
+			if t := extractTwoRowTrack(r); t.ID != "" && t.Title != "" {
+				twoRowTracks = append(twoRowTracks, t)
+			}
+			considerChartPlaylist(r, &picked, &fallback)
+		},
+	})
 
-	// Find a chart playlist (e.g. "Trending", "Top songs") and pull its songs.
-	if pid := findChartPlaylist(root); pid != "" {
+	tracks := listTracks
+
+	// Drill into the chart playlist (e.g. "Trending", "Top songs") for its songs.
+	pid := picked
+	if pid == "" {
+		pid = fallback
+	}
+	if pid != "" {
 		pp := c.clientCtx()
 		pp["browseId"] = pid
 		if pbody, perr := c.post("browse", pp); perr == nil {
@@ -39,7 +64,7 @@ func (c *Client) Trending() ([]Track, error) {
 	}
 
 	// Fallback: also include playable carousel items (music videos).
-	tracks = append(tracks, collectTwoRowTracks(root)...)
+	tracks = append(tracks, twoRowTracks...)
 
 	return dedupeTracks(tracks), nil
 }
@@ -103,46 +128,38 @@ func collectTwoRowTracks(node any) []Track {
 	return out
 }
 
-// findChartPlaylist scans carousel cards for a chart playlist browseId, favouring
-// titles that look like a trending / top-songs chart.
-func findChartPlaylist(node any) string {
-	var fallback string
-	var picked string
-
-	walkRenderers(node, "musicTwoRowItemRenderer", func(r map[string]any) {
-		if picked != "" {
-			return
-		}
-		browseID := str(dig(r, "navigationEndpoint", "browseEndpoint", "browseId"))
-		// VL prefix marks a playlist browse target.
-		if !strings.HasPrefix(browseID, "VL") {
-			return
-		}
-		pageType := str(dig(r, "navigationEndpoint", "browseEndpoint",
-			"browseEndpointContextSupportedConfigs",
-			"browseEndpointContextMusicConfig", "pageType"))
-		if pageType != "" && pageType != "MUSIC_PAGE_TYPE_PLAYLIST" {
-			return
-		}
-
-		if fallback == "" {
-			fallback = browseID
-		}
-
-		title := ""
-		if runs := digSlice(dig(r, "title", "runs")); len(runs) > 0 {
-			title = strings.ToLower(str(dig(runs[0], "text")))
-		}
-		if strings.Contains(title, "trending") || strings.Contains(title, "top song") ||
-			strings.Contains(title, "top 100") {
-			picked = browseID
-		}
-	})
-
-	if picked != "" {
-		return picked
+// considerChartPlaylist inspects a single musicTwoRowItemRenderer for a chart
+// playlist browseId, updating *picked (a title that looks like a trending /
+// top-songs chart) or *fallback (the first playlist seen). Called per renderer
+// during the Trending traversal.
+func considerChartPlaylist(r map[string]any, picked, fallback *string) {
+	if *picked != "" {
+		return
 	}
-	return fallback
+	browseID := str(dig(r, "navigationEndpoint", "browseEndpoint", "browseId"))
+	// VL prefix marks a playlist browse target.
+	if !strings.HasPrefix(browseID, "VL") {
+		return
+	}
+	pageType := str(dig(r, "navigationEndpoint", "browseEndpoint",
+		"browseEndpointContextSupportedConfigs",
+		"browseEndpointContextMusicConfig", "pageType"))
+	if pageType != "" && pageType != "MUSIC_PAGE_TYPE_PLAYLIST" {
+		return
+	}
+
+	if *fallback == "" {
+		*fallback = browseID
+	}
+
+	title := ""
+	if runs := digSlice(dig(r, "title", "runs")); len(runs) > 0 {
+		title = strings.ToLower(str(dig(runs[0], "text")))
+	}
+	if strings.Contains(title, "trending") || strings.Contains(title, "top song") ||
+		strings.Contains(title, "top 100") {
+		*picked = browseID
+	}
 }
 
 // walkRenderers recursively descends the decoded JSON and invokes fn for every
@@ -161,6 +178,27 @@ func walkRenderers(node any, key string, fn func(map[string]any)) {
 	case []any:
 		for _, child := range v {
 			walkRenderers(child, key, fn)
+		}
+	}
+}
+
+// walkRenderersMulti is walkRenderers for several renderer keys at once: it
+// descends the decoded JSON a single time and invokes the matching handler for
+// each key it encounters. Avoids re-walking a large response once per key.
+func walkRenderersMulti(node any, handlers map[string]func(map[string]any)) {
+	switch v := node.(type) {
+	case map[string]any:
+		for k, child := range v {
+			if fn, ok := handlers[k]; ok {
+				if m, ok := child.(map[string]any); ok {
+					fn(m)
+				}
+			}
+			walkRenderersMulti(child, handlers)
+		}
+	case []any:
+		for _, child := range v {
+			walkRenderersMulti(child, handlers)
 		}
 	}
 }

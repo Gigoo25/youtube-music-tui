@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -16,7 +17,8 @@ import (
 type view int
 
 const (
-	viewSearch view = iota
+	viewHome view = iota
+	viewSearch
 	viewQueue
 	viewFavorites
 	viewHistory
@@ -24,6 +26,7 @@ const (
 	viewNewReleases
 	viewExplore
 	viewAlbum
+	viewArtist
 	viewHelp
 )
 
@@ -51,6 +54,7 @@ type navEntry struct {
 // navEntries lists the sidebar Quick Links in display order. The selected
 // entry stays in sync with activeView.
 var navEntries = []navEntry{
+	{"Home", viewHome},
 	{"Search", viewSearch},
 	{"Queue", viewQueue},
 	{"Favorites", viewFavorites},
@@ -84,12 +88,36 @@ type model struct {
 	viewportH  int  // visible list height (set during render), for page scrolling
 	pendingG   bool // first 'g' of a 'gg' (go-to-top) chord was pressed
 
-	// search
+	// home (drop-in view): Listen Again (from local history) + Quick Picks
+	// (related to most-recent play, falling back to Trending). The cursor spans
+	// both sections as one flat list.
+	homeListenAgain []api.Track
+	homeQuickPicks  []api.Track
+	homeCursor      int
+	homeQPLoading   bool
+	homeQPErr       string
+	homeLoaded      bool
+
+	// artist view (top songs + albums for an artist) — contextual like album view
+	artistName    string
+	artistSongs   []api.Track
+	artistAlbums  []api.AlbumRef
+	artistCursor  int // spans songs then albums
+	artistLoading bool
+	artistErr     string
+
+	// search (global YouTube Music search — its own view)
 	searchInput   textinput.Model
 	searchTyping  bool // true = editing query; false = browsing results
 	searching     bool
 	searchResults []api.Track
 	searchCursor  int
+
+	// local filter ("/"): narrows the CURRENT pane's list in-memory. filtering =
+	// editing the query; filter != "" = an applied filter being browsed.
+	filterInput textinput.Model
+	filtering   bool
+	filter      string
 
 	// queue
 	queue       []api.Track
@@ -124,6 +152,31 @@ type model struct {
 	status    string
 	statusErr bool
 	statusAt  time.Time
+
+	// render caches: rebuilt only when their input key changes (sidebar and
+	// shortcuts bar are otherwise re-rendered from scratch every frame)
+	sbKey   sidebarKey
+	sbCache string
+	scKey   shortcutsKey
+	scCache string
+
+	// debounced config persistence: mutations mark dirty; the tick flushes after
+	// configSaveDelay so favoriting/queue churn doesn't re-marshal+write on every
+	// action. main.go does a final Save() on exit, so nothing is lost on quit.
+	cfgDirty   bool
+	cfgDirtyAt time.Time
+}
+
+// configSaveDelay is how long config changes are batched before being written.
+const configSaveDelay = 3 * time.Second
+
+// markConfigDirty flags the in-memory config for a debounced disk write. The
+// actual Save happens in the tick handler (the single Update goroutine).
+func (m *model) markConfigDirty() {
+	if !m.cfgDirty {
+		m.cfgDirty = true
+		m.cfgDirtyAt = time.Now()
+	}
 }
 
 // statusTTL is how long a transient status message stays on screen.
@@ -170,6 +223,16 @@ type albumDoneMsg struct {
 	err    error
 }
 
+type homeQuickPicksMsg struct {
+	tracks []api.Track
+	err    error
+}
+
+type artistDoneMsg struct {
+	res api.ArtistResult
+	err error
+}
+
 // randomSeeds drive the "play random" feature (z): a random seed is searched
 // and a random result is played. No extra API endpoint required.
 var randomSeeds = []string{
@@ -181,17 +244,24 @@ func New(p *player.Player, cfg *config.Config) *model {
 	ti := textinput.New()
 	ti.Placeholder = "Search YouTube Music..."
 	ti.CharLimit = 200
-	ti.Focus()
+
+	fi := textinput.New()
+	fi.Placeholder = "filter…"
+	fi.CharLimit = 100
+
+	client := api.NewClient()
+	client.SetTimeout(api.RequestTimeout)
 
 	return &model{
 		player:       p,
 		cfg:          cfg,
-		api:          api.NewClient(),
-		activeView:   viewSearch,
+		api:          client,
+		activeView:   viewHome,
 		focus:        focusPanel,
-		navCursor:    navIndexOf(viewSearch),
+		navCursor:    navIndexOf(viewHome),
 		searchInput:  ti,
-		searchTyping: true,
+		filterInput:  fi,
+		searchTyping: false,
 		playerState:  player.State{Volume: cfg.Volume},
 		browse: map[view]*browseState{
 			viewTrending:    {title: "Trending", load: (*api.Client).Trending},
@@ -202,16 +272,31 @@ func New(p *player.Player, cfg *config.Config) *model {
 }
 
 func (m *model) Init() tea.Cmd {
+	// Drop into Home: Listen Again is built synchronously from history; Quick
+	// Picks loads asynchronously.
+	m.refreshListenAgain()
+	m.homeLoaded = true
 	return tea.Batch(
 		textinput.Blink,
-		tick(),
+		m.nextTick(),
+		m.loadHomeQuickPicks(),
 	)
 }
 
-func tick() tea.Cmd {
-	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg {
+func tickEvery(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
+}
+
+// nextTick schedules the player-snapshot refresh. Fast cadence only while a track
+// is actively playing (so the progress bar advances smoothly); backs off when idle
+// or paused to cut steady-state wakeups ~4x.
+func (m *model) nextTick() tea.Cmd {
+	if m.hasCurrent && !m.playerState.Paused {
+		return tickEvery(500 * time.Millisecond)
+	}
+	return tickEvery(2 * time.Second)
 }
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -231,11 +316,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = ""
 			m.statusErr = false
 		}
+		// Flush any debounced config changes.
+		if m.cfgDirty && time.Since(m.cfgDirtyAt) >= configSaveDelay {
+			m.cfg.Save()
+			m.cfgDirty = false
+		}
 		// Lazily load the active browse view the first time it's opened.
 		if bs, ok := m.browse[m.activeView]; ok && !bs.loaded && !bs.loading {
-			return m, tea.Batch(tick(), m.loadBrowse(m.activeView))
+			return m, tea.Batch(m.nextTick(), m.loadBrowse(m.activeView))
 		}
-		return m, tick()
+		return m, m.nextTick()
 
 	case browseLoadedMsg:
 		if bs, ok := m.browse[msg.view]; ok {
@@ -291,6 +381,37 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case homeQuickPicksMsg:
+		m.homeQPLoading = false
+		if msg.err != nil {
+			m.homeQPErr = msg.err.Error()
+		} else {
+			m.homeQPErr = ""
+			m.homeQuickPicks = msg.tracks
+		}
+		if m.homeCursor >= m.homeLen() {
+			m.homeCursor = max(0, m.homeLen()-1)
+		}
+		return m, nil
+
+	case artistDoneMsg:
+		m.artistLoading = false
+		if msg.err != nil {
+			m.artistErr = msg.err.Error()
+		} else {
+			m.artistErr = ""
+			if msg.res.Name != "" {
+				m.artistName = msg.res.Name
+			}
+			m.artistSongs = msg.res.Songs
+			m.artistAlbums = msg.res.Albums
+			if len(m.artistSongs) == 0 && len(m.artistAlbums) == 0 {
+				m.setStatus("artist not found")
+			}
+		}
+		m.artistCursor = 0
+		return m, nil
+
 	case searchDoneMsg:
 		m.searching = false
 		if msg.err != nil {
@@ -322,6 +443,157 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // typing reports whether the user is actively editing the search query.
 func (m *model) typing() bool {
 	return m.activeView == viewSearch && m.searchTyping
+}
+
+// ── Local filter ──
+
+// filterableView reports whether the active view has a list the "/" filter
+// applies to.
+func (m *model) filterableView() bool {
+	switch m.activeView {
+	case viewHome, viewQueue, viewFavorites, viewHistory,
+		viewTrending, viewNewReleases, viewExplore, viewAlbum, viewArtist:
+		return true
+	}
+	return false
+}
+
+// filterActive reports whether a filter query is currently shaping the list.
+func (m *model) filterActive() bool {
+	return m.filter != "" && m.filterableView()
+}
+
+func matchStr(s, q string) bool {
+	return strings.Contains(strings.ToLower(s), strings.ToLower(q))
+}
+
+func matchTrack(t api.Track, q string) bool {
+	return matchStr(t.Title, q) || matchStr(t.Artist, q)
+}
+
+// filt returns src filtered by the active query (or src unchanged when no filter).
+func (m *model) filt(src []api.Track) []api.Track {
+	if !m.filterActive() {
+		return src
+	}
+	out := make([]api.Track, 0, len(src))
+	for _, t := range src {
+		if matchTrack(t, m.filter) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// filtAlbums is filt for album refs (matches title/artist).
+func (m *model) filtAlbums(src []api.AlbumRef) []api.AlbumRef {
+	if !m.filterActive() {
+		return src
+	}
+	out := make([]api.AlbumRef, 0, len(src))
+	for _, a := range src {
+		if matchStr(a.Title, m.filter) || matchStr(a.Artist, m.filter) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// filtHistory is filt for history entries.
+func (m *model) filtHistory(src []config.HistoryEntry) []config.HistoryEntry {
+	if !m.filterActive() {
+		return src
+	}
+	out := make([]config.HistoryEntry, 0, len(src))
+	for _, e := range src {
+		if matchTrack(e.Track, m.filter) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// trackVisibleIndices maps filtered positions back to original indices in src —
+// needed by views with positional semantics (Queue removal, Album/Artist
+// "play from here").
+func (m *model) trackVisibleIndices(src []api.Track) []int {
+	out := make([]int, 0, len(src))
+	for i, t := range src {
+		if !m.filterActive() || matchTrack(t, m.filter) {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// activeCursorPtr returns a pointer to the active view's list cursor, or nil.
+func (m *model) activeCursorPtr() *int {
+	switch m.activeView {
+	case viewHome:
+		return &m.homeCursor
+	case viewQueue:
+		return &m.queueCursor
+	case viewFavorites:
+		return &m.favCursor
+	case viewHistory:
+		return &m.historyCursor
+	case viewTrending, viewNewReleases, viewExplore:
+		if bs, ok := m.browse[m.activeView]; ok {
+			return &bs.cursor
+		}
+	case viewAlbum:
+		return &m.albumCursor
+	case viewArtist:
+		return &m.artistCursor
+	}
+	return nil
+}
+
+// activeFilteredLen is the number of rows currently selectable in the active view
+// under the live filter.
+func (m *model) activeFilteredLen() int {
+	switch m.activeView {
+	case viewHome:
+		return len(m.filt(m.homeListenAgain)) + len(m.filt(m.homeQuickPicks))
+	case viewQueue:
+		return len(m.filt(m.queue))
+	case viewFavorites:
+		return len(m.filt(m.cfg.Favorites))
+	case viewHistory:
+		return len(m.filtHistory(m.cfg.History))
+	case viewTrending, viewNewReleases, viewExplore:
+		if bs, ok := m.browse[m.activeView]; ok {
+			return len(m.filt(bs.tracks))
+		}
+	case viewAlbum:
+		return len(m.filt(m.albumTracks))
+	case viewArtist:
+		return len(m.filt(m.artistSongs)) + len(m.filtAlbums(m.artistAlbums))
+	}
+	return 0
+}
+
+// clampActiveCursor keeps the active view's cursor within the filtered list.
+func (m *model) clampActiveCursor() {
+	cp := m.activeCursorPtr()
+	if cp == nil {
+		return
+	}
+	n := m.activeFilteredLen()
+	if *cp >= n {
+		*cp = max(0, n-1)
+	}
+	if *cp < 0 {
+		*cp = 0
+	}
+}
+
+// clearFilter drops any active filter (called when leaving a view).
+func (m *model) clearFilter() {
+	m.filter = ""
+	m.filtering = false
+	m.filterInput.SetValue("")
+	m.filterInput.Blur()
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -364,6 +636,29 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		var cmd tea.Cmd
 		m.searchInput, cmd = m.searchInput.Update(msg)
+		return m, cmd
+	}
+
+	// While editing the local "/" filter, the filter input owns the keyboard
+	// except for confirm/cancel.
+	if m.filtering {
+		switch msg.String() {
+		case "enter":
+			// Keep the filter applied; drop back to navigating the results.
+			m.filtering = false
+			m.filterInput.Blur()
+			return m, nil
+		case "esc":
+			m.clearFilter()
+			if cp := m.activeCursorPtr(); cp != nil {
+				*cp = 0
+			}
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.filterInput, cmd = m.filterInput.Update(msg)
+		m.filter = m.filterInput.Value()
+		m.clampActiveCursor()
 		return m, cmd
 	}
 
@@ -419,11 +714,22 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "a":
 		return m, m.goToAlbum()
+	case "A":
+		return m, m.goToArtist()
 	case "/":
-		m.activateView(viewSearch)
-		m.searchTyping = true
-		m.searchInput.Focus()
-		return m, textinput.Blink
+		// Local filter of the current pane. In the global Search view, "/" instead
+		// re-focuses the query box (global search lives on the sidebar / key 2).
+		if m.filterableView() {
+			m.filtering = true
+			m.filterInput.Focus()
+			return m, textinput.Blink
+		}
+		if m.activeView == viewSearch {
+			m.searchTyping = true
+			m.searchInput.Focus()
+			return m, textinput.Blink
+		}
+		return m, nil
 	case "tab":
 		// Toggle focus between sidebar and panel.
 		if m.focus == focusSidebar {
@@ -440,24 +746,27 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "1":
-		m.activateView(viewSearch)
+		m.activateView(viewHome)
 		return m, nil
 	case "2":
-		m.activateView(viewQueue)
+		m.activateView(viewSearch)
 		return m, nil
 	case "3":
-		m.activateView(viewFavorites)
+		m.activateView(viewQueue)
 		return m, nil
 	case "4":
-		m.activateView(viewHistory)
+		m.activateView(viewFavorites)
 		return m, nil
 	case "5":
-		m.activateView(viewTrending)
+		m.activateView(viewHistory)
 		return m, nil
 	case "6":
-		m.activateView(viewNewReleases)
+		m.activateView(viewTrending)
 		return m, nil
 	case "7":
+		m.activateView(viewNewReleases)
+		return m, nil
+	case "8":
 		m.activateView(viewExplore)
 		return m, nil
 	case "z":
@@ -466,7 +775,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.startRadio()
 	case "?":
 		if m.activeView == viewHelp {
-			m.activateView(viewSearch)
+			m.activateView(viewHome)
 		} else {
 			m.activateView(viewHelp)
 		}
@@ -485,8 +794,18 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.navCursor = navIndexOf(m.activeView)
 		return m, nil
 	case "esc":
-		// From the album view, esc returns to the screen it was opened from.
-		if m.activeView == viewAlbum {
+		// An applied local filter clears first, before any navigation.
+		if m.filter != "" {
+			m.clearFilter()
+			if cp := m.activeCursorPtr(); cp != nil {
+				*cp = 0
+			}
+			return m, nil
+		}
+		// The album and artist views are contextual: esc returns to the screen
+		// they were opened from.
+		if m.activeView == viewAlbum || m.activeView == viewArtist {
+			m.clearFilter()
 			m.activeView = m.prevView
 			m.navCursor = navIndexOf(m.activeView)
 			m.focus = focusPanel
@@ -506,6 +825,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// ── Panel focus: view-specific keys ──
 	switch m.activeView {
+	case viewHome:
+		return m.handleHomeKey(msg)
 	case viewSearch:
 		return m.handleSearchKey(msg)
 	case viewQueue:
@@ -518,6 +839,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleBrowseKey(m.activeView, msg)
 	case viewAlbum:
 		return m.handleAlbumKey(msg)
+	case viewArtist:
+		return m.handleArtistKey(msg)
 	case viewHelp:
 		return m, nil
 	}
@@ -534,6 +857,7 @@ func (m *model) goToAlbum() tea.Cmd {
 	if m.activeView != viewAlbum {
 		m.prevView = m.activeView
 	}
+	m.clearFilter()
 	m.activeView = viewAlbum
 	m.focus = focusPanel
 	m.albumLoading = true
@@ -615,14 +939,17 @@ func (m *model) vimMove(key string, cursor, total int) (int, bool) {
 }
 
 func (m *model) handleAlbumKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if nc, ok := m.vimMove(msg.String(), m.albumCursor, len(m.albumTracks)); ok {
+	vis := m.trackVisibleIndices(m.albumTracks)
+	if nc, ok := m.vimMove(msg.String(), m.albumCursor, len(vis)); ok {
 		m.albumCursor = nc
 		return m, nil
 	}
 	switch msg.String() {
 	case "enter":
-		// Play the whole album starting from the selected track.
-		m.playAlbumFrom(m.albumCursor)
+		// Play the whole album starting from the selected (filtered) track.
+		if m.albumCursor < len(vis) {
+			m.playAlbumFrom(vis[m.albumCursor])
+		}
 	case "p":
 		// Play the whole album from the top.
 		m.playAlbumFrom(0)
@@ -639,6 +966,195 @@ func (m *model) playAlbumFrom(idx int) {
 	m.queueCursor = idx
 	m.playAt(idx)
 	m.setStatus("playing album: " + m.albumTitle)
+}
+
+// ── Home view ──
+
+// homeSections returns the (filter-aware) Listen Again and Quick Picks lists.
+func (m *model) homeSections() (la, qp []api.Track) {
+	return m.filt(m.homeListenAgain), m.filt(m.homeQuickPicks)
+}
+
+// homeLen is the number of selectable tracks across both home sections.
+func (m *model) homeLen() int {
+	la, qp := m.homeSections()
+	return len(la) + len(qp)
+}
+
+// homeTrackAt resolves the track at flat index i (Listen Again then Quick Picks).
+func (m *model) homeTrackAt(i int) (api.Track, bool) {
+	la, qp := m.homeSections()
+	if i < 0 {
+		return api.Track{}, false
+	}
+	if i < len(la) {
+		return la[i], true
+	}
+	i -= len(la)
+	if i < len(qp) {
+		return qp[i], true
+	}
+	return api.Track{}, false
+}
+
+// refreshListenAgain rebuilds the Listen Again section from recent history,
+// deduped by track id (newest first), capped.
+func (m *model) refreshListenAgain() {
+	const limit = 15
+	seen := make(map[string]struct{}, limit)
+	out := m.homeListenAgain[:0] // reuse backing array across refreshes
+	for _, h := range m.cfg.History {
+		if h.Track.ID == "" {
+			continue
+		}
+		if _, dup := seen[h.Track.ID]; dup {
+			continue
+		}
+		seen[h.Track.ID] = struct{}{}
+		out = append(out, h.Track)
+		if len(out) >= limit {
+			break
+		}
+	}
+	m.homeListenAgain = out
+}
+
+// loadHomeQuickPicks fetches Quick Picks: tracks related to the most-recent play,
+// falling back to Trending when there's no history (or no related results).
+func (m *model) loadHomeQuickPicks() tea.Cmd {
+	m.homeQPLoading = true
+	m.homeQPErr = ""
+	seed := ""
+	if len(m.cfg.History) > 0 {
+		seed = m.cfg.History[0].Track.ID
+	}
+	client := m.api
+	return func() tea.Msg {
+		var tracks []api.Track
+		var err error
+		if seed != "" {
+			tracks, err = client.Related(seed)
+		}
+		if err == nil && len(tracks) == 0 {
+			tracks, err = client.Trending()
+		}
+		return homeQuickPicksMsg{tracks: tracks, err: err}
+	}
+}
+
+func (m *model) handleHomeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if nc, ok := m.vimMove(msg.String(), m.homeCursor, m.homeLen()); ok {
+		m.homeCursor = nc
+		return m, nil
+	}
+	switch msg.String() {
+	case "enter":
+		if t, ok := m.homeTrackAt(m.homeCursor); ok {
+			m.enqueue(t)
+		}
+	case "p":
+		if t, ok := m.homeTrackAt(m.homeCursor); ok {
+			m.playNow(t)
+		}
+	case "ctrl+r":
+		m.refreshListenAgain()
+		return m, m.loadHomeQuickPicks()
+	}
+	return m, nil
+}
+
+// ── Artist view ──
+
+// goToArtist opens the artist view for the selected/playing track's artist.
+func (m *model) goToArtist() tea.Cmd {
+	t := m.contextTrack()
+	if t == nil || t.Artist == "" {
+		m.setError("no artist for selection")
+		return nil
+	}
+	if m.activeView != viewArtist {
+		m.prevView = m.activeView
+	}
+	m.clearFilter()
+	m.activeView = viewArtist
+	m.focus = focusPanel
+	m.artistLoading = true
+	m.artistErr = ""
+	m.artistSongs = nil
+	m.artistAlbums = nil
+	m.artistCursor = 0
+	m.artistName = firstArtistOf(t.Artist)
+
+	client := m.api
+	name := m.artistName
+	return func() tea.Msg {
+		res, err := api.ArtistByQuery(client, name)
+		return artistDoneMsg{res: res, err: err}
+	}
+}
+
+func (m *model) handleArtistKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	songVis := m.trackVisibleIndices(m.artistSongs)
+	albums := m.filtAlbums(m.artistAlbums)
+	total := len(songVis) + len(albums)
+	if nc, ok := m.vimMove(msg.String(), m.artistCursor, total); ok {
+		m.artistCursor = nc
+		return m, nil
+	}
+	switch msg.String() {
+	case "enter":
+		if m.artistCursor < len(songVis) {
+			m.playArtistSongsFrom(songVis[m.artistCursor])
+		} else if ai := m.artistCursor - len(songVis); ai < len(albums) {
+			return m, m.openAlbumByID(albums[ai])
+		}
+	case "p":
+		m.playArtistSongsFrom(0)
+	}
+	return m, nil
+}
+
+// playArtistSongsFrom replaces the queue with the artist's top songs and plays
+// from idx.
+func (m *model) playArtistSongsFrom(idx int) {
+	if idx < 0 || idx >= len(m.artistSongs) {
+		return
+	}
+	m.queue = append([]api.Track(nil), m.artistSongs...)
+	m.queueCursor = idx
+	m.playAt(idx)
+	m.setStatus("playing: " + m.artistName)
+}
+
+// openAlbumByID opens an album (by browse id) from the artist view; esc returns
+// to the artist.
+func (m *model) openAlbumByID(a api.AlbumRef) tea.Cmd {
+	m.clearFilter()
+	m.prevView = viewArtist
+	m.activeView = viewAlbum
+	m.focus = focusPanel
+	m.albumLoading = true
+	m.albumErr = ""
+	m.albumTracks = nil
+	m.albumCursor = 0
+	m.albumTitle = a.Title
+
+	client := m.api
+	id := a.ID
+	return func() tea.Msg {
+		tracks, title, err := api.AlbumByID(client, id)
+		return albumDoneMsg{tracks: tracks, title: title, err: err}
+	}
+}
+
+// firstArtistOf returns the primary artist from a possibly multi-artist byline.
+func firstArtistOf(s string) string {
+	for _, sep := range []string{" & ", ", ", " feat", " · ", " x "} {
+		if i := strings.Index(s, sep); i > 0 {
+			return strings.TrimSpace(s[:i])
+		}
+	}
+	return strings.TrimSpace(s)
 }
 
 // loadBrowse kicks off the async API call for a browse view.
@@ -661,18 +1177,19 @@ func (m *model) handleBrowseKey(v view, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if !ok {
 		return m, nil
 	}
-	if nc, ok := m.vimMove(msg.String(), bs.cursor, len(bs.tracks)); ok {
+	tracks := m.filt(bs.tracks)
+	if nc, ok := m.vimMove(msg.String(), bs.cursor, len(tracks)); ok {
 		bs.cursor = nc
 		return m, nil
 	}
 	switch msg.String() {
 	case "enter":
-		if bs.cursor < len(bs.tracks) {
-			m.enqueue(bs.tracks[bs.cursor])
+		if bs.cursor < len(tracks) {
+			m.enqueue(tracks[bs.cursor])
 		}
 	case "p":
-		if bs.cursor < len(bs.tracks) {
-			m.playNow(bs.tracks[bs.cursor])
+		if bs.cursor < len(tracks) {
+			m.playNow(tracks[bs.cursor])
 		}
 	case "ctrl+r":
 		// reload the feed
@@ -710,7 +1227,7 @@ func (m *model) startRadio() tea.Cmd {
 }
 
 func (m *model) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	hist := m.cfg.History
+	hist := m.filtHistory(m.cfg.History)
 	if nc, ok := m.vimMove(msg.String(), m.historyCursor, len(hist)); ok {
 		m.historyCursor = nc
 		return m, nil
@@ -731,9 +1248,17 @@ func (m *model) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // activateView switches to v, syncs the sidebar selection, and moves focus to
 // the panel. Used by quick-jump keys and sidebar activation.
 func (m *model) activateView(v view) {
+	m.clearFilter()
 	m.activeView = v
 	m.navCursor = navIndexOf(v)
 	m.focus = focusPanel
+	if v == viewHome {
+		// Keep Listen Again current with recent plays each time Home is opened.
+		m.refreshListenAgain()
+		if m.homeCursor >= m.homeLen() {
+			m.homeCursor = 0
+		}
+	}
 }
 
 // handleSidebarKey processes navigation while the Quick Links sidebar is focused.
@@ -745,8 +1270,7 @@ func (m *model) handleSidebarKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter", "l", "right":
 		target := navEntries[m.navCursor].view
-		m.activeView = target
-		m.focus = focusPanel
+		m.activateView(target)
 		if target == viewSearch {
 			m.searchTyping = true
 			m.searchInput.Focus()
@@ -781,28 +1305,31 @@ func (m *model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if nc, ok := m.vimMove(msg.String(), m.queueCursor, len(m.queue)); ok {
+	// vis maps filtered rows back to indices in the full queue (identity when no
+	// filter is applied).
+	vis := m.trackVisibleIndices(m.queue)
+	if nc, ok := m.vimMove(msg.String(), m.queueCursor, len(vis)); ok {
 		m.queueCursor = nc
 		return m, nil
 	}
 	switch msg.String() {
 	case "J":
-		m.moveQueueItem(m.queueCursor, m.queueCursor+1)
+		if !m.filterActive() {
+			m.moveQueueItem(m.queueCursor, m.queueCursor+1)
+		}
 	case "K":
-		m.moveQueueItem(m.queueCursor, m.queueCursor-1)
+		if !m.filterActive() {
+			m.moveQueueItem(m.queueCursor, m.queueCursor-1)
+		}
 	case "enter", "p":
-		if len(m.queue) > 0 {
-			m.queuePos = m.queueCursor
+		if m.queueCursor < len(vis) {
+			m.queuePos = vis[m.queueCursor]
 			m.playAt(m.queuePos)
 		}
 	case "d", "x":
-		if len(m.queue) > 0 {
-			removed := m.queueCursor
+		if m.queueCursor < len(vis) {
+			removed := vis[m.queueCursor]
 			m.queue = append(m.queue[:removed], m.queue[removed+1:]...)
-			// Keep the cursor in range.
-			if m.queueCursor >= len(m.queue) && m.queueCursor > 0 {
-				m.queueCursor--
-			}
 			// Keep queuePos pointing at the same playing track.
 			switch {
 			case removed < m.queuePos:
@@ -815,6 +1342,7 @@ func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.queuePos = 0
 				}
 			}
+			m.clampActiveCursor() // keep cursor in range of the (refiltered) list
 			m.setStatus("removed from queue")
 		}
 	case "c":
@@ -846,7 +1374,7 @@ func (m *model) moveQueueItem(from, to int) {
 }
 
 func (m *model) handleFavKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	favs := m.cfg.Favorites
+	favs := m.filt(m.cfg.Favorites)
 	if nc, ok := m.vimMove(msg.String(), m.favCursor, len(favs)); ok {
 		m.favCursor = nc
 		return m, nil
@@ -864,10 +1392,8 @@ func (m *model) handleFavKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Remove from favorites (f is the global toggle handled above).
 		if m.favCursor < len(favs) {
 			m.cfg.ToggleFavorite(favs[m.favCursor])
-			m.cfg.Save()
-			if m.favCursor >= len(m.cfg.Favorites) && m.favCursor > 0 {
-				m.favCursor--
-			}
+			m.markConfigDirty()
+			m.clampActiveCursor()
 			m.setStatus("removed from favorites")
 		}
 	}
@@ -882,7 +1408,7 @@ func (m *model) toggleFavoriteContext() {
 		return
 	}
 	added := m.cfg.ToggleFavorite(*t)
-	m.cfg.Save()
+	m.markConfigDirty()
 	if added {
 		m.setStatus("favorited: " + t.Title)
 	} else {
@@ -896,34 +1422,45 @@ func (m *model) toggleFavoriteContext() {
 // contextTrack resolves the track the user is currently acting on, by view.
 func (m *model) contextTrack() *api.Track {
 	switch m.activeView {
+	case viewHome:
+		if t, ok := m.homeTrackAt(m.homeCursor); ok {
+			return &t
+		}
+	case viewArtist:
+		if songs := m.filt(m.artistSongs); m.artistCursor < len(songs) {
+			t := songs[m.artistCursor]
+			return &t
+		}
 	case viewSearch:
 		if m.searchCursor < len(m.searchResults) {
 			t := m.searchResults[m.searchCursor]
 			return &t
 		}
 	case viewQueue:
-		if m.queueCursor < len(m.queue) {
-			t := m.queue[m.queueCursor]
+		if q := m.filt(m.queue); m.queueCursor < len(q) {
+			t := q[m.queueCursor]
 			return &t
 		}
 	case viewFavorites:
-		if m.favCursor < len(m.cfg.Favorites) {
-			t := m.cfg.Favorites[m.favCursor]
+		if favs := m.filt(m.cfg.Favorites); m.favCursor < len(favs) {
+			t := favs[m.favCursor]
 			return &t
 		}
 	case viewHistory:
-		if m.historyCursor < len(m.cfg.History) {
-			t := m.cfg.History[m.historyCursor].Track
+		if hist := m.filtHistory(m.cfg.History); m.historyCursor < len(hist) {
+			t := hist[m.historyCursor].Track
 			return &t
 		}
 	case viewTrending, viewNewReleases, viewExplore:
-		if bs, ok := m.browse[m.activeView]; ok && bs.cursor < len(bs.tracks) {
-			t := bs.tracks[bs.cursor]
-			return &t
+		if bs, ok := m.browse[m.activeView]; ok {
+			if tracks := m.filt(bs.tracks); bs.cursor < len(tracks) {
+				t := tracks[bs.cursor]
+				return &t
+			}
 		}
 	case viewAlbum:
-		if m.albumCursor < len(m.albumTracks) {
-			t := m.albumTracks[m.albumCursor]
+		if tracks := m.filt(m.albumTracks); m.albumCursor < len(tracks) {
+			t := tracks[m.albumCursor]
 			return &t
 		}
 	}
@@ -970,9 +1507,9 @@ func (m *model) playAt(idx int) {
 	m.player.Load(t.ID)
 	// No transient "loading" status — the now-playing bar shows load state.
 
-	// Record the play in history (newest first) and persist.
+	// Record the play in history (newest first); persistence is debounced.
 	m.cfg.AddHistory(t)
-	m.cfg.Save()
+	m.markConfigDirty()
 	m.historyCursor = 0
 }
 

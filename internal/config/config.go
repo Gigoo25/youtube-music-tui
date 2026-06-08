@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/rob/ytmusic/internal/api"
@@ -23,6 +24,16 @@ type Config struct {
 	History   []HistoryEntry `json:"history"`
 	Volume    float64        `json:"volume"`
 	path      string
+	favSet    map[string]struct{} // favorite IDs, for O(1) IsFavorite lookups
+}
+
+// rebuildFavSet repopulates the favorite-ID set from the Favorites slice. Called
+// after load and lazily on first mutation.
+func (c *Config) rebuildFavSet() {
+	c.favSet = make(map[string]struct{}, len(c.Favorites))
+	for _, f := range c.Favorites {
+		c.favSet[f.ID] = struct{}{}
+	}
 }
 
 func Load() (*Config, error) {
@@ -54,6 +65,7 @@ func Load() (*Config, error) {
 		return &Config{path: path, Volume: 100}, nil
 	}
 	cfg.path = path
+	cfg.rebuildFavSet()
 	return cfg, nil
 }
 
@@ -72,22 +84,23 @@ func (c *Config) Save() error {
 }
 
 func (c *Config) IsFavorite(id string) bool {
-	for _, f := range c.Favorites {
-		if f.ID == id {
-			return true
-		}
-	}
-	return false
+	_, ok := c.favSet[id]
+	return ok
 }
 
 func (c *Config) ToggleFavorite(t api.Track) bool {
+	if c.favSet == nil {
+		c.rebuildFavSet()
+	}
 	for i, f := range c.Favorites {
 		if f.ID == t.ID {
 			c.Favorites = append(c.Favorites[:i], c.Favorites[i+1:]...)
+			delete(c.favSet, t.ID)
 			return false
 		}
 	}
 	c.Favorites = append(c.Favorites, t)
+	c.favSet[t.ID] = struct{}{}
 	return true
 }
 
@@ -98,7 +111,9 @@ func (c *Config) AddHistory(t api.Track) {
 		return
 	}
 	entry := HistoryEntry{Track: t, PlayedAt: time.Now()}
-	c.History = append([]HistoryEntry{entry}, c.History...)
+	// Insert at the front; once History reaches maxHistory this shifts in place
+	// and reuses the backing array instead of allocating a fresh slice each play.
+	c.History = slices.Insert(c.History, 0, entry)
 	if len(c.History) > maxHistory {
 		c.History = c.History[:maxHistory]
 	}
