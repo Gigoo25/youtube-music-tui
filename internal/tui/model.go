@@ -986,7 +986,15 @@ func (m *model) playAlbumFrom(idx int) {
 	if idx < 0 || idx >= len(m.albumTracks) {
 		return
 	}
-	m.queue = append([]api.Track(nil), m.albumTracks...)
+	tracks := append([]api.Track(nil), m.albumTracks...)
+	// Album rows carry the artist but not the album name; fill it so the
+	// now-playing bar shows the album.
+	for i := range tracks {
+		if tracks[i].Album == "" {
+			tracks[i].Album = m.albumTitle
+		}
+	}
+	m.queue = tracks
 	m.queueCursor = idx
 	m.playAt(idx)
 	m.setStatus("playing album: " + m.albumTitle)
@@ -1144,7 +1152,15 @@ func (m *model) playArtistSongsFrom(idx int) {
 	if idx < 0 || idx >= len(m.artistSongs) {
 		return
 	}
-	m.queue = append([]api.Track(nil), m.artistSongs...)
+	songs := append([]api.Track(nil), m.artistSongs...)
+	// Artist-page rows often omit the (implied) artist; fill it so the now-playing
+	// bar shows it.
+	for i := range songs {
+		if songs[i].Artist == "" {
+			songs[i].Artist = m.artistName
+		}
+	}
+	m.queue = songs
 	m.queueCursor = idx
 	m.playAt(idx)
 	m.setStatus("playing: " + m.artistName)

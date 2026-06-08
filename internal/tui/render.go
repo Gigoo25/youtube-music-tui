@@ -688,7 +688,10 @@ func (m *model) renderNowBar(w int) string {
 	}
 	left := istyle.Render(icon) + " " + fav + stylePrimaryBold.Render(t.Title)
 	if t.Artist != "" {
-		left += styleDim.Render(" • " + t.Artist)
+		left += styleDim.Render(" • ") + styleSecondary.Render(t.Artist)
+	}
+	if t.Album != "" {
+		left += styleDim.Render(" — " + t.Album)
 	}
 
 	pct := 0
