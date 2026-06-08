@@ -149,22 +149,28 @@ func (m *model) renderSidebar(w, h int) string {
 		inner = 1
 	}
 
+	// The box has Padding(0,1), so the usable text width is inner-2. A coloured
+	// (ANSI) selection row wider than this overflows and lipgloss wraps it onto a
+	// second line, so every row must be padded/cropped to textW exactly.
+	textW := inner - 2
+	if textW < 1 {
+		textW = 1
+	}
+
 	var rows []string
-	rows = append(rows, stylePrimaryBold.Render(truncate2(iconVolume+" ytmusic", inner)))
-	rows = append(rows, styleSecondaryBold.Render("Quick Links"))
+	rows = append(rows, stylePrimaryBold.Render(truncate2(iconVolume+" ytmusic", textW)))
+	rows = append(rows, styleSecondaryBold.Render(truncate2("Quick Links", textW)))
 	sidebarFocused := m.focus == focusSidebar
 	for i, e := range navEntries {
 		switch {
 		case sidebarFocused && i == m.navCursor:
-			// Strong cursor highlight only when the sidebar has focus. Pad with a
-			// display-width-aware helper so the background fills exactly one line
-			// (a rune-count truncate miscounts glyphs like ▸ and wraps).
-			rows = append(rows, styleSelected.Render(padRight("> "+e.label, inner)))
+			// Strong cursor highlight only when the sidebar has focus.
+			rows = append(rows, styleSelected.Render(padRight("> "+e.label, textW)))
 		case e.view == m.activeView:
 			// Marks the active view while the panel is focused.
-			rows = append(rows, stylePrimary.Render(truncate2("> "+e.label, inner)))
+			rows = append(rows, stylePrimary.Render(truncate2("> "+e.label, textW)))
 		default:
-			rows = append(rows, styleText.Render(truncate2("  "+e.label, inner)))
+			rows = append(rows, styleText.Render(truncate2("  "+e.label, textW)))
 		}
 	}
 

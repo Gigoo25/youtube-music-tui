@@ -517,7 +517,7 @@ func (m *model) goToAlbum() tea.Cmd {
 		name = t.Title
 	}
 	m.albumTitle = name
-	m.setStatus("loading album…")
+	// The album panel shows its own "Loading…" — no transient status needed.
 
 	album, artist := t.Album, t.Artist
 	if album == "" {
