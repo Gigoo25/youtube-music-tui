@@ -240,10 +240,41 @@ func (m *model) renderPanelBody(w, h int) string {
 		return m.renderBrowse(m.activeView, w, h)
 	case viewAlbum:
 		return m.renderAlbum(w, h)
+	case viewGenres:
+		return m.renderGenres(w, h)
 	case viewHelp:
 		return m.renderHelp(w, h)
 	}
 	return ""
+}
+
+// renderGenres renders the random-genre picker (row 0 = "Any").
+func (m *model) renderGenres(w, h int) string {
+	heading := styleSecondaryBold.Render(iconShuffle + " Random — pick a genre")
+	items := make([]string, 0, len(randomSeeds)+1)
+	items = append(items, "Any (surprise me)")
+	items = append(items, randomSeeds...)
+
+	listH := h - lipgloss.Height(heading)
+	if listH < 1 {
+		listH = 1
+	}
+	focused := m.focus == focusPanel
+	start, end := windowBounds(m.genreCursor, len(items), listH)
+	var rows []string
+	for i := start; i < end; i++ {
+		selected := i == m.genreCursor
+		if selected && focused {
+			rows = append(rows, styleSelected.Width(w).Render(truncate("▸ "+items[i], w)))
+			continue
+		}
+		marker := "  "
+		if selected {
+			marker = stylePrimary.Render("▸ ")
+		}
+		rows = append(rows, marker+styleText.Render(items[i]))
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, heading, strings.Join(rows, "\n"))
 }
 
 // renderAlbum renders the album-of-a-track view.
@@ -611,6 +642,9 @@ func (m *model) buildShortcutsBar(w int) string {
 			segs = append(segs, shortcut{"j/k", "move", false},
 				shortcut{"enter", "play / open", false}, shortcut{"p", "play songs", false},
 				shortcut{"f", "fav", false})
+		case viewGenres:
+			segs = append(segs, shortcut{"j/k", "move", false},
+				shortcut{"enter", "pick & play", false}, shortcut{"esc", "cancel", false})
 		}
 		segs = append(segs, shortcut{"h", "menu", false})
 	}
@@ -1032,7 +1066,7 @@ func (m *model) renderHelp(w, h int) string {
 		{"f", "toggle favorite"},
 		{"a", "open the track's album (Enter to play it)"},
 		{"A", "open the track's artist (top songs + albums)"},
-		{"z", "play a random song"},
+		{"z", "random song (pick a genre)"},
 		{"R", "start radio from current track"},
 		{"T", "cycle color theme"},
 		{"enter", "queue / play selected"},

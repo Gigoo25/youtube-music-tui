@@ -27,6 +27,7 @@ const (
 	viewExplore
 	viewAlbum
 	viewArtist
+	viewGenres
 	viewHelp
 )
 
@@ -80,14 +81,15 @@ type model struct {
 	cfg    *config.Config
 	api    *api.Client
 
-	activeView view
-	focus      focusArea
-	navCursor  int
-	width      int
-	height     int
-	viewportH  int  // visible list height (set during render), for page scrolling
-	pendingG   bool // first 'g' of a 'gg' (go-to-top) chord was pressed
-	themeIdx   int  // index into themes of the active color theme
+	activeView  view
+	focus       focusArea
+	navCursor   int
+	width       int
+	height      int
+	viewportH   int  // visible list height (set during render), for page scrolling
+	pendingG    bool // first 'g' of a 'gg' (go-to-top) chord was pressed
+	themeIdx    int  // index into themes of the active color theme
+	genreCursor int  // selection in the random genre picker
 
 	// home (drop-in view): Listen Again (from local history) + Quick Picks
 	// (related to most-recent play, falling back to Trending). The cursor spans
@@ -791,7 +793,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.activateView(viewExplore)
 		return m, nil
 	case "z":
-		return m, m.playRandom()
+		m.openGenres()
+		return m, nil
 	case "R":
 		return m, m.startRadio()
 	case "T":
@@ -826,9 +829,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		// The album and artist views are contextual: esc returns to the screen
-		// they were opened from.
-		if m.activeView == viewAlbum || m.activeView == viewArtist {
+		// The album, artist and genre-picker views are contextual: esc returns to
+		// the screen they were opened from.
+		if m.activeView == viewAlbum || m.activeView == viewArtist || m.activeView == viewGenres {
 			m.clearFilter()
 			m.activeView = m.prevView
 			m.navCursor = navIndexOf(m.activeView)
@@ -865,6 +868,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleAlbumKey(msg)
 	case viewArtist:
 		return m.handleArtistKey(msg)
+	case viewGenres:
+		return m.handleGenresKey(msg)
 	case viewHelp:
 		return m, nil
 	}
@@ -1240,10 +1245,48 @@ func (m *model) handleBrowseKey(v view, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// playRandom searches a random seed term and plays a random result.
+// openGenres opens the random-genre picker.
+func (m *model) openGenres() {
+	if m.activeView != viewGenres {
+		m.prevView = m.activeView
+	}
+	m.clearFilter()
+	m.activeView = viewGenres
+	m.focus = focusPanel
+	m.genreCursor = 0
+}
+
+// handleGenresKey drives the random-genre picker. Row 0 is "Any" (a random
+// genre); the rest are the seeds. Selecting one plays a random song from it and
+// closes the picker.
+func (m *model) handleGenresKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if nc, ok := m.vimMove(msg.String(), m.genreCursor, len(randomSeeds)+1); ok {
+		m.genreCursor = nc
+		return m, nil
+	}
+	switch msg.String() {
+	case "enter":
+		var cmd tea.Cmd
+		if m.genreCursor == 0 {
+			cmd = m.playRandom()
+		} else {
+			cmd = m.playRandomGenre(randomSeeds[m.genreCursor-1])
+		}
+		m.activeView = m.prevView
+		m.navCursor = navIndexOf(m.activeView)
+		return m, cmd
+	}
+	return m, nil
+}
+
+// playRandom searches a random seed genre and plays a random result.
 func (m *model) playRandom() tea.Cmd {
-	seed := randomSeeds[rand.Intn(len(randomSeeds))]
-	m.setStatus("finding a random song (" + seed + ")...")
+	return m.playRandomGenre(randomSeeds[rand.Intn(len(randomSeeds))])
+}
+
+// playRandomGenre searches the given genre and plays a random result.
+func (m *model) playRandomGenre(seed string) tea.Cmd {
+	m.setStatus("finding a random " + seed + " song...")
 	client := m.api
 	return func() tea.Msg {
 		tracks, err := client.Search(seed)
