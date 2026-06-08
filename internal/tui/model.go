@@ -137,21 +137,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Global
-	switch msg.String() {
-	case "ctrl+c":
+	// Always quit on ctrl+c
+	if msg.String() == "ctrl+c" {
 		return m, tea.Quit
-	case "q":
-		if !m.searchMode {
+	}
+
+	// Tab/shift+tab work outside search input mode
+	if !m.searchMode {
+		switch msg.String() {
+		case "q":
 			return m, tea.Quit
-		}
-	case "tab":
-		if !m.searchMode {
+		case "tab":
 			m.activeView = (m.activeView + 1) % 3
 			return m, nil
-		}
-	case "shift+tab":
-		if !m.searchMode {
+		case "shift+tab":
 			m.activeView = (m.activeView + 2) % 3
 			return m, nil
 		}
@@ -180,7 +179,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	// Playback controls (always)
+	// Playback controls (always active outside search input mode)
 	switch msg.String() {
 	case " ":
 		m.player.PlayPause()
@@ -191,10 +190,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "b", "left":
 		m.prevTrack()
 		return m, nil
-	case "L": // shift+right equivalent
+	case "shift+right":
 		m.player.Seek(10)
 		return m, nil
-	case "H": // shift+left equivalent
+	case "shift+left":
 		m.player.Seek(-10)
 		return m, nil
 	case "=", "+":
@@ -215,13 +214,13 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.repeat = (m.repeat + 1) % 3
 		m.setStatus([]string{"repeat off", "repeat all", "repeat one"}[m.repeat])
 		return m, nil
-	case "/", "i":
+	case "/":
 		m.searchMode = true
 		m.searchInput.Focus()
 		return m, textinput.Blink
 	}
 
-	// View-specific
+	// View-specific keys
 	switch m.activeView {
 	case viewSearch:
 		return m.handleSearchKey(msg)
@@ -440,6 +439,9 @@ func (m *model) View() string {
 	headerH := lipgloss.Height(header)
 	playerH := lipgloss.Height(playerBar)
 	contentH := m.height - headerH - playerH
+	if contentH < 1 {
+		contentH = 1
+	}
 
 	content := m.renderContent(contentH)
 
@@ -449,38 +451,52 @@ func (m *model) View() string {
 func (m *model) renderHeader() string {
 	title := styleTitle.Render("▶ YT Music")
 
-	views := []string{" Search ", " Queue ", " Favorites "}
-	var tabs []string
-	for i, name := range views {
+	// Build tabs
+	tabNames := []string{"Search", "Queue", "Favorites"}
+	var tabParts []string
+	for i, name := range tabNames {
+		padded := "  " + name + "  "
 		if view(i) == m.activeView {
-			tabs = append(tabs, lipgloss.NewStyle().
-				Foreground(colorRed).Bold(true).Underline(true).Render(name))
+			tabParts = append(tabParts, lipgloss.NewStyle().
+				Foreground(colorRed).Bold(true).Underline(true).Render(padded))
 		} else {
-			tabs = append(tabs, styleHelp.Render(name))
+			tabParts = append(tabParts, styleHelp.Render(padded))
 		}
 	}
-	tabBar := strings.Join(tabs, styleHelp.Render("│"))
+	tabBar := strings.Join(tabParts, styleHelp.Render("│"))
 
-	indicators := ""
+	// Mode indicators
+	var indParts []string
 	if m.shuffle {
-		indicators += styleStatus.Render(" ⇌")
+		indParts = append(indParts, styleStatus.Render("⇌"))
 	}
 	switch m.repeat {
 	case repeatAll:
-		indicators += styleStatus.Render(" ↻")
+		indParts = append(indParts, styleStatus.Render("↻"))
 	case repeatOne:
-		indicators += styleStatus.Render(" ↺1")
+		indParts = append(indParts, styleStatus.Render("↺1"))
 	}
+	indicators := strings.Join(indParts, " ")
 
 	titleW := lipgloss.Width(title)
 	tabW := lipgloss.Width(tabBar)
 	indW := lipgloss.Width(indicators)
-	gap := m.width - titleW - tabW - indW - 2
-	if gap < 1 {
-		gap = 1
+
+	// Center tabs, right-align indicators
+	remaining := m.width - titleW - indW
+	if remaining < tabW {
+		remaining = tabW + 2
+	}
+	leftPad := (remaining - tabW) / 2
+	rightPad := remaining - tabW - leftPad
+	if leftPad < 1 {
+		leftPad = 1
+	}
+	if rightPad < 1 {
+		rightPad = 1
 	}
 
-	line := title + strings.Repeat(" ", gap/2+1) + tabBar + strings.Repeat(" ", gap-gap/2) + indicators
+	line := title + strings.Repeat(" ", leftPad) + tabBar + strings.Repeat(" ", rightPad) + indicators
 	sep := styleHelp.Render(strings.Repeat("─", m.width))
 	return line + "\n" + sep
 }
@@ -500,6 +516,7 @@ func (m *model) renderContent(height int) string {
 func (m *model) renderSearch(height int) string {
 	var sb strings.Builder
 
+	// Search input line
 	prefix := styleHelp.Render("  / ")
 	if m.searchMode {
 		prefix = styleStatus.Render("  / ")
@@ -507,19 +524,22 @@ func (m *model) renderSearch(height int) string {
 	inputLine := prefix + m.searchInput.View()
 	sb.WriteString(inputLine + "\n")
 	sb.WriteString(styleHelp.Render(strings.Repeat("─", m.width)) + "\n")
-	reserved := 2
+	reserved := 2 // input line + separator
 
 	if m.searching {
 		sb.WriteString(styleStatus.Render("  Searching..."))
-		return sb.String()
+		return m.padContent(sb.String(), height)
 	}
 
 	if len(m.searchResults) == 0 {
 		sb.WriteString(styleHelp.Render("  [/] search  [Enter] queue  [p] play now  [f] favorite"))
-		return sb.String()
+		return m.padContent(sb.String(), height)
 	}
 
 	listH := height - reserved
+	if listH < 1 {
+		listH = 1
+	}
 	start := 0
 	if m.searchCursor >= listH {
 		start = m.searchCursor - listH + 1
@@ -533,8 +553,9 @@ func (m *model) renderSearch(height int) string {
 
 func (m *model) renderQueue(height int) string {
 	if len(m.queue) == 0 {
-		return styleHelp.Render("  Queue empty — search tracks and press Enter to add.\n" +
-			"  [d] remove  [c] clear  [f] favorite  [Enter] play selected")
+		lines := styleHelp.Render("  Queue empty — search tracks and press Enter to add.\n") +
+			styleHelp.Render("  [d/x] remove  [c] clear  [f] favorite  [Enter/p] play")
+		return m.padContent(lines, height)
 	}
 
 	var sb strings.Builder
@@ -544,11 +565,11 @@ func (m *model) renderQueue(height int) string {
 	}
 
 	for i := start; i < len(m.queue) && i-start < height; i++ {
-		prefix := "   "
+		nowPlayingPrefix := "  "
 		if i == m.queuePos && m.current != nil {
-			prefix = styleNowPlaying.Render(" ▶ ")
+			nowPlayingPrefix = styleNowPlaying.Render("▶ ")
 		}
-		sb.WriteString(prefix + m.renderTrackLine(m.queue[i], i == m.queueCursor) + "\n")
+		sb.WriteString(nowPlayingPrefix + m.renderTrackLine(m.queue[i], i == m.queueCursor) + "\n")
 	}
 	return sb.String()
 }
@@ -556,7 +577,7 @@ func (m *model) renderQueue(height int) string {
 func (m *model) renderFavorites(height int) string {
 	favs := m.cfg.Favorites
 	if len(favs) == 0 {
-		return styleHelp.Render("  No favorites yet — press [f] on any track to add.")
+		return m.padContent(styleHelp.Render("  No favorites yet — press [f] on any track to add."), height)
 	}
 
 	var sb strings.Builder
@@ -566,8 +587,7 @@ func (m *model) renderFavorites(height int) string {
 	}
 
 	for i := start; i < len(favs) && i-start < height; i++ {
-		heart := styleFavorite.Render(" ♥ ")
-		sb.WriteString(heart + m.renderTrackLine(favs[i], i == m.favCursor) + "\n")
+		sb.WriteString(m.renderTrackLine(favs[i], i == m.favCursor) + "\n")
 	}
 	return sb.String()
 }
@@ -583,42 +603,60 @@ func (m *model) renderTrackLine(t api.Track, selected bool) string {
 		dur = "─:──"
 	}
 
-	total := m.width - 4
+	// Calculate column widths
+	total := m.width - 4 // margins
+	if total < 20 {
+		total = 20
+	}
 	durW := 6
 	favW := 2
 	artistW := total / 4
 	titleW := total - artistW - durW - favW
+	if titleW < 10 {
+		titleW = 10
+	}
 
 	title := truncate(t.Title, titleW)
 	artist := truncate(t.Artist, artistW)
 
 	if selected {
-		return styleSelected.Render(fmt.Sprintf(" %-*s %-*s %s %s ",
-			titleW, title, artistW, artist, fav, dur))
+		row := fmt.Sprintf(" %-*s  %-*s  %s %*s",
+			titleW, title,
+			artistW, artist,
+			fav,
+			durW, dur,
+		)
+		return styleSelected.Render(row)
 	}
 
-	return fmt.Sprintf(" %s %s %s %s",
+	return fmt.Sprintf(" %s  %s  %s %s",
 		styleNormal.Render(fmt.Sprintf("%-*s", titleW, title)),
 		styleSubtitle.Render(fmt.Sprintf("%-*s", artistW, artist)),
 		fav,
-		styleHelp.Render(dur),
+		styleHelp.Render(fmt.Sprintf("%*s", durW, dur)),
 	)
 }
 
 func (m *model) renderPlayerBar() string {
 	sep := styleHelp.Render(strings.Repeat("─", m.width))
+	help := styleHelp.Render("  [/]search [space]pause [n/b]skip [shift+←→]seek [=/-]vol [f]fav [s]shuffle [r]repeat [q]quit")
 
 	if m.current == nil {
-		help := styleHelp.Render("  [/] search  [Space] pause  [n/b] skip  [=/-] vol  [s] shuffle  [r] repeat  [Tab] switch  [q] quit")
 		return sep + "\n" + help
 	}
 
 	state := m.playerState
 
-	// Line 1: track info + status
-	title := truncate(m.current.Title, m.width/2)
-	artist := truncate(m.current.Artist, m.width/4)
-	trackInfo := styleTitle.Render(title) + "  " + styleSubtitle.Render(artist)
+	// Play/pause icon
+	playIcon := styleStatus.Render("▶")
+	if state.Paused {
+		playIcon = styleHelp.Render("⏸")
+	}
+
+	// Line 1: icon + title · artist + status
+	titleStr := truncate(m.current.Title, m.width/2)
+	artistStr := truncate(m.current.Artist, m.width/4)
+	trackInfo := styleTitle.Render(titleStr) + styleHelp.Render("  ·  ") + styleSubtitle.Render(artistStr)
 
 	statusPart := ""
 	if m.status != "" {
@@ -628,30 +666,25 @@ func (m *model) renderPlayerBar() string {
 			statusPart = "  " + styleStatus.Render(m.status)
 		}
 	}
+	line1 := " " + playIcon + "  " + trackInfo + statusPart
 
-	playIcon := styleStatus.Render("▶")
-	if state.Paused {
-		playIcon = styleHelp.Render("⏸")
-	}
-
-	vol := styleHelp.Render(fmt.Sprintf(" vol:%d%%", int(state.Volume)))
-
-	// Line 2: progress
+	// Line 2: icon + progress bar + time + volume
 	posStr := fmtDur(state.Position)
 	durStr := fmtDur(state.Duration)
 	timeStr := styleHelp.Render(posStr + "/" + durStr)
-	timeW := len(posStr) + len(durStr) + 1
+	volStr := styleHelp.Render(fmt.Sprintf(" vol:%d%%", int(state.Volume)))
 
-	progressW := m.width - timeW - lipgloss.Width(playIcon) - lipgloss.Width(vol) - 6
+	timeW := len(posStr) + len(durStr) + 1
+	volW := lipgloss.Width(volStr)
+	iconW := lipgloss.Width(playIcon)
+	progressW := m.width - timeW - iconW - volW - 6
 	if progressW < 4 {
 		progressW = 4
 	}
 	bar := renderProgress(state.Position, state.Duration, progressW)
+	line2 := " " + playIcon + "  " + bar + "  " + timeStr + volStr
 
-	line1 := " " + playIcon + "  " + trackInfo + statusPart
-	line2 := " " + playIcon + "  " + bar + "  " + timeStr + vol
-
-	return sep + "\n" + line1 + "\n" + line2
+	return sep + "\n" + line1 + "\n" + line2 + "\n" + help
 }
 
 func renderProgress(pos, dur float64, width int) string {
@@ -689,4 +722,13 @@ func truncate(s string, max int) string {
 		return "…"
 	}
 	return s[:max-1] + "…"
+}
+
+// padContent pads content string to fill height lines (used for empty states)
+func (m *model) padContent(content string, height int) string {
+	lines := strings.Count(content, "\n")
+	if lines < height {
+		content += strings.Repeat("\n", height-lines)
+	}
+	return content
 }

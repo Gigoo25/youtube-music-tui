@@ -3,31 +3,32 @@ package tui
 import "github.com/charmbracelet/lipgloss"
 
 var (
-	colorRed      = lipgloss.Color("#FF3333")
-	colorMuted    = lipgloss.Color("#666666")
-	colorSelected = lipgloss.Color("#FFFFFF")
-	colorAccent   = lipgloss.Color("#FF6666")
-	colorGreen    = lipgloss.Color("#44DD88")
-	colorText     = lipgloss.Color("#CCCCCC")
-	colorBorder   = lipgloss.Color("#444444")
+	colorRed    = lipgloss.Color("#FF3333")
+	colorMuted  = lipgloss.Color("#666666")
+	colorWhite  = lipgloss.Color("#FFFFFF")
+	colorGreen  = lipgloss.Color("#44DD88")
+	colorPink   = lipgloss.Color("#FF6B6B")
+	colorText   = lipgloss.Color("#CCCCCC")
+	colorArtist = lipgloss.Color("#888888")
+	colorSelBg  = lipgloss.Color("#222222")
 
 	styleTitle = lipgloss.NewStyle().
 			Foreground(colorRed).
 			Bold(true)
 
 	styleSubtitle = lipgloss.NewStyle().
-			Foreground(colorMuted)
+			Foreground(colorArtist)
 
 	styleSelected = lipgloss.NewStyle().
-			Foreground(colorSelected).
-			Background(lipgloss.Color("#2A2A2A")).
+			Foreground(colorWhite).
+			Background(colorSelBg).
 			Bold(true)
 
 	styleNormal = lipgloss.NewStyle().
 			Foreground(colorText)
 
 	styleFavorite = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FF6B6B"))
+			Foreground(colorPink)
 
 	styleHelp = lipgloss.NewStyle().
 			Foreground(colorMuted)
@@ -36,13 +37,13 @@ var (
 			Foreground(colorGreen)
 
 	styleError = lipgloss.NewStyle().
-			Foreground(colorAccent)
+			Foreground(colorPink)
 
 	styleProgressFull = lipgloss.NewStyle().
 				Foreground(colorRed)
 
 	styleProgressEmpty = lipgloss.NewStyle().
-				Foreground(colorBorder)
+				Foreground(colorMuted)
 
 	styleNowPlaying = lipgloss.NewStyle().
 			Foreground(colorGreen).
