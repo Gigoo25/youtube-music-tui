@@ -144,6 +144,30 @@ func (m *model) View() string {
 	return styleShell.Width(innerW).Height(m.height - 2).Render(inner)
 }
 
+// viewIcon returns the distinct glyph for a view, shown in the sidebar tab and
+// its panel heading so each tab is visually identifiable.
+func viewIcon(v view) string {
+	switch v {
+	case viewHome:
+		return iconHome
+	case viewSearch:
+		return iconSearch
+	case viewQueue:
+		return iconQueue
+	case viewFavorites:
+		return iconFav
+	case viewHistory:
+		return iconHistory
+	case viewAlbum:
+		return iconAlbum
+	case viewArtist:
+		return iconArtist
+	case viewHelp:
+		return iconHelp
+	}
+	return iconPlaylist
+}
+
 // renderSidebar renders the persistent Quick Links navigation column.
 // sidebarKey captures every input that affects the sidebar render; when it is
 // unchanged the cached string is reused (the sidebar is rebuilt every frame).
@@ -183,15 +207,16 @@ func (m *model) buildSidebar(w, h int) string {
 	rows = append(rows, styleSecondaryBold.Render(truncate2("Quick Links", textW)))
 	sidebarFocused := m.focus == focusSidebar
 	for i, e := range navEntries {
+		label := viewIcon(e.view) + " " + e.label
 		switch {
 		case sidebarFocused && i == m.navCursor:
 			// Background highlight already marks the cursor — no ">" needed.
-			rows = append(rows, styleSelected.Render(padRight("  "+e.label, textW)))
+			rows = append(rows, styleSelected.Render(padRight("  "+label, textW)))
 		case e.view == m.activeView:
 			// Marks the active view while the panel is focused.
-			rows = append(rows, stylePrimary.Render(truncate2("> "+e.label, textW)))
+			rows = append(rows, stylePrimary.Render(truncate2("> "+label, textW)))
 		default:
-			rows = append(rows, styleText.Render(truncate2("  "+e.label, textW)))
+			rows = append(rows, styleText.Render(truncate2("  "+label, textW)))
 		}
 	}
 
@@ -236,8 +261,6 @@ func (m *model) renderPanelBody(w, h int) string {
 		return m.renderFavorites(w, h)
 	case viewHistory:
 		return m.renderHistory(w, h)
-	case viewTrending, viewNewReleases, viewExplore:
-		return m.renderBrowse(m.activeView, w, h)
 	case viewAlbum:
 		return m.renderAlbum(w, h)
 	case viewGenres:
@@ -279,7 +302,7 @@ func (m *model) renderGenres(w, h int) string {
 
 // renderAlbum renders the album-of-a-track view.
 func (m *model) renderAlbum(w, h int) string {
-	heading := styleSecondaryBold.Render(iconPlaylist + " Album: " + m.albumTitle)
+	heading := styleSecondaryBold.Render(iconAlbum + " Album: " + m.albumTitle)
 
 	switch {
 	case m.albumLoading:
@@ -307,39 +330,6 @@ func (m *model) renderAlbum(w, h int) string {
 	return lipgloss.JoinVertical(lipgloss.Left, heading, strings.Join(rows, "\n"))
 }
 
-// renderBrowse renders an async browse view (Trending / New Releases / Explore).
-func (m *model) renderBrowse(v view, w, h int) string {
-	bs, ok := m.browse[v]
-	if !ok {
-		return ""
-	}
-	heading := styleSecondaryBold.Render(iconPlaylist + " " + bs.title)
-
-	switch {
-	case bs.loading || !bs.loaded:
-		return lipgloss.JoinVertical(lipgloss.Left, heading, styleAccent.Render("Loading..."))
-	case bs.err != "":
-		return lipgloss.JoinVertical(lipgloss.Left, heading, styleError.Render(bs.err))
-	case len(bs.tracks) == 0:
-		return lipgloss.JoinVertical(lipgloss.Left, heading, styleDim.Render("Nothing here yet."))
-	}
-
-	tracks := m.filt(bs.tracks)
-	if len(tracks) == 0 {
-		return lipgloss.JoinVertical(lipgloss.Left, heading, styleDim.Render("No matching tracks."))
-	}
-	listH := h - lipgloss.Height(heading)
-	if listH < 1 {
-		listH = 1
-	}
-	start, end := windowBounds(bs.cursor, len(tracks), listH)
-	var rows []string
-	for i := start; i < end; i++ {
-		rows = append(rows, m.renderResultRow(i+1, tracks[i], i == bs.cursor, m.focus == focusPanel, w, false))
-	}
-	return lipgloss.JoinVertical(lipgloss.Left, heading, strings.Join(rows, "\n"))
-}
-
 // ─── Home screen ───────────────────────────────────────────────────────────────
 
 // renderHome renders the drop-in Home view: a Listen Again section (recent
@@ -360,7 +350,7 @@ func (m *model) renderHome(w, h int) string {
 
 	listenAgain, quickPicks := m.homeSections()
 
-	rows = append(rows, styleSecondaryBold.Render(iconRepeatAll+" Listen Again"))
+	rows = append(rows, styleSecondaryBold.Render(iconListen+" Listen Again"))
 	if len(listenAgain) == 0 {
 		rows = append(rows, styleDim.Render("  Nothing yet — play a song and it'll show up here."))
 	}
@@ -368,7 +358,7 @@ func (m *model) renderHome(w, h int) string {
 		addTrack(i+1, t)
 	}
 
-	rows = append(rows, styleSecondaryBold.Render(iconAutoplay+" Quick Picks"))
+	rows = append(rows, styleSecondaryBold.Render(iconPicks+" Quick Picks"))
 	switch {
 	case len(quickPicks) == 0 && m.homeQPLoading:
 		rows = append(rows, styleAccent.Render("  Loading…"))
@@ -389,7 +379,7 @@ func (m *model) renderHome(w, h int) string {
 // renderArtist renders the artist view: top songs plus albums, one flat cursor
 // spanning both (songs first, then albums).
 func (m *model) renderArtist(w, h int) string {
-	heading := styleSecondaryBold.Render(iconPlaylist + " Artist: " + m.artistName)
+	heading := styleSecondaryBold.Render(iconArtist + " Artist: " + m.artistName)
 
 	switch {
 	case m.artistLoading:
@@ -531,6 +521,7 @@ type shortcutsKey struct {
 	volume     float64
 	shuffle    bool
 	repeat     repeatMode
+	autoCont   bool
 	focus      focusArea
 	view       view
 }
@@ -540,7 +531,8 @@ func (m *model) renderShortcutsBar(w int) string {
 		w: w, typing: m.typing(), filtering: m.filtering, filtered: m.filter != "",
 		hasCurrent: m.hasCurrent,
 		paused:     m.playerState.Paused, volume: m.playerState.Volume,
-		shuffle: m.shuffle, repeat: m.repeat, focus: m.focus, view: m.activeView,
+		shuffle: m.shuffle, repeat: m.repeat, autoCont: m.cfg.AutoContinue,
+		focus: m.focus, view: m.activeView,
 	}
 	if m.scCache != "" && key == m.scKey {
 		return m.scCache
@@ -598,7 +590,11 @@ func (m *model) buildShortcutsBar(w int) string {
 	case repeatOne:
 		repLabel = "repeat 1"
 	}
-	segs = append(segs, shortcut{"r", repLabel, m.repeat != repeatOff})
+	segs = append(segs,
+		shortcut{"r", repLabel, m.repeat != repeatOff},
+		shortcut{"R", "radio", false},
+		shortcut{"C", "auto-continue", m.cfg.AutoContinue},
+	)
 
 	// Context-specific actions.
 	if m.focus == focusSidebar {
@@ -612,7 +608,7 @@ func (m *model) buildShortcutsBar(w int) string {
 			segs = append(segs, shortcut{"j/k", "move", false},
 				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
 				shortcut{"f", "fav", false}, shortcut{"a", "album", false},
-				shortcut{"A", "artist", false}, shortcut{"ctrl+r", "refresh", false})
+				shortcut{"A", "artist", false})
 		case viewSearch:
 			segs = append(segs, shortcut{"j/k", "move", false},
 				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
@@ -629,11 +625,6 @@ func (m *model) buildShortcutsBar(w int) string {
 				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
 				shortcut{"f", "fav", false}, shortcut{"a", "album", false},
 				shortcut{"A", "artist", false})
-		case viewTrending, viewNewReleases, viewExplore:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
-				shortcut{"f", "fav", false}, shortcut{"a", "album", false},
-				shortcut{"A", "artist", false}, shortcut{"ctrl+r", "refresh", false})
 		case viewAlbum:
 			segs = append(segs, shortcut{"j/k", "move", false},
 				shortcut{"enter", "play album", false}, shortcut{"p", "play all", false},
@@ -649,14 +640,15 @@ func (m *model) buildShortcutsBar(w int) string {
 		segs = append(segs, shortcut{"h", "menu", false})
 	}
 
-	// More globals. "/" filters the current pane (or re-focuses the query in the
-	// Search view); global YouTube Music search lives on the sidebar / key 2.
+	// Discovery: "/" filters the current pane; global YouTube Music search lives on
+	// the sidebar / key 2.
 	if m.filterableView() {
 		segs = append(segs, shortcut{"/", "filter", m.filter != ""})
 	}
+	segs = append(segs, shortcut{"z", "random", false})
+
+	// App globals.
 	segs = append(segs,
-		shortcut{"z", "random", false},
-		shortcut{"R", "radio", false},
 		shortcut{"T", "theme", false},
 		shortcut{"?", "help", false},
 		shortcut{"q", "quit", false},
@@ -737,15 +729,26 @@ func (m *model) renderNowBar(w int) string {
 		right += styleAccent.Render("loading… ")
 	}
 	right += styleDim.Render(fmt.Sprintf("%s / %s [%d%%]", fmtDur(s.Position), fmtDur(s.Duration), pct))
+
+	// Active-mode indicators: bold for legibility, single-width glyphs, separated
+	// from the timecode and kept one column off the right border (trailing space)
+	// so they don't get clipped by the shell.
+	var flags []string
 	if m.shuffle {
-		right += stylePrimary.Render(" " + iconShuffle)
+		flags = append(flags, stylePrimary.Bold(true).Render(iconShuffle))
 	}
 	if m.repeat != repeatOff {
-		g := iconRepeatAll
+		g := iconRepeat
 		if m.repeat == repeatOne {
-			g = iconRepeatOne
+			g += " 1" // distinguish repeat-one from repeat-all
 		}
-		right += styleSecondary.Render(" " + g)
+		flags = append(flags, styleSecondary.Bold(true).Render(g))
+	}
+	if m.cfg.AutoContinue {
+		flags = append(flags, styleSuccess.Bold(true).Render(iconAutoplay))
+	}
+	if len(flags) > 0 {
+		right += "   " + strings.Join(flags, " ") + " "
 	}
 
 	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
@@ -863,6 +866,9 @@ func (m *model) renderResultRow(n int, t api.Track, selected, focused bool, w in
 	if t.Artist != "" {
 		artistPart = " • " + t.Artist
 	}
+	if t.Album != "" {
+		artistPart += " • " + t.Album
+	}
 
 	// Focused + selected: whole-row inverse highlight (single color).
 	if selected && focused {
@@ -905,7 +911,7 @@ func (m *model) renderResultRow(n int, t api.Track, selected, focused bool, w in
 // ─── Queue screen ──────────────────────────────────────────────────────────────
 
 func (m *model) renderQueue(w, h int) string {
-	header := styleSecondaryBold.Render(fmt.Sprintf("%s Up next (%d tracks)", iconPlaylist, len(m.queue)))
+	header := styleSecondaryBold.Render(fmt.Sprintf("%s Up next (%d tracks)", iconQueue, len(m.queue)))
 	if len(m.queue) == 0 {
 		return lipgloss.JoinVertical(lipgloss.Left,
 			header,
@@ -997,7 +1003,7 @@ func (m *model) renderFavorites(w, h int) string {
 // ─── History screen ────────────────────────────────────────────────────────────
 
 func (m *model) renderHistory(w, h int) string {
-	heading := styleSecondaryBold.Render(iconPlaylist + " Recently Played")
+	heading := styleSecondaryBold.Render(iconHistory + " Recently Played")
 	if len(m.cfg.History) == 0 {
 		return lipgloss.JoinVertical(lipgloss.Left,
 			heading,
@@ -1055,43 +1061,59 @@ func (m *model) renderHistory(w, h int) string {
 // ─── Help screen ───────────────────────────────────────────────────────────────
 
 func (m *model) renderHelp(w, h int) string {
-	keys := [][2]string{
-		{"Space", "play / pause"},
-		{"n", "next track"},
-		{"b", "previous track"},
-		{"< / >", "seek backward / forward"},
-		{"+ / -", "volume up / down"},
-		{"s", "toggle shuffle"},
-		{"r", "cycle repeat mode"},
-		{"f", "toggle favorite"},
-		{"a", "open the track's album (Enter to play it)"},
-		{"A", "open the track's artist (top songs + albums)"},
-		{"z", "random song (pick a genre)"},
-		{"R", "start radio from current track"},
-		{"T", "cycle color theme"},
-		{"enter", "queue / play selected"},
-		{"p", "play now"},
-		{"d / x", "remove from queue"},
-		{"J / K", "move track down / up in queue"},
-		{"c", "clear queue"},
-		{"ctrl+r", "refresh Home / browse feed"},
-		{"/", "filter the current pane (esc clears)"},
-		{"2", "global YouTube Music search"},
-		{"j / k", "navigate list"},
-		{"ctrl+d / ctrl+u", "scroll half page down / up"},
-		{"ctrl+f / ctrl+b", "scroll full page down / up"},
-		{"gg / G", "jump to top / bottom"},
-		{"h / esc", "back to menu / previous"},
-		{"tab", "toggle sidebar / panel focus"},
-		{"1-8", "jump to view (Home…Explore)"},
-		{"? ", "this help"},
-		{"q", "quit"},
+	type binding struct{ key, desc string }
+	sections := []struct {
+		title string
+		keys  []binding
+	}{
+		{"Playback", []binding{
+			{"Space", "play / pause"},
+			{"n / b", "next / previous track"},
+			{"< / >", "seek backward / forward"},
+			{"+ / -", "volume up / down"},
+			{"s", "toggle shuffle"},
+			{"r", "cycle repeat mode"},
+			{"R", "start radio from current track"},
+			{"C", "auto-continue radio when the queue ends"},
+		}},
+		{"Queue & track", []binding{
+			{"enter", "queue / play selected"},
+			{"p", "play now"},
+			{"f", "toggle favorite"},
+			{"d / x", "remove from queue"},
+			{"J / K", "move track down / up in queue"},
+			{"c", "clear queue"},
+		}},
+		{"Lists & navigation", []binding{
+			{"j / k", "navigate list"},
+			{"gg / G", "jump to top / bottom"},
+			{"ctrl+d / ctrl+u", "scroll half page down / up"},
+			{"ctrl+f / ctrl+b", "scroll full page down / up"},
+			{"tab", "toggle sidebar / panel focus"},
+			{"h / esc", "back to menu / previous"},
+		}},
+		{"Views & discovery", []binding{
+			{"1-5", "jump to view (Home…History)"},
+			{"2", "global YouTube Music search"},
+			{"/", "filter the current pane (esc clears)"},
+			{"a", "open the track's album (Enter to play it)"},
+			{"A", "open the track's artist (top songs + albums)"},
+			{"z", "random song (pick a genre)"},
+		}},
+		{"App", []binding{
+			{"T", "cycle color theme"},
+			{"?", "this help"},
+			{"q", "quit"},
+		}},
 	}
 
 	var rows []string
 	rows = append(rows, styleSecondaryBold.Render(iconHelp+" Keyboard Shortcuts"))
-	for _, k := range keys {
-		rows = append(rows, stylePrimary.Render(fmt.Sprintf("  %-8s", k[0]))+styleText.Render(k[1]))
+	for _, sec := range sections {
+		rows = append(rows, "", styleSecondaryBold.Render(sec.title))
+		for _, k := range sec.keys {
+			rows = append(rows, stylePrimary.Render(fmt.Sprintf("  %-16s", k.key))+styleText.Render(k.desc))
+		}
 	}
 
 	inner := w - 4

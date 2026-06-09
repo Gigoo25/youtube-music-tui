@@ -22,9 +22,6 @@ const (
 	viewQueue
 	viewFavorites
 	viewHistory
-	viewTrending
-	viewNewReleases
-	viewExplore
 	viewAlbum
 	viewArtist
 	viewGenres
@@ -60,9 +57,6 @@ var navEntries = []navEntry{
 	{"Queue", viewQueue},
 	{"Favorites", viewFavorites},
 	{"History", viewHistory},
-	{"Trending", viewTrending},
-	{"New Releases", viewNewReleases},
-	{"Explore", viewExplore},
 	{"Help", viewHelp},
 }
 
@@ -80,6 +74,7 @@ type model struct {
 	player *player.Player
 	cfg    *config.Config
 	api    *api.Client
+	mpris  *mprisServer // in-process MPRIS server; nil if the session bus is unavailable
 
 	activeView  view
 	focus       focusArea
@@ -135,9 +130,6 @@ type model struct {
 	// history
 	historyCursor int
 
-	// async browse views (Trending / New Releases / Explore)
-	browse map[view]*browseState
-
 	// album view (the album a track belongs to)
 	albumTracks  []api.Track
 	albumCursor  int
@@ -192,30 +184,19 @@ type searchDoneMsg struct {
 
 type tickMsg time.Time
 
-// browseState holds the async-loaded contents of a browse view (Trending,
-// New Releases, Explore). Loaded lazily the first time the view is opened.
-type browseState struct {
-	title   string
-	tracks  []api.Track
-	cursor  int
-	loading bool
-	loaded  bool
-	err     string
-	load    func(*api.Client) ([]api.Track, error)
-}
-
-type browseLoadedMsg struct {
-	view   view
-	tracks []api.Track
-	err    error
-}
-
 type randomDoneMsg struct {
 	tracks []api.Track
 	err    error
 }
 
 type radioDoneMsg struct {
+	tracks []api.Track
+	err    error
+}
+
+// autoContinueMsg carries radio tracks fetched to keep playback going after the
+// queue ran out (auto-continue). Unlike radioDoneMsg it resumes playback.
+type autoContinueMsg struct {
 	tracks []api.Track
 	err    error
 }
@@ -274,11 +255,6 @@ func New(p *player.Player, cfg *config.Config) *model {
 		searchTyping: false,
 		themeIdx:     themeIdx,
 		playerState:  player.State{Volume: cfg.Volume},
-		browse: map[view]*browseState{
-			viewTrending:    {title: "Trending", load: (*api.Client).Trending},
-			viewNewReleases: {title: "New Releases", load: (*api.Client).NewReleases},
-			viewExplore:     {title: "Explore", load: (*api.Client).Explore},
-		},
 	}
 }
 
@@ -331,8 +307,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.playerState = m.player.State()
+		var cmds []tea.Cmd
 		if m.player.TrackEnded() {
-			m.nextTrack()
+			if c := m.nextTrack(); c != nil {
+				cmds = append(cmds, c)
+			}
 		}
 		// Auto-clear a transient status message once it has been shown long enough.
 		if m.status != "" && time.Since(m.statusAt) >= statusTTL {
@@ -344,25 +323,57 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cfg.Save()
 			m.cfgDirty = false
 		}
-		// Lazily load the active browse view the first time it's opened.
-		if bs, ok := m.browse[m.activeView]; ok && !bs.loaded && !bs.loading {
-			return m, tea.Batch(m.nextTick(), m.loadBrowse(m.activeView))
-		}
-		return m, m.nextTick()
+		m.pushMPRIS()
+		cmds = append(cmds, m.nextTick())
+		return m, tea.Batch(cmds...)
 
-	case browseLoadedMsg:
-		if bs, ok := m.browse[msg.view]; ok {
-			bs.loading = false
-			bs.loaded = true
-			bs.cursor = 0
-			if msg.err != nil {
-				bs.err = msg.err.Error()
-			} else {
-				bs.err = ""
-				bs.tracks = msg.tracks
-			}
+	case mprisActionMsg:
+		return m.handleMPRISAction(msg.action)
+
+	case mprisSeekMsg:
+		m.player.Seek(float64(msg.offsetUS) / 1e6)
+		if m.mpris != nil {
+			m.mpris.Seeked(int64((m.playerState.Position)*1e6) + msg.offsetUS)
 		}
 		return m, nil
+
+	case mprisSetPosMsg:
+		m.player.SeekAbs(float64(msg.posUS) / 1e6)
+		if m.mpris != nil {
+			m.mpris.Seeked(msg.posUS)
+		}
+		return m, nil
+
+	case mprisSetVolMsg:
+		m.player.SetVolume(msg.level * 100)
+		return m, nil
+
+	case autoContinueMsg:
+		if msg.err != nil {
+			m.setError("auto-continue failed: " + msg.err.Error())
+			return m, nil
+		}
+		// Related lives in explore.go (not the secret-blocked ytmusic.go), so its
+		// tracks are already clean. Drop the seed itself to avoid an instant repeat.
+		var tracks []api.Track
+		seed := ""
+		if m.hasCurrent {
+			seed = m.current.ID
+		}
+		for _, t := range msg.tracks {
+			if t.ID != "" && t.ID != seed {
+				tracks = append(tracks, t)
+			}
+		}
+		if len(tracks) == 0 {
+			m.setError("auto-continue: nothing found")
+			return m, nil
+		}
+		start := len(m.queue)
+		m.queue = append(m.queue, tracks...)
+		m.playAt(start)
+		m.setStatus(fmt.Sprintf("auto-continue: added %d tracks", len(tracks)))
+		return m, m.nextTick()
 
 	case randomDoneMsg:
 		// Search (the random source) lives in the secret-blocked ytmusic.go, so its
@@ -479,7 +490,7 @@ func (m *model) typing() bool {
 func (m *model) filterableView() bool {
 	switch m.activeView {
 	case viewHome, viewQueue, viewFavorites, viewHistory,
-		viewTrending, viewNewReleases, viewExplore, viewAlbum, viewArtist:
+		viewAlbum, viewArtist:
 		return true
 	}
 	return false
@@ -564,10 +575,6 @@ func (m *model) activeCursorPtr() *int {
 		return &m.favCursor
 	case viewHistory:
 		return &m.historyCursor
-	case viewTrending, viewNewReleases, viewExplore:
-		if bs, ok := m.browse[m.activeView]; ok {
-			return &bs.cursor
-		}
 	case viewAlbum:
 		return &m.albumCursor
 	case viewArtist:
@@ -588,10 +595,6 @@ func (m *model) activeFilteredLen() int {
 		return len(m.filt(m.cfg.Favorites))
 	case viewHistory:
 		return len(m.filtHistory(m.cfg.History))
-	case viewTrending, viewNewReleases, viewExplore:
-		if bs, ok := m.browse[m.activeView]; ok {
-			return len(m.filt(bs.tracks))
-		}
 	case viewAlbum:
 		return len(m.filt(m.albumTracks))
 	case viewArtist:
@@ -707,8 +710,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q":
 		return m, tea.Quit
 	case "n":
-		m.nextTrack()
-		return m, nil
+		return m, m.nextTrack()
 	case "b":
 		m.prevTrack()
 		return m, nil
@@ -787,20 +789,20 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "5":
 		m.activateView(viewHistory)
 		return m, nil
-	case "6":
-		m.activateView(viewTrending)
-		return m, nil
-	case "7":
-		m.activateView(viewNewReleases)
-		return m, nil
-	case "8":
-		m.activateView(viewExplore)
-		return m, nil
 	case "z":
 		m.openGenres()
 		return m, nil
 	case "R":
 		return m, m.startRadio()
+	case "C":
+		m.cfg.AutoContinue = !m.cfg.AutoContinue
+		m.markConfigDirty()
+		if m.cfg.AutoContinue {
+			m.setStatus("auto-continue on")
+		} else {
+			m.setStatus("auto-continue off")
+		}
+		return m, nil
 	case "T":
 		m.cycleTheme()
 		return m, nil
@@ -866,8 +868,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleFavKey(msg)
 	case viewHistory:
 		return m.handleHistoryKey(msg)
-	case viewTrending, viewNewReleases, viewExplore:
-		return m.handleBrowseKey(m.activeView, msg)
 	case viewAlbum:
 		return m.handleAlbumKey(msg)
 	case viewArtist:
@@ -1097,9 +1097,6 @@ func (m *model) handleHomeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if t, ok := m.homeTrackAt(m.homeCursor); ok {
 			m.playNow(t)
 		}
-	case "ctrl+r":
-		m.refreshListenAgain()
-		return m, m.loadHomeQuickPicks()
 	}
 	return m, nil
 }
@@ -1206,49 +1203,6 @@ func firstArtistOf(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// loadBrowse kicks off the async API call for a browse view.
-func (m *model) loadBrowse(v view) tea.Cmd {
-	bs, ok := m.browse[v]
-	if !ok || bs.load == nil {
-		return nil
-	}
-	bs.loading = true
-	load := bs.load
-	client := m.api
-	return func() tea.Msg {
-		tracks, err := load(client)
-		return browseLoadedMsg{view: v, tracks: tracks, err: err}
-	}
-}
-
-func (m *model) handleBrowseKey(v view, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	bs, ok := m.browse[v]
-	if !ok {
-		return m, nil
-	}
-	tracks := m.filt(bs.tracks)
-	if nc, ok := m.vimMove(msg.String(), bs.cursor, len(tracks)); ok {
-		bs.cursor = nc
-		return m, nil
-	}
-	switch msg.String() {
-	case "enter":
-		if bs.cursor < len(tracks) {
-			m.enqueue(tracks[bs.cursor])
-		}
-	case "p":
-		if bs.cursor < len(tracks) {
-			m.playNow(tracks[bs.cursor])
-		}
-	case "ctrl+r":
-		// reload the feed
-		bs.loaded = false
-		bs.loading = false
-		return m, m.loadBrowse(v)
-	}
-	return m, nil
-}
-
 // openGenres opens the random-genre picker.
 func (m *model) openGenres() {
 	if m.activeView != viewGenres {
@@ -1293,7 +1247,7 @@ func (m *model) playRandomGenre(seed string) tea.Cmd {
 	m.setStatus("finding a random " + seed + " song...")
 	client := m.api
 	return func() tea.Msg {
-		tracks, err := client.Search(seed)
+		tracks, err := client.SearchSongs(seed)
 		return randomDoneMsg{tracks: tracks, err: err}
 	}
 }
@@ -1538,13 +1492,6 @@ func (m *model) contextTrack() *api.Track {
 			t := hist[m.historyCursor].Track
 			return &t
 		}
-	case viewTrending, viewNewReleases, viewExplore:
-		if bs, ok := m.browse[m.activeView]; ok {
-			if tracks := m.filt(bs.tracks); bs.cursor < len(tracks) {
-				t := tracks[bs.cursor]
-				return &t
-			}
-		}
 	case viewAlbum:
 		if tracks := m.filt(m.albumTracks); m.albumCursor < len(tracks) {
 			t := tracks[m.albumCursor]
@@ -1585,6 +1532,10 @@ func (m *model) playAt(idx int) {
 	t := m.queue[idx]
 	m.current = t
 	m.hasCurrent = true
+	// Reset the cached position/duration so the now-bar and MPRIS don't briefly
+	// show the previous track's values before the next tick refreshes them.
+	m.playerState.Position = 0
+	m.playerState.Duration = 0
 	// Set MPRIS title so shells (noctalia/playerctl) show the song, not the URL.
 	title := t.Title
 	if t.Artist != "" {
@@ -1598,11 +1549,17 @@ func (m *model) playAt(idx int) {
 	m.cfg.AddHistory(t)
 	m.markConfigDirty()
 	m.historyCursor = 0
+
+	// Publish the new track to MPRIS immediately (don't wait for the next tick).
+	m.pushMPRIS()
 }
 
-func (m *model) nextTrack() {
+// nextTrack advances playback. It returns a non-nil tea.Cmd only when the queue
+// has run out and auto-continue is on, in which case the cmd fetches radio tracks
+// to keep playing.
+func (m *model) nextTrack() tea.Cmd {
 	if len(m.queue) == 0 {
-		return
+		return nil
 	}
 	switch m.repeat {
 	case repeatOne:
@@ -1618,10 +1575,26 @@ func (m *model) nextTrack() {
 			m.playAt(rand.Intn(len(m.queue)))
 		} else if m.queuePos+1 < len(m.queue) {
 			m.playAt(m.queuePos + 1)
+		} else if m.cfg.AutoContinue && m.hasCurrent {
+			return m.continueRadio()
 		} else {
 			m.hasCurrent = false
 			m.setStatus("queue ended")
 		}
+	}
+	return nil
+}
+
+// continueRadio fetches tracks related to the just-finished track so playback
+// keeps going after the queue empties (auto-continue). hasCurrent stays true so
+// the seed survives until the related tracks arrive.
+func (m *model) continueRadio() tea.Cmd {
+	seed := m.current.ID
+	m.setStatus("auto-continue: finding more…")
+	client := m.api
+	return func() tea.Msg {
+		tracks, err := client.Related(seed)
+		return autoContinueMsg{tracks: tracks, err: err}
 	}
 }
 
@@ -1643,7 +1616,9 @@ func (m *model) prevTrack() {
 
 func (m *model) doSearch(query string) tea.Cmd {
 	return func() tea.Msg {
-		tracks, err := m.api.Search(query)
+		// SearchSongs filters to the Songs tab so results are the official audio
+		// (ATV) versions with proper title/artist/album, not music videos.
+		tracks, err := m.api.SearchSongs(query)
 		return searchDoneMsg{tracks: tracks, err: err}
 	}
 }

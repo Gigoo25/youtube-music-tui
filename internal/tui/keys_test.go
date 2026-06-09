@@ -268,7 +268,7 @@ func TestViewsRenderWithoutPanic(t *testing.T) {
 	m.artistName = "Artist A"
 	m.artistSongs = m.queue
 	m.artistAlbums = []api.AlbumRef{{ID: "MPREb1", Title: "Album One", Year: "2020"}}
-	for _, v := range []view{viewHome, viewSearch, viewQueue, viewFavorites, viewHistory, viewTrending, viewAlbum, viewArtist, viewGenres, viewHelp} {
+	for _, v := range []view{viewHome, viewSearch, viewQueue, viewFavorites, viewHistory, viewAlbum, viewArtist, viewGenres, viewHelp} {
 		m.activeView = v
 		out := m.View()
 		if out == "" {

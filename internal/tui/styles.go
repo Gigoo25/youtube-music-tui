@@ -5,21 +5,32 @@ import "github.com/charmbracelet/lipgloss"
 // ─── Icons (exact glyphs from the reference interface) ─────────────────────────
 
 const (
-	iconPlay      = "▶"
-	iconPause     = "‖"
-	iconNext      = "▶|"
-	iconPrev      = "|◀"
-	iconShuffle   = "⇄"
-	iconRepeatAll = "↻"
-	iconRepeatOne = "↺"
-	iconPlaylist  = "♫"
-	iconSearch    = "/"
-	iconHelp      = "?"
-	iconDownload  = "↓"
-	iconQuit      = "×"
-	iconVolume    = "♪"
-	iconHeart     = "♥"
-	iconAutoplay  = "∞"
+	iconPlay     = "" // nf-fa-play
+	iconPause    = "" // nf-fa-pause
+	iconNext     = "" // nf-fa-step_forward
+	iconPrev     = "" // nf-fa-step_backward
+	iconShuffle  = "" // nf-fa-random
+	iconRepeat   = "" // nf-fa-repeat
+	iconPlaylist = "" // nf-fa-music
+	iconSearch   = "" // nf-fa-search (magnifying glass) — search tab + filter
+	iconDownload = "" // nf-fa-download
+	iconQuit     = "" // nf-fa-times
+	iconVolume   = "" // nf-fa-headphones (app brand)
+	iconHeart    = "" // nf-fa-heart
+	iconAutoplay = "" // nf-fa-infinity
+	iconPicks    = "" // nf-fa-star (Quick Picks)
+	iconListen   = "" // nf-fa-history (Listen Again)
+
+	// Per-tab icons. Nerd Font glyphs (Private-Use-Area): they measure as 1 cell in
+	// both lipgloss and a Nerd-Font terminal, so the width math matches and the
+	// "icon + space" layout stays aligned. Requires a Nerd Font installed.
+	iconHome    = "" // nf-fa-home
+	iconQueue   = "" // nf-fa-list
+	iconHistory = "" // nf-fa-history
+	iconAlbum   = "" // nf-fa-compact_disc
+	iconArtist  = "" // nf-fa-microphone
+	iconFav     = "" // nf-fa-heart (favorites tab)
+	iconHelp    = "" // nf-fa-question_circle
 )
 
 // ─── Themes ────────────────────────────────────────────────────────────────────
