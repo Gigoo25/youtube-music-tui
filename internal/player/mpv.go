@@ -3,6 +3,7 @@ package player
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -13,6 +14,10 @@ import (
 	"sync"
 	"time"
 )
+
+// loadTimeout caps how long a single yt-dlp stream extraction may run before it
+// is abandoned, so a hung extraction can't pin the player in "loading" forever.
+const loadTimeout = 60 * time.Second
 
 // socketPath is per-process so multiple instances don't collide on /tmp.
 func socketPathFor() string {
@@ -29,17 +34,18 @@ type State struct {
 }
 
 type Player struct {
-	cmd       *exec.Cmd
-	sockPath  string
-	conn      net.Conn
-	mu        sync.Mutex    // protects state, conn, reqID, loadGen
-	sendCh    chan []byte   // serialized writes
-	reqID     int
-	loadGen   int           // epoch token: cancels stale async loads
-	state     State
-	done      chan struct{} // signalled on natural end-of-file
-	closed    chan struct{} // closed once on shutdown
-	closeOnce sync.Once
+	cmd        *exec.Cmd
+	sockPath   string
+	conn       net.Conn
+	mu         sync.Mutex  // protects state, conn, reqID, loadGen, loadCancel
+	sendCh     chan []byte // serialized writes
+	reqID      int
+	loadGen    int                // epoch token: cancels stale async loads
+	loadCancel context.CancelFunc // cancels the in-flight load's yt-dlp, if any
+	state      State
+	done       chan struct{} // signalled on natural end-of-file
+	closed     chan struct{} // closed once on shutdown
+	closeOnce  sync.Once
 }
 
 type ipcCmd struct {
@@ -62,17 +68,14 @@ func New(volume float64) (*Player, error) {
 	sockPath := socketPathFor()
 	os.Remove(sockPath)
 
+	// MPRIS is served in-process (see internal/mpris); the mpv-mpris plugin is no
+	// longer loaded, so media-key controls map straight to the app's queue.
 	args := []string{
 		"--no-video",
 		"--idle=yes",
 		"--input-ipc-server=" + sockPath,
 		"--really-quiet",
 		"--no-terminal",
-	}
-	// Load mpv-mpris plugin if available so MPRIS-aware shells (noctalia,
-	// playerctl, GNOME, KDE) show the now-playing track and accept controls.
-	if script := findMprisScript(); script != "" {
-		args = append(args, "--script="+script)
 	}
 
 	cmd := exec.Command("mpv", args...)
@@ -145,12 +148,19 @@ func (p *Player) writeLoop() {
 	}
 }
 
-// beginLoad resets playback state and returns the new load epoch. A later load
-// (or skip) bumps the epoch so a slow yt-dlp extraction can detect it is stale.
-func (p *Player) beginLoad() int {
+// beginLoad resets playback state and returns the new load epoch plus a context
+// scoped to this load. A later load (or skip) bumps the epoch and cancels the
+// previous context, so a slow/stale yt-dlp extraction is killed immediately
+// instead of running to completion and piling up concurrent requests.
+func (p *Player) beginLoad() (int, context.Context) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.loadCancel != nil {
+		p.loadCancel() // kill any in-flight yt-dlp from the superseded load
+	}
 	p.loadGen++
+	ctx, cancel := context.WithTimeout(context.Background(), loadTimeout)
+	p.loadCancel = cancel
 	p.state.Position = 0
 	p.state.Duration = 0
 	p.state.Idle = false
@@ -159,14 +169,14 @@ func (p *Player) beginLoad() int {
 	case <-p.done:
 	default:
 	}
-	return p.loadGen
+	return p.loadGen, ctx
 }
 
 func (p *Player) Load(videoID string) error {
-	gen := p.beginLoad()
+	gen, ctx := p.beginLoad()
 
 	go func() {
-		url, err := extractURL(videoID)
+		url, err := extractURL(ctx, videoID)
 
 		p.mu.Lock()
 		stale := gen != p.loadGen
@@ -192,7 +202,7 @@ func (p *Player) LoadURL(url string) error {
 	return p.send([]any{"loadfile", url, "replace"})
 }
 
-func extractURL(videoID string) (string, error) {
+func extractURL(ctx context.Context, videoID string) (string, error) {
 	ytURL := "https://www.youtube.com/watch?v=" + videoID
 
 	ytdlp, err := exec.LookPath("yt-dlp")
@@ -201,9 +211,11 @@ func extractURL(videoID string) (string, error) {
 		return ytURL, nil
 	}
 
-	out, err := exec.Command(ytdlp, "-f", "bestaudio", "-g", ytURL).Output()
+	out, err := exec.CommandContext(ctx, ytdlp, "-f", "bestaudio", "-g", ytURL).Output()
 	if err != nil {
-		return ytURL, nil
+		// Cancelled/timed-out extraction returns an error; the raw watch URL is a
+		// best-effort fallback (the caller drops it if this load is now stale).
+		return ytURL, err
 	}
 	url := strings.TrimSpace(string(bytes.TrimRight(out, "\n")))
 	if url == "" {
@@ -216,8 +228,23 @@ func (p *Player) PlayPause() error {
 	return p.send([]any{"cycle", "pause"})
 }
 
+// Play resumes playback (MPRIS Play — explicit, unlike the PlayPause toggle).
+func (p *Player) Play() error {
+	return p.send([]any{"set_property", "pause", false})
+}
+
+// Pause pauses playback (MPRIS Pause — explicit, unlike the PlayPause toggle).
+func (p *Player) Pause() error {
+	return p.send([]any{"set_property", "pause", true})
+}
+
 func (p *Player) Seek(seconds float64) error {
 	return p.send([]any{"seek", seconds, "relative"})
+}
+
+// SeekAbs seeks to an absolute position in seconds (MPRIS SetPosition).
+func (p *Player) SeekAbs(seconds float64) error {
+	return p.send([]any{"seek", seconds, "absolute"})
 }
 
 func (p *Player) SetVolume(vol float64) error {
@@ -245,56 +272,28 @@ func (p *Player) VolumeDown() error {
 }
 
 func (p *Player) Stop() error {
+	// Cancel any in-flight load and bump the epoch so a pending yt-dlp extraction
+	// can't fire loadfile after the stop and resurrect playback (e.g. clearing the
+	// queue while a track was still resolving).
+	p.mu.Lock()
+	if p.loadCancel != nil {
+		p.loadCancel()
+		p.loadCancel = nil
+	}
+	p.loadGen++
+	p.state.Loading = false
+	p.mu.Unlock()
 	return p.send([]any{"stop"})
 }
 
-// SetTitle sets mpv's force-media-title so MPRIS metadata (xesam:title) shows
-// a clean track name in shells like noctalia instead of the raw stream URL.
+// SetTitle sets mpv's force-media-title so the stream shows a clean track name
+// (e.g. in mpv logs) instead of the raw URL. Now-playing metadata for MPRIS
+// shells is published separately by internal/mpris.
 func (p *Player) SetTitle(title string) error {
 	if title == "" {
 		return nil
 	}
 	return p.send([]any{"set_property", "force-media-title", title})
-}
-
-// findMprisScript locates the mpv-mpris plugin (mpris.so). Returns "" if not
-// found, in which case mpv runs without MPRIS support.
-func findMprisScript() string {
-	if p := os.Getenv("YTMUSIC_MPRIS_SCRIPT"); p != "" && fileExists(p) {
-		return p
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		if p := filepath.Join(home, ".config", "mpv", "scripts", "mpris.so"); fileExists(p) {
-			return p
-		}
-	}
-	candidates := []string{
-		"/usr/lib/mpv-mpris/mpris.so",
-		"/usr/lib/x86_64-linux-gnu/mpv-mpris/mpris.so",
-		"/usr/lib/x86_64-linux-gnu/mpris.so",
-		"/usr/local/lib/mpv-mpris/mpris.so",
-		"/etc/mpv/scripts/mpris.so",
-	}
-	for _, p := range candidates {
-		if fileExists(p) {
-			return p
-		}
-	}
-	// NixOS: mpvScripts.mpris lands in the nix store.
-	for _, pat := range []string{
-		"/nix/store/*mpv-mpris*/share/mpv/scripts/mpris.so",
-		"/nix/store/*/share/mpv/scripts/mpris.so",
-	} {
-		if m, _ := filepath.Glob(pat); len(m) > 0 {
-			return m[len(m)-1]
-		}
-	}
-	return ""
-}
-
-func fileExists(p string) bool {
-	info, err := os.Stat(p)
-	return err == nil && !info.IsDir()
 }
 
 func (p *Player) State() State {
@@ -452,6 +451,9 @@ func (p *Player) Close() {
 		close(p.closed) // stops writeLoop and the reconnect loop; gates send()
 
 		p.mu.Lock()
+		if p.loadCancel != nil {
+			p.loadCancel() // kill any in-flight yt-dlp extraction
+		}
 		conn := p.conn
 		p.conn = nil
 		p.mu.Unlock()
