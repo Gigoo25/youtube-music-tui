@@ -118,13 +118,51 @@ func parseArtistSongs(root any) []Track {
 }
 
 // CleanTracks strips byline separator artifacts from every track's artist (see
-// cleanArtist). Applied to each track list the API returns so no view renders
-// "Title • &".
+// cleanArtist) and removes invisible width-distorting characters from all display
+// fields (see sanitizeDisplay). Applied to each track list the API returns so no
+// view renders "Title • &" and rows don't wrap from miscounted widths.
 func CleanTracks(ts []Track) []Track {
 	for i := range ts {
-		ts[i].Artist = cleanArtist(ts[i].Artist)
+		ts[i].Title = sanitizeDisplay(ts[i].Title)
+		ts[i].Artist = sanitizeDisplay(cleanArtist(ts[i].Artist))
+		// cleanArtist also strips lone separator artifacts ("&", "feat") that leak
+		// into the album field, so rows don't render "Title • Artist • &".
+		ts[i].Album = sanitizeDisplay(cleanArtist(ts[i].Album))
 	}
 	return ts
+}
+
+// sanitizeDisplay removes characters that render with an unpredictable terminal
+// width (so display-width math diverges from the real terminal and rows wrap,
+// corrupting the layout): control chars, zero-width marks, emoji variation
+// selectors, and bidirectional formatting. Visible letters/emoji are kept.
+func sanitizeDisplay(s string) string {
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
+		switch {
+		case r == '\t' || r == '\n' || r == '\r':
+			out = append(out, ' ')
+		case r < 0x20 || r == 0x7f: // C0 controls + DEL
+			continue
+		case r >= 0x80 && r <= 0x9f: // C1 controls
+			continue
+		case r >= 0x200b && r <= 0x200f: // zero-width + LRM/RLM
+			continue
+		case r >= 0x202a && r <= 0x202e: // bidi embeddings/overrides
+			continue
+		case r >= 0x2060 && r <= 0x2064: // word joiner + invisible ops
+			continue
+		case r >= 0x2066 && r <= 0x2069: // bidi isolates
+			continue
+		case r >= 0xfe00 && r <= 0xfe0f: // variation selectors
+			continue
+		case r == 0xfeff: // BOM / zero-width no-break space
+			continue
+		default:
+			out = append(out, r)
+		}
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // cleanArtist removes byline artifacts left by multi-artist parsing — e.g. a

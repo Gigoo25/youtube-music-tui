@@ -69,30 +69,6 @@ func (c *Client) Trending() ([]Track, error) {
 	return CleanTracks(dedupeTracks(tracks)), nil
 }
 
-// NewReleases returns newly released songs from YouTube Music via the Innertube
-// browse endpoint (browseId FEmusic_new_releases). The shelf is built from
-// musicTwoRowItemRenderer cards; only the playable ones (with a watch endpoint)
-// become tracks.
-func (c *Client) NewReleases() ([]Track, error) {
-	p := c.clientCtx()
-	p["browseId"] = "FEmusic_new_releases"
-
-	body, err := c.post("browse", p)
-	if err != nil {
-		return nil, err
-	}
-
-	root, err := parseJSON(body)
-	if err != nil {
-		return nil, err
-	}
-
-	tracks := collectTwoRowTracks(root)
-	tracks = append(tracks, collectListItemTracks(root)...)
-
-	return CleanTracks(dedupeTracks(tracks)), nil
-}
-
 // parseJSON unmarshals an Innertube response body into a generic map.
 func parseJSON(body []byte) (map[string]any, error) {
 	var root map[string]any
@@ -108,19 +84,6 @@ func collectListItemTracks(node any) []Track {
 	var out []Track
 	walkRenderers(node, "musicResponsiveListItemRenderer", func(r map[string]any) {
 		t := extractTrack(r)
-		if t.ID != "" && t.Title != "" {
-			out = append(out, t)
-		}
-	})
-	return out
-}
-
-// collectTwoRowTracks walks the response for every musicTwoRowItemRenderer and
-// extracts the ones that point at a playable video.
-func collectTwoRowTracks(node any) []Track {
-	var out []Track
-	walkRenderers(node, "musicTwoRowItemRenderer", func(r map[string]any) {
-		t := extractTwoRowTrack(r)
 		if t.ID != "" && t.Title != "" {
 			out = append(out, t)
 		}

@@ -5,60 +5,6 @@ import (
 	"strings"
 )
 
-// Explore returns a feed of explore/mood/genre songs from YouTube Music.
-//
-// Uses the Innertube "browse" endpoint with the FEmusic_explore browseId and
-// walks the returned carousel shelves for any songs that carry a videoId.
-func (c *Client) Explore() ([]Track, error) {
-	payload := c.clientCtx()
-	payload["browseId"] = "FEmusic_explore"
-
-	body, err := c.post("browse", payload)
-	if err != nil {
-		return nil, err
-	}
-
-	var root map[string]any
-	if err := json.Unmarshal(body, &root); err != nil {
-		return nil, err
-	}
-
-	var tracks []Track
-	seen := map[string]bool{}
-	collectBrowseTracks(root, &tracks, seen)
-
-	if len(tracks) > 50 {
-		tracks = tracks[:50]
-	}
-	return CleanTracks(tracks), nil
-}
-
-// collectBrowseTracks walks an arbitrary Innertube browse response and pulls
-// out every song-like item that exposes a videoId. It descends into all maps
-// and slices, handling both musicResponsiveListItemRenderer (list rows) and
-// musicTwoRowItemRenderer / playlistPanelVideoRenderer (carousel cards).
-func collectBrowseTracks(node any, out *[]Track, seen map[string]bool) {
-	switch v := node.(type) {
-	case map[string]any:
-		if r, ok := v["musicResponsiveListItemRenderer"].(map[string]any); ok {
-			addTrack(extractTrack(r), out, seen)
-		}
-		if r, ok := v["musicTwoRowItemRenderer"].(map[string]any); ok {
-			addTrack(extractTwoRowTrack(r), out, seen)
-		}
-		if r, ok := v["playlistPanelVideoRenderer"].(map[string]any); ok {
-			addTrack(extractPanelTrack(r), out, seen)
-		}
-		for _, child := range v {
-			collectBrowseTracks(child, out, seen)
-		}
-	case []any:
-		for _, child := range v {
-			collectBrowseTracks(child, out, seen)
-		}
-	}
-}
-
 // extractTwoRowTrack pulls a Track out of a musicTwoRowItemRenderer (carousel
 // card). Only items whose navigation points at a watchEndpoint (i.e. a single
 // song/video) are returned with an ID.
