@@ -6,6 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/rob/ytmusic/internal/config"
+	"github.com/rob/ytmusic/internal/mpris"
 	"github.com/rob/ytmusic/internal/player"
 	"github.com/rob/ytmusic/internal/tui"
 )
@@ -33,6 +34,16 @@ func run() error {
 
 	m := tui.New(p, cfg)
 	prog := tea.NewProgram(m, tea.WithAltScreen())
+
+	// Serve MPRIS in-process so media keys / shells (noctalia, playerctl) can
+	// drive playback. Non-fatal if there's no session bus or the name is taken.
+	if srv, err := mpris.New(tui.MPRISHandlers(prog.Send)); err != nil {
+		fmt.Fprintf(os.Stderr, "mpris unavailable: %v\n", err)
+	} else {
+		m.SetMPRIS(srv)
+		defer srv.Close()
+	}
+
 	if _, err := prog.Run(); err != nil {
 		return fmt.Errorf("error: %w", err)
 	}
