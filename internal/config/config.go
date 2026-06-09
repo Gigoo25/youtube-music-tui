@@ -20,12 +20,13 @@ type HistoryEntry struct {
 }
 
 type Config struct {
-	Favorites []api.Track    `json:"favorites"`
-	History   []HistoryEntry `json:"history"`
-	Volume    float64        `json:"volume"`
-	Theme     string         `json:"theme"`
-	path      string
-	favSet    map[string]struct{} // favorite IDs, for O(1) IsFavorite lookups
+	Favorites    []api.Track    `json:"favorites"`
+	History      []HistoryEntry `json:"history"`
+	Volume       float64        `json:"volume"`
+	Theme        string         `json:"theme"`
+	AutoContinue bool           `json:"autoContinue"` // keep playing radio-style when the queue ends
+	path         string
+	favSet       map[string]struct{} // favorite IDs, for O(1) IsFavorite lookups
 }
 
 // rebuildFavSet repopulates the favorite-ID set from the Favorites slice. Called
