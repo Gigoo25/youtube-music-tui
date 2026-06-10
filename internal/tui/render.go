@@ -939,7 +939,7 @@ func (m *model) renderQueue(w, h int) string {
 		selected := i == m.queueCursor
 
 		nowMark := "  "
-		if orig == m.queuePos {
+		if m.hasCurrent && orig == m.queuePos {
 			nowMark = iconPlay + " "
 		}
 		artistPart := ""
@@ -954,7 +954,7 @@ func (m *model) renderQueue(w, h int) string {
 		}
 
 		nowStr := styleDim.Render(nowMark)
-		if orig == m.queuePos {
+		if m.hasCurrent && orig == m.queuePos {
 			nowStr = stylePrimary.Render(nowMark)
 		}
 		heart := ""

@@ -71,8 +71,30 @@ func TestQueueRemovePlayingTrackDropsMarker(t *testing.T) {
 	if m.hasCurrent {
 		t.Fatal("removing the playing track should clear hasCurrent")
 	}
-	if m.queuePos >= len(m.queue) {
-		t.Fatalf("queuePos %d out of range after removal (len %d)", m.queuePos, len(m.queue))
+	if m.queuePos != 0 {
+		t.Fatalf("queuePos = %d after removing the playing last track, want 0 (one before end)", m.queuePos)
+	}
+}
+
+// TestQueueRemovePlayingTrackDoesNotSkipNext: removing the playing track must
+// leave queuePos one before the track that shifted into its slot, so the next
+// advance plays that track instead of skipping it.
+func TestQueueRemovePlayingTrackDoesNotSkipNext(t *testing.T) {
+	m := newTestModel()
+	m.activeView = viewQueue
+	m.focus = focusPanel
+	m.queue = []api.Track{{ID: "a", Title: "A"}, {ID: "b", Title: "B"}, {ID: "c", Title: "C"}}
+	m.queuePos = 0 // A is playing
+	m.hasCurrent = true
+	m.queueCursor = 0 // cursor on the playing track
+
+	press(m, "d") // remove A while it plays
+
+	if m.queuePos != -1 {
+		t.Fatalf("queuePos = %d after removing playing head, want -1 so the next advance plays B", m.queuePos)
+	}
+	if len(m.queue) != 2 || m.queue[0].ID != "b" {
+		t.Fatalf("queue = %v, want [b c]", m.queue)
 	}
 }
 

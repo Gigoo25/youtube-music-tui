@@ -1377,11 +1377,12 @@ func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.queuePos--
 			case removed == m.queuePos:
 				// The currently-playing entry was removed: it keeps playing, but it
-				// is no longer in the queue, so drop the now-playing marker.
+				// is no longer in the queue, so drop the now-playing marker. Step
+				// queuePos back so the next advance plays the track that shifted
+				// into the removed slot instead of skipping it (-1 is fine: playAt
+				// rejects it and nextTrack's queuePos+1 lands on index 0).
 				m.hasCurrent = false
-				if m.queuePos >= len(m.queue) {
-					m.queuePos = 0
-				}
+				m.queuePos--
 			}
 			m.clampActiveCursor() // keep cursor in range of the (refiltered) list
 			m.setStatus("removed from queue")
