@@ -1513,6 +1513,11 @@ func (m *model) enqueue(t api.Track) {
 	m.setStatus("queued: " + t.Title)
 	if !m.hasCurrent {
 		m.playAt(len(m.queue) - 1)
+		return
+	}
+	// Warm the newly queued track so a queue-then-play flow is instant.
+	if m.player != nil {
+		m.player.Prefetch(t.ID)
 	}
 }
 
@@ -1545,6 +1550,9 @@ func (m *model) playAt(idx int) {
 	m.player.Load(t.ID)
 	// No transient "loading" status — the now-playing bar shows load state.
 
+	// Warm the next track's stream URL so auto-advance is instant.
+	m.prefetchNext()
+
 	// Record the play in history (newest first); persistence is debounced.
 	m.cfg.AddHistory(t)
 	m.markConfigDirty()
@@ -1552,6 +1560,34 @@ func (m *model) playAt(idx int) {
 
 	// Publish the new track to MPRIS immediately (don't wait for the next tick).
 	m.pushMPRIS()
+}
+
+// prefetchAhead is how many upcoming tracks to warm. 1 covers auto-advance; a
+// few more absorb a manual skip-forward without resolving the whole queue (URLs
+// expire, and the queue may be reordered/cleared before they're reached).
+const prefetchAhead = 3
+
+// prefetchNext resolves the stream URLs of the next few tracks so upcoming Loads
+// are cache hits. Skipped under shuffle (unpredictable) and stops at the end of
+// the queue unless repeatAll will wrap.
+func (m *model) prefetchNext() {
+	if m.player == nil || m.shuffle || len(m.queue) == 0 {
+		return
+	}
+	n := len(m.queue)
+	for i := 1; i <= prefetchAhead; i++ {
+		idx := m.queuePos + i
+		if idx >= n {
+			if m.repeat != repeatAll {
+				return
+			}
+			idx %= n // wrap for repeatAll
+		}
+		if idx == m.queuePos {
+			return // wrapped fully around a queue smaller than prefetchAhead
+		}
+		m.player.Prefetch(m.queue[idx].ID)
+	}
 }
 
 // nextTrack advances playback. It returns a non-nil tea.Cmd only when the queue

@@ -37,16 +37,27 @@ type Player struct {
 	cmd        *exec.Cmd
 	sockPath   string
 	conn       net.Conn
-	mu         sync.Mutex  // protects state, conn, reqID, loadGen, loadCancel
+	mu         sync.Mutex  // protects state, conn, reqID, loadGen, loadCancel, urlCache
 	sendCh     chan []byte // serialized writes
 	reqID      int
-	loadGen    int                // epoch token: cancels stale async loads
-	loadCancel context.CancelFunc // cancels the in-flight load's yt-dlp, if any
+	loadGen    int                  // epoch token: cancels stale async loads
+	loadCancel context.CancelFunc   // cancels the in-flight load's yt-dlp, if any
 	state      State
+	urlCache   map[string]cachedURL // videoID -> resolved stream URL (prefetch)
 	done       chan struct{} // signalled on natural end-of-file
 	closed     chan struct{} // closed once on shutdown
 	closeOnce  sync.Once
 }
+
+// cachedURL is a yt-dlp-resolved stream URL with the time it was resolved.
+// googlevideo URLs carry an `expire` param (hours out); urlTTL keeps us well
+// inside that window so a prefetched URL is never stale when finally played.
+type cachedURL struct {
+	url string
+	at  time.Time
+}
+
+const urlTTL = 30 * time.Minute
 
 type ipcCmd struct {
 	Command   []any `json:"command"`
@@ -175,8 +186,23 @@ func (p *Player) beginLoad() (int, context.Context) {
 func (p *Player) Load(videoID string) error {
 	gen, ctx := p.beginLoad()
 
+	// Cache hit (prefetched while the previous track played): skip yt-dlp and
+	// hand the URL straight to mpv — the common auto-advance path is instant.
+	if url, ok := p.cacheGet(videoID); ok {
+		p.mu.Lock()
+		if p.loadCancel != nil {
+			p.loadCancel() // no extraction for this load; release its ctx timer
+			p.loadCancel = nil
+		}
+		p.mu.Unlock()
+		return p.send([]any{"loadfile", url, "replace"})
+	}
+
 	go func() {
-		url, err := extractURL(ctx, videoID)
+		url, resolved, err := extractURL(ctx, videoID)
+		if resolved {
+			p.cachePut(videoID, url)
+		}
 
 		p.mu.Lock()
 		stale := gen != p.loadGen
@@ -196,32 +222,80 @@ func (p *Player) Load(videoID string) error {
 	return nil
 }
 
+// Prefetch resolves a stream URL in the background and caches it so a later
+// Load(videoID) is instant. Safe to call repeatedly; no-op on cache hit.
+func (p *Player) Prefetch(videoID string) {
+	if videoID == "" {
+		return
+	}
+	if _, ok := p.cacheGet(videoID); ok {
+		return
+	}
+	go func() {
+		// Own timeout, deliberately not tied to loadCancel: a prefetch warms a
+		// future track and must survive the current load being superseded.
+		ctx, cancel := context.WithTimeout(context.Background(), loadTimeout)
+		defer cancel()
+		if url, resolved, _ := extractURL(ctx, videoID); resolved {
+			p.cachePut(videoID, url)
+		}
+	}()
+}
+
+func (p *Player) cacheGet(videoID string) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	c, ok := p.urlCache[videoID]
+	if !ok || time.Since(c.at) > urlTTL {
+		return "", false
+	}
+	return c.url, true
+}
+
+func (p *Player) cachePut(videoID, url string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.urlCache == nil {
+		p.urlCache = make(map[string]cachedURL)
+	}
+	p.urlCache[videoID] = cachedURL{url: url, at: time.Now()}
+}
+
 // LoadURL sends a pre-resolved URL directly to mpv without yt-dlp extraction.
 func (p *Player) LoadURL(url string) error {
 	p.beginLoad()
 	return p.send([]any{"loadfile", url, "replace"})
 }
 
-func extractURL(ctx context.Context, videoID string) (string, error) {
+// extractURL resolves a direct stream URL for videoID via yt-dlp. resolved is
+// false when it falls back to the raw watch-page URL (yt-dlp missing, failed,
+// or cancelled) — fallbacks must not be cached, or a transient failure would
+// pin the slow page-URL path for the whole TTL and suppress retries.
+func extractURL(ctx context.Context, videoID string) (url string, resolved bool, err error) {
 	ytURL := "https://www.youtube.com/watch?v=" + videoID
 
-	ytdlp, err := exec.LookPath("yt-dlp")
-	if err != nil {
+	ytdlp, lookErr := exec.LookPath("yt-dlp")
+	if lookErr != nil {
 		// yt-dlp not in PATH; return raw URL, mpv may handle via its ytdl hook
-		return ytURL, nil
+		return ytURL, false, nil
 	}
 
-	out, err := exec.CommandContext(ctx, ytdlp, "-f", "bestaudio", "-g", ytURL).Output()
+	// Drop the `tv` client from yt-dlp's default client set: it adds ~0.5s of
+	// extraction latency and isn't needed for audio. The remaining default
+	// clients still resolve a bestaudio stream.
+	out, err := exec.CommandContext(ctx, ytdlp,
+		"--extractor-args", "youtube:player_client=default,-tv",
+		"-f", "bestaudio", "-g", ytURL).Output()
 	if err != nil {
 		// Cancelled/timed-out extraction returns an error; the raw watch URL is a
 		// best-effort fallback (the caller drops it if this load is now stale).
-		return ytURL, err
+		return ytURL, false, err
 	}
-	url := strings.TrimSpace(string(bytes.TrimRight(out, "\n")))
+	url = strings.TrimSpace(string(bytes.TrimRight(out, "\n")))
 	if url == "" {
-		return ytURL, nil
+		return ytURL, false, nil
 	}
-	return url, nil
+	return url, true, nil
 }
 
 func (p *Player) PlayPause() error {
