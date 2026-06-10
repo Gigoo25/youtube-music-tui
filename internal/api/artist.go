@@ -44,7 +44,7 @@ func ArtistByQuery(c *Client, name string) (ArtistResult, error) {
 		return res, err
 	}
 
-	res.Name = artistName(broot)
+	res.Name = sanitizeDisplay(artistName(broot))
 	if res.Name == "" {
 		res.Name = name
 	}
@@ -128,6 +128,8 @@ func CleanTracks(ts []Track) []Track {
 		// cleanArtist also strips lone separator artifacts ("&", "feat") that leak
 		// into the album field, so rows don't render "Title • Artist • &".
 		ts[i].Album = sanitizeDisplay(cleanArtist(ts[i].Album))
+		ts[i].Duration = sanitizeDisplay(ts[i].Duration)
+		ts[i].Year = sanitizeDisplay(ts[i].Year)
 	}
 	return ts
 }
@@ -136,6 +138,8 @@ func CleanTracks(ts []Track) []Track {
 // width (so display-width math diverges from the real terminal and rows wrap,
 // corrupting the layout): control chars, zero-width marks, emoji variation
 // selectors, and bidirectional formatting. Visible letters/emoji are kept.
+// Stripping C0/C1 controls also keeps YouTube-supplied text from injecting raw
+// terminal escape sequences (ESC/CSI/OSC).
 func sanitizeDisplay(s string) string {
 	out := make([]rune, 0, len(s))
 	for _, r := range s {
@@ -195,7 +199,7 @@ func parseArtistAlbums(root any) []AlbumRef {
 		var a AlbumRef
 		a.ID = id
 		if runs := digSlice(dig(r, "title", "runs")); len(runs) > 0 {
-			a.Title = str(dig(runs[0], "text"))
+			a.Title = sanitizeDisplay(str(dig(runs[0], "text")))
 		}
 		if a.Title == "" {
 			return

@@ -54,7 +54,7 @@ func (c *Client) albumByID(browseID, fallbackArtist string) ([]Track, string, er
 		return nil, "", err
 	}
 
-	title := albumTitle(broot)
+	title := sanitizeDisplay(albumTitle(broot))
 	albumArtist := albumHeaderArtist(broot)
 	if albumArtist == "" {
 		albumArtist = fallbackArtist
