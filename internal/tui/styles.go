@@ -17,9 +17,10 @@ const (
 	iconQuit     = "" // nf-fa-times
 	iconVolume   = "" // nf-fa-headphones (app brand)
 	iconHeart    = "" // nf-fa-heart
-	iconAutoplay = "" // nf-fa-infinity
+	iconAutoplay = "" // nf-fa-forward (auto-continue; U+F534 infinity was dropped in Nerd Fonts v3)
 	iconPicks    = "" // nf-fa-star (Quick Picks)
 	iconListen   = "" // nf-fa-history (Listen Again)
+	iconMute     = "" // nf-fa-volume_off (muted indicator)
 
 	// Per-tab icons. Nerd Font glyphs (Private-Use-Area): they measure as 1 cell in
 	// both lipgloss and a Nerd-Font terminal, so the width math matches and the
@@ -164,12 +165,14 @@ func applyTheme(t theme) {
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(colorDim).
 		Padding(0, 1)
+	// Interior boxes all use the rounded border so the chrome reads as one
+	// family; only the outer shell is square.
 	styleSearchBox = lipgloss.NewStyle().
-		Border(lipgloss.NormalBorder()).
+		Border(lipgloss.RoundedBorder()).
 		BorderForeground(colorSecondary).
 		Padding(0, 1)
 	styleShortcutsBox = lipgloss.NewStyle().
-		Border(lipgloss.NormalBorder()).
+		Border(lipgloss.RoundedBorder()).
 		BorderForeground(colorDim)
 	styleContentBox = lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).

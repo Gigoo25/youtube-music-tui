@@ -7,7 +7,7 @@ import (
 	"slices"
 	"time"
 
-	"github.com/rob/ytmusic/internal/api"
+	"github.com/Gigoo25/youtube-music-tui/internal/api"
 )
 
 const maxHistory = 500
@@ -19,14 +19,28 @@ type HistoryEntry struct {
 	PlayedAt time.Time `json:"playedAt"`
 }
 
+// Playlist is a user-named, ordered collection of tracks saved locally.
+type Playlist struct {
+	Name   string      `json:"name"`
+	Tracks []api.Track `json:"tracks"`
+}
+
 type Config struct {
 	Favorites    []api.Track    `json:"favorites"`
 	History      []HistoryEntry `json:"history"`
+	Playlists    []Playlist     `json:"playlists,omitempty"`
 	Volume       float64        `json:"volume"`
 	Theme        string         `json:"theme"`
 	AutoContinue bool           `json:"autoContinue"` // keep playing radio-style when the queue ends
-	path         string
-	favSet       map[string]struct{} // favorite IDs, for O(1) IsFavorite lookups
+
+	// Session state, restored on next launch (see snapshotSession in the TUI).
+	Queue    []api.Track `json:"queue,omitempty"`
+	QueuePos int         `json:"queuePos,omitempty"`
+	Shuffle  bool        `json:"shuffle,omitempty"`
+	Repeat   int         `json:"repeat,omitempty"`
+
+	path   string
+	favSet map[string]struct{} // favorite IDs, for O(1) IsFavorite lookups
 }
 
 // rebuildFavSet repopulates the favorite-ID set from the Favorites slice. Called
@@ -79,7 +93,9 @@ func (c *Config) Save() error {
 		return err
 	}
 	tmp := c.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	// 0600: the config carries the user's full listening history/favorites —
+	// no reason for it to be world-readable.
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, c.path)
@@ -104,6 +120,29 @@ func (c *Config) ToggleFavorite(t api.Track) bool {
 	c.Favorites = append(c.Favorites, t)
 	c.favSet[t.ID] = struct{}{}
 	return true
+}
+
+// SavePlaylist stores tracks under name, replacing an existing playlist of the
+// same name. The track slice is copied so later queue mutations don't bleed in.
+func (c *Config) SavePlaylist(name string, tracks []api.Track) {
+	cp := append([]api.Track(nil), tracks...)
+	for i := range c.Playlists {
+		if c.Playlists[i].Name == name {
+			c.Playlists[i].Tracks = cp
+			return
+		}
+	}
+	c.Playlists = append(c.Playlists, Playlist{Name: name, Tracks: cp})
+}
+
+// DeletePlaylist removes the named playlist (no-op if absent).
+func (c *Config) DeletePlaylist(name string) {
+	for i := range c.Playlists {
+		if c.Playlists[i].Name == name {
+			c.Playlists = append(c.Playlists[:i], c.Playlists[i+1:]...)
+			return
+		}
+	}
 }
 
 // AddHistory records a play at the front of the history list (newest first),

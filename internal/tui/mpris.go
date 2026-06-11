@@ -3,7 +3,7 @@ package tui
 import (
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/rob/ytmusic/internal/mpris"
+	"github.com/Gigoo25/youtube-music-tui/internal/mpris"
 )
 
 // MPRIS control messages, delivered from the D-Bus goroutine via Program.Send so

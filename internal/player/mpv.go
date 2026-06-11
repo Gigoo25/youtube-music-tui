@@ -19,9 +19,17 @@ import (
 // is abandoned, so a hung extraction can't pin the player in "loading" forever.
 const loadTimeout = 60 * time.Second
 
-// socketPath is per-process so multiple instances don't collide on /tmp.
+// socketPathFor returns a per-process IPC socket path. The mpv IPC socket
+// accepts arbitrary commands (including `run`, i.e. code execution), so it goes
+// in $XDG_RUNTIME_DIR — a per-user 0700 directory — rather than the shared /tmp,
+// where another local user could connect if the umask allowed it. The pid suffix
+// keeps multiple instances from colliding.
 func socketPathFor() string {
-	return filepath.Join(os.TempDir(), fmt.Sprintf("ytmusic-mpv-%d.sock", os.Getpid()))
+	dir := os.Getenv("XDG_RUNTIME_DIR")
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, fmt.Sprintf("ytmusic-mpv-%d.sock", os.Getpid()))
 }
 
 type State struct {
@@ -31,21 +39,24 @@ type State struct {
 	Paused   bool
 	Idle     bool
 	Loading  bool
+	Muted    bool
 }
 
 type Player struct {
 	cmd        *exec.Cmd
 	sockPath   string
 	conn       net.Conn
-	mu         sync.Mutex  // protects state, conn, reqID, loadGen, loadCancel, urlCache
+	mu         sync.Mutex  // protects state, conn, reqID, loadGen, loadCancel, urlCache, inflight
 	sendCh     chan []byte // serialized writes
 	reqID      int
-	loadGen    int                  // epoch token: cancels stale async loads
-	loadCancel context.CancelFunc   // cancels the in-flight load's yt-dlp, if any
+	loadGen    int                // epoch token: cancels stale async loads
+	loadCancel context.CancelFunc // cancels the in-flight load's yt-dlp, if any
 	state      State
+	lastErr    string               // most recent load/playback failure, for the UI
 	urlCache   map[string]cachedURL // videoID -> resolved stream URL (prefetch)
-	done       chan struct{} // signalled on natural end-of-file
-	closed     chan struct{} // closed once on shutdown
+	inflight   map[string]struct{}  // videoIDs with a resolve in progress (prefetch dedup)
+	done       chan struct{}        // signalled on natural end-of-file
+	closed     chan struct{}        // closed once on shutdown
 	closeOnce  sync.Once
 }
 
@@ -109,6 +120,7 @@ func New(volume float64) (*Player, error) {
 	conn, err := dialWithRetry(sockPath, 30, 100*time.Millisecond)
 	if err != nil {
 		cmd.Process.Kill()
+		cmd.Wait() // reap; don't leave a zombie until the app exits
 		return nil, fmt.Errorf("connect mpv IPC: %w", err)
 	}
 	p.conn = conn
@@ -121,6 +133,7 @@ func New(volume float64) (*Player, error) {
 	p.send([]any{"observe_property", 3, "pause"})
 	p.send([]any{"observe_property", 4, "volume"})
 	p.send([]any{"observe_property", 5, "idle-active"})
+	p.send([]any{"observe_property", 6, "mute"})
 
 	// Restore the saved volume (mpv starts at 100 by default).
 	p.SetVolume(volume)
@@ -134,11 +147,11 @@ func dialWithRetry(path string, attempts int, delay time.Duration) (net.Conn, er
 		err  error
 	)
 	for i := 0; i < attempts; i++ {
-		time.Sleep(delay)
 		conn, err = net.Dial("unix", path)
 		if err == nil {
 			return conn, nil
 		}
+		time.Sleep(delay)
 	}
 	return nil, err
 }
@@ -199,6 +212,10 @@ func (p *Player) Load(videoID string) error {
 	}
 
 	go func() {
+		// Deliberately not deduped against an in-flight Prefetch of the same id:
+		// a load must deliver loadfile as soon as its URL resolves, and waiting on
+		// the prefetch would need per-id signaling. Worst case is one extra
+		// resolve when a track is played while its prefetch is still running.
 		url, resolved, err := extractURL(ctx, videoID)
 		if resolved {
 			p.cachePut(videoID, url)
@@ -212,6 +229,7 @@ func (p *Player) Load(videoID string) error {
 		}
 		if err != nil {
 			p.state.Loading = false
+			p.lastErr = "could not resolve stream (yt-dlp failed)"
 			p.mu.Unlock()
 			return
 		}
@@ -223,15 +241,17 @@ func (p *Player) Load(videoID string) error {
 }
 
 // Prefetch resolves a stream URL in the background and caches it so a later
-// Load(videoID) is instant. Safe to call repeatedly; no-op on cache hit.
+// Load(videoID) is instant. Safe to call repeatedly and concurrently: it is a
+// no-op on a cache hit or when a resolve for the same id is already running, so
+// rapid re-triggers (e.g. queue reordering) never spawn duplicate yt-dlp
+// processes for the same video — which would otherwise multiply requests to
+// YouTube and risk rate limiting.
 func (p *Player) Prefetch(videoID string) {
-	if videoID == "" {
-		return
-	}
-	if _, ok := p.cacheGet(videoID); ok {
+	if videoID == "" || !p.claimResolve(videoID) {
 		return
 	}
 	go func() {
+		defer p.releaseResolve(videoID)
 		// Own timeout, deliberately not tied to loadCancel: a prefetch warms a
 		// future track and must survive the current load being superseded.
 		ctx, cancel := context.WithTimeout(context.Background(), loadTimeout)
@@ -240,6 +260,32 @@ func (p *Player) Prefetch(videoID string) {
 			p.cachePut(videoID, url)
 		}
 	}()
+}
+
+// claimResolve reports whether videoID needs a fresh resolve, marking it
+// in-flight if so. It returns false when the URL is already cached or another
+// resolve for the same id is already running, so each video is resolved at most
+// once at a time.
+func (p *Player) claimResolve(videoID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if c, ok := p.urlCache[videoID]; ok && time.Since(c.at) <= urlTTL {
+		return false
+	}
+	if _, ok := p.inflight[videoID]; ok {
+		return false
+	}
+	if p.inflight == nil {
+		p.inflight = make(map[string]struct{})
+	}
+	p.inflight[videoID] = struct{}{}
+	return true
+}
+
+func (p *Player) releaseResolve(videoID string) {
+	p.mu.Lock()
+	delete(p.inflight, videoID)
+	p.mu.Unlock()
 }
 
 func (p *Player) cacheGet(videoID string) (string, bool) {
@@ -258,6 +304,13 @@ func (p *Player) cachePut(videoID, url string) {
 	if p.urlCache == nil {
 		p.urlCache = make(map[string]cachedURL)
 	}
+	// Evict expired entries so a long session doesn't grow the cache unbounded
+	// (stale entries are otherwise only skipped on read, never removed).
+	for id, c := range p.urlCache {
+		if time.Since(c.at) > urlTTL {
+			delete(p.urlCache, id)
+		}
+	}
 	p.urlCache[videoID] = cachedURL{url: url, at: time.Now()}
 }
 
@@ -272,6 +325,12 @@ func (p *Player) LoadURL(url string) error {
 // or cancelled) — fallbacks must not be cached, or a transient failure would
 // pin the slow page-URL path for the whole TTL and suppress retries.
 func extractURL(ctx context.Context, videoID string) (url string, resolved bool, err error) {
+	// The id is interpolated into a URL handed to yt-dlp/mpv; reject anything
+	// outside the YouTube id alphabet so a malformed API value can't smuggle
+	// extra URL components or odd argv content into the subprocesses.
+	if !validVideoID(videoID) {
+		return "", false, fmt.Errorf("invalid video id %q", videoID)
+	}
 	ytURL := "https://www.youtube.com/watch?v=" + videoID
 
 	ytdlp, lookErr := exec.LookPath("yt-dlp")
@@ -298,6 +357,24 @@ func extractURL(ctx context.Context, videoID string) (url string, resolved bool,
 	return url, true, nil
 }
 
+// validVideoID reports whether s looks like a YouTube video id (URL-safe base64
+// alphabet). Length is left loose on purpose — ids are 11 chars today, but the
+// format isn't contractual.
+func validVideoID(s string) bool {
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func (p *Player) PlayPause() error {
 	return p.send([]any{"cycle", "pause"})
 }
@@ -310,6 +387,12 @@ func (p *Player) Play() error {
 // Pause pauses playback (MPRIS Pause — explicit, unlike the PlayPause toggle).
 func (p *Player) Pause() error {
 	return p.send([]any{"set_property", "pause", true})
+}
+
+// ToggleMute flips mpv's mute flag. mpv keeps mute independent of volume, so the
+// stored volume level (and its display) is unaffected.
+func (p *Player) ToggleMute() error {
+	return p.send([]any{"cycle", "mute"})
 }
 
 func (p *Player) Seek(seconds float64) error {
@@ -376,6 +459,17 @@ func (p *Player) State() State {
 	return p.state
 }
 
+// LoadError returns (and clears) the most recent load/playback failure message,
+// or "" when none occurred since the last call. Polled by the TUI tick so
+// failures surface in the status line instead of dying silently.
+func (p *Player) LoadError() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.lastErr
+	p.lastErr = ""
+	return e
+}
+
 // TrackEnded returns true (and resets) if a track-end event was received since last call.
 func (p *Player) TrackEnded() bool {
 	select {
@@ -431,11 +525,18 @@ func (p *Player) readLoop() {
 				// Only a natural end-of-file means the track finished. Loading a new
 				// file emits end-file with reason "stop"/"redirect" for the previous
 				// one — ignore those so we don't falsely advance the queue.
-				if resp.Reason == "eof" {
+				switch resp.Reason {
+				case "eof":
 					select {
 					case p.done <- struct{}{}:
 					default:
 					}
+				case "error":
+					// mpv couldn't play the stream (expired URL, network, bad format).
+					p.mu.Lock()
+					p.state.Loading = false
+					p.lastErr = "playback failed (stream error)"
+					p.mu.Unlock()
 				}
 				continue
 
@@ -470,6 +571,10 @@ func (p *Player) readLoop() {
 				case 5:
 					if v, ok := resp.Data.(bool); ok {
 						p.state.Idle = v
+					}
+				case 6:
+					if v, ok := resp.Data.(bool); ok {
+						p.state.Muted = v
 					}
 				}
 				p.mu.Unlock()
@@ -510,6 +615,7 @@ func (p *Player) readLoop() {
 		p.send([]any{"observe_property", 3, "pause"})
 		p.send([]any{"observe_property", 4, "volume"})
 		p.send([]any{"observe_property", 5, "idle-active"})
+		p.send([]any{"observe_property", 6, "mute"})
 
 		// Re-apply the last known volume so it survives an mpv restart.
 		p.mu.Lock()

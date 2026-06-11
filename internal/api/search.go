@@ -12,24 +12,70 @@ const songsFilterParam = "EgWKAQIIAWoMEAMQBBAJEAUQChAV"
 // results. Song rows are parsed here (rather than via extractTrack) because the
 // Songs-tab flexColumn layout puts artist/album/duration in the second column.
 func (c *Client) SearchSongs(query string) ([]Track, error) {
+	tracks, _, err := c.SearchSongsPage(query, "")
+	return tracks, err
+}
+
+// SearchSongsPage runs a Songs-tab search (continuation == "") or fetches the
+// next page of an earlier one (continuation != "", the token from a prior call).
+// It returns the page's tracks plus the token for the following page ("" when
+// the results are exhausted), so callers can lazily load more.
+func (c *Client) SearchSongsPage(query, continuation string) ([]Track, string, error) {
 	payload := c.clientCtx()
-	payload["query"] = query
-	payload["params"] = songsFilterParam
+	if continuation != "" {
+		// The token already encodes the filtered search context, so query/params
+		// are not resent.
+		payload["continuation"] = continuation
+	} else {
+		payload["query"] = query
+		payload["params"] = songsFilterParam
+	}
 
 	body, err := c.post("search", payload)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	var root map[string]any
 	if err := json.Unmarshal(body, &root); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	var tracks []Track
 	seen := map[string]bool{}
 	collectSongRows(root, &tracks, seen)
-	return CleanTracks(tracks), nil
+	return CleanTracks(tracks), findSearchContinuation(root), nil
+}
+
+// findSearchContinuation locates the token for the next page of results. Modern
+// Innertube responses carry it in a continuationCommand; older shelf layouts use
+// nextContinuationData. Returns "" when there is no further page.
+func findSearchContinuation(node any) string {
+	switch v := node.(type) {
+	case map[string]any:
+		if cc, ok := v["continuationCommand"].(map[string]any); ok {
+			if tok := str(cc["token"]); tok != "" {
+				return tok
+			}
+		}
+		if nc, ok := v["nextContinuationData"].(map[string]any); ok {
+			if tok := str(nc["continuation"]); tok != "" {
+				return tok
+			}
+		}
+		for _, child := range v {
+			if r := findSearchContinuation(child); r != "" {
+				return r
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if r := findSearchContinuation(child); r != "" {
+				return r
+			}
+		}
+	}
+	return ""
 }
 
 // collectSongRows walks the search response for musicResponsiveListItemRenderer

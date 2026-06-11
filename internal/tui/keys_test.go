@@ -1,13 +1,17 @@
 package tui
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/Gigoo25/youtube-music-tui/internal/api"
+	"github.com/Gigoo25/youtube-music-tui/internal/config"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/rob/ytmusic/internal/api"
-	"github.com/rob/ytmusic/internal/config"
+	"github.com/charmbracelet/lipgloss"
 )
+
+var errFake = errors.New("network down")
 
 // newTestModel builds a model without a real player/mpv process.
 func newTestModel() *model {
@@ -195,6 +199,22 @@ func TestLocalFilterCapturesKeys(t *testing.T) {
 	}
 }
 
+// TestStaleSearchResponseDropped: a slow response from an older search must not
+// clobber the results of a newer one.
+func TestStaleSearchResponseDropped(t *testing.T) {
+	m := newTestModel()
+	m.searchGen = 2
+	m.searchResults = []api.Track{{ID: "new", Title: "New"}}
+	m.Update(searchDoneMsg{gen: 1, tracks: []api.Track{{ID: "old", Title: "Old"}}})
+	if len(m.searchResults) != 1 || m.searchResults[0].ID != "new" {
+		t.Fatalf("stale search response overwrote newer results: %v", m.searchResults)
+	}
+	m.Update(searchDoneMsg{gen: 2, tracks: []api.Track{{ID: "cur", Title: "Cur"}}})
+	if len(m.searchResults) != 1 || m.searchResults[0].ID != "cur" {
+		t.Fatalf("current search response not applied: %v", m.searchResults)
+	}
+}
+
 // TestStartsAtHome: the app opens on the Home view (not typing).
 func TestStartsAtHome(t *testing.T) {
 	m := newTestModel()
@@ -281,6 +301,281 @@ func TestThemeCycle(t *testing.T) {
 	}
 }
 
+// TestArtistEnterQueuesNotReplaces: pressing enter on an artist song appends it
+// to the existing queue (with the artist filled in) instead of replacing the
+// queue and hijacking playback.
+func TestArtistEnterQueuesNotReplaces(t *testing.T) {
+	m := newTestModel()
+	m.queue = []api.Track{{ID: "q1", Title: "Existing"}}
+	m.queuePos = 0
+	m.current = m.queue[0]
+	m.hasCurrent = true // avoids playAt (nil player) and proves playback isn't disturbed
+	m.activeView = viewArtist
+	m.focus = focusPanel
+	m.artistName = "The Artist"
+	m.artistSongs = []api.Track{{ID: "a1", Title: "ArtSong"}}
+	m.artistCursor = 0
+
+	press(m, "enter")
+
+	if len(m.queue) != 2 || m.queue[1].ID != "a1" {
+		t.Fatalf("enter should append a1, got queue %v", m.queue)
+	}
+	if m.queue[1].Artist != "The Artist" {
+		t.Fatalf("artist name not filled: %q", m.queue[1].Artist)
+	}
+	if m.current.ID != "q1" {
+		t.Fatalf("playback disturbed: current = %q", m.current.ID)
+	}
+}
+
+// TestAlbumEnterQueues: enter on an album track appends it (album name filled),
+// matching the artist-view behavior.
+func TestAlbumEnterQueues(t *testing.T) {
+	m := newTestModel()
+	m.queue = []api.Track{{ID: "q1", Title: "Existing"}}
+	m.hasCurrent = true
+	m.activeView = viewAlbum
+	m.focus = focusPanel
+	m.albumTitle = "Greatest Hits"
+	m.albumTracks = []api.Track{{ID: "t1", Title: "Track 1"}}
+	m.albumCursor = 0
+
+	press(m, "enter")
+
+	if len(m.queue) != 2 || m.queue[1].ID != "t1" {
+		t.Fatalf("enter should append t1, got queue %v", m.queue)
+	}
+	if m.queue[1].Album != "Greatest Hits" {
+		t.Fatalf("album name not filled: %q", m.queue[1].Album)
+	}
+}
+
+// TestPlaylistSaveAndAppend: S names+saves the queue; the Playlists view's 'e'
+// appends a saved playlist to the queue.
+func TestPlaylistSaveAndAppend(t *testing.T) {
+	m := newTestModel()
+	m.queue = []api.Track{{ID: "a", Title: "A"}, {ID: "b", Title: "B"}}
+
+	press(m, "S")
+	if !m.naming {
+		t.Fatal("S should enter naming mode")
+	}
+	m.playlistInput.SetValue("Road Trip")
+	press(m, "enter")
+	if m.naming {
+		t.Fatal("enter should leave naming mode")
+	}
+	if len(m.cfg.Playlists) != 1 || m.cfg.Playlists[0].Name != "Road Trip" ||
+		len(m.cfg.Playlists[0].Tracks) != 2 {
+		t.Fatalf("playlist not saved correctly: %v", m.cfg.Playlists)
+	}
+
+	// Append it onto a queue that's already playing (hasCurrent avoids playAt).
+	m.queue = []api.Track{{ID: "x", Title: "X"}}
+	m.hasCurrent = true
+	m.activeView = viewPlaylists
+	m.focus = focusPanel
+	m.playlistCursor = 0
+	press(m, "e")
+	if len(m.queue) != 3 {
+		t.Fatalf("e should append the 2 playlist tracks, got queue %v", m.queue)
+	}
+}
+
+// TestSessionRestoreAndSnapshot: New restores a saved session; SnapshotSession
+// writes the live state back for next time.
+func TestSessionRestoreAndSnapshot(t *testing.T) {
+	cfg := &config.Config{
+		Volume:   100,
+		Queue:    []api.Track{{ID: "a"}, {ID: "b"}, {ID: "c"}},
+		QueuePos: 2, Shuffle: true, Repeat: int(repeatAll),
+	}
+	m := New(nil, cfg)
+	if len(m.queue) != 3 || m.queuePos != 2 || m.queueCursor != 2 {
+		t.Fatalf("queue not restored: len=%d pos=%d cursor=%d", len(m.queue), m.queuePos, m.queueCursor)
+	}
+	if !m.shuffle || m.repeat != repeatAll {
+		t.Fatalf("toggles not restored: shuffle=%v repeat=%v", m.shuffle, m.repeat)
+	}
+
+	m.queue = m.queue[:1]
+	m.queuePos = 0
+	m.shuffle = false
+	m.repeat = repeatOne
+	m.SnapshotSession()
+	if len(m.cfg.Queue) != 1 || m.cfg.QueuePos != 0 || m.cfg.Shuffle || m.cfg.Repeat != int(repeatOne) {
+		t.Fatalf("snapshot wrong: %+v", m.cfg)
+	}
+}
+
+// TestClearHistoryConfirmation: 'c' in History asks for confirmation; 'y'
+// clears history (and Listen Again), any other key cancels and keeps it.
+func TestClearHistoryConfirmation(t *testing.T) {
+	m := newTestModel()
+	m.activeView = viewHistory
+	m.focus = focusPanel
+	m.cfg.History = []config.HistoryEntry{
+		{Track: api.Track{ID: "a", Title: "A"}},
+		{Track: api.Track{ID: "b", Title: "B"}},
+	}
+	m.refreshListenAgain()
+
+	// Cancel path: any key other than y aborts.
+	press(m, "c")
+	if m.confirmFn == nil || m.confirmPrompt == "" {
+		t.Fatal("'c' should arm a confirmation")
+	}
+	press(m, "j")
+	if m.confirmFn != nil {
+		t.Fatal("non-y key should cancel the confirmation")
+	}
+	if len(m.cfg.History) != 2 {
+		t.Fatalf("cancel must keep history, got %d entries", len(m.cfg.History))
+	}
+	if m.historyCursor != 0 {
+		t.Fatalf("the cancelling key must be consumed, not act (cursor=%d)", m.historyCursor)
+	}
+
+	// Confirm path.
+	press(m, "c")
+	press(m, "y")
+	if len(m.cfg.History) != 0 {
+		t.Fatalf("y should clear history, got %d entries", len(m.cfg.History))
+	}
+	if len(m.homeListenAgain) != 0 {
+		t.Fatal("clearing history should also empty Listen Again")
+	}
+	if m.confirmFn != nil || m.confirmPrompt != "" {
+		t.Fatal("confirmation state should be reset after running")
+	}
+}
+
+// TestLoadMoreErrorRestoresToken: a failed load-more puts the consumed
+// continuation token back so the next scroll-to-bottom retries instead of
+// pagination dying on one transient failure.
+func TestLoadMoreErrorRestoresToken(t *testing.T) {
+	m := newTestModel()
+	m.searchGen = 1
+	m.searchResults = []api.Track{{ID: "a", Title: "A"}}
+	m.searchContinuation = "tok"
+
+	cmd := m.loadMoreSearch()
+	if cmd == nil {
+		t.Fatal("loadMoreSearch should fire with a token present")
+	}
+	if m.searchContinuation != "" || !m.searchMoreLoading {
+		t.Fatalf("dispatch should consume token and set loading, got token=%q loading=%v",
+			m.searchContinuation, m.searchMoreLoading)
+	}
+	// Guard against double-fire while in flight.
+	if m.loadMoreSearch() != nil {
+		t.Fatal("a second load-more while one is in flight must not fire")
+	}
+
+	m.Update(searchMoreMsg{gen: 1, token: "tok", err: errFake})
+	if m.searchContinuation != "tok" {
+		t.Fatalf("error should restore the token, got %q", m.searchContinuation)
+	}
+	if m.searchMoreLoading {
+		t.Fatal("error should clear the loading flag")
+	}
+}
+
+// TestSearchFooterStates: the pagination footer reflects loading / more / end,
+// and is absent when there are no results.
+func TestSearchFooterStates(t *testing.T) {
+	m := newTestModel()
+	if got := m.renderSearchFooter(60); got != "" {
+		t.Fatalf("no results should yield no footer, got %q", got)
+	}
+	m.searchResults = []api.Track{{ID: "a", Title: "A"}}
+
+	m.searchContinuation = "tok"
+	m.searchMoreLoading = false
+	if !strings.Contains(m.renderSearchFooter(60), "more") {
+		t.Errorf("with a continuation token the footer should mention more: %q", m.renderSearchFooter(60))
+	}
+
+	m.searchMoreLoading = true
+	if !strings.Contains(m.renderSearchFooter(60), "loading") {
+		t.Errorf("while loading the footer should say loading: %q", m.renderSearchFooter(60))
+	}
+
+	m.searchMoreLoading = false
+	m.searchContinuation = ""
+	if !strings.Contains(m.renderSearchFooter(60), "end of results") {
+		t.Errorf("exhausted results should show end-of-results: %q", m.renderSearchFooter(60))
+	}
+}
+
+// TestViewDimensions: every view renders to exactly the terminal size, even with
+// wide (CJK) glyphs and overlong titles. A row that overflows its width is
+// wrapped by lipgloss onto an extra (background-colored) line, corrupting the
+// layout in a real terminal — so width and height must both match exactly.
+func TestViewDimensions(t *testing.T) {
+	nasty := []api.Track{
+		{ID: "x1", Title: "Song A", Artist: "Artist A", Album: "Album A", Duration: "3:21"},
+		{ID: "x2", Title: "夜に駆ける 夜に駆ける 夜に駆ける 夜に駆ける 夜に駆ける", Artist: "YOASOBIとずっと真夜中でいいのに。", Album: "アルバム", Duration: "4:23"},
+		{ID: "x3", Title: strings.Repeat("VeryLongTitle ", 20), Artist: strings.Repeat("LongArtist ", 10), Duration: "12:34"},
+	}
+	for _, size := range [][2]int{{80, 24}, {120, 40}, {46, 16}} {
+		m := newTestModel()
+		m.width, m.height = size[0], size[1]
+		m.queue = append([]api.Track(nil), nasty...)
+		m.searchResults = m.queue
+		m.homeListenAgain = m.queue
+		m.albumTracks = m.queue
+		m.albumTitle = nasty[1].Title
+		m.artistName = nasty[1].Artist
+		m.artistSongs = m.queue
+		m.artistAlbums = []api.AlbumRef{{ID: "MPREb1", Title: nasty[1].Title, Year: "2020"}}
+		m.cfg.History = []config.HistoryEntry{{Track: nasty[1]}}
+		m.cfg.Playlists = []config.Playlist{{Name: nasty[1].Title, Tracks: m.queue}}
+		m.current = nasty[1]
+		m.hasCurrent = true
+		m.queuePos = 1
+		for _, v := range []view{viewHome, viewSearch, viewQueue, viewFavorites, viewHistory, viewAlbum, viewArtist, viewGenres, viewPlaylists, viewHelp} {
+			m.activeView = v
+			m.queueCursor, m.homeCursor, m.searchCursor = 1, 1, 1
+			m.albumCursor, m.artistCursor, m.historyCursor = 1, 1, 0
+			m.playlistCursor = 0
+			for _, focus := range []focusArea{focusPanel, focusSidebar} {
+				m.focus = focus
+				m.sbCache, m.scCache = "", ""
+				out := m.View()
+				if gotH := lipgloss.Height(out); gotH != m.height {
+					t.Errorf("%dx%d view %v focus %v: height %d, want %d", m.width, m.height, v, focus, gotH, m.height)
+				}
+				if gotW := lipgloss.Width(out); gotW != m.width {
+					t.Errorf("%dx%d view %v focus %v: width %d, want %d", m.width, m.height, v, focus, gotW, m.width)
+				}
+			}
+		}
+	}
+}
+
+// TestStatusLineDoesNotShiftLayout: a transient status appearing/expiring must
+// not change the overall height (the line is always reserved).
+func TestStatusLineDoesNotShiftLayout(t *testing.T) {
+	m := newTestModel()
+	m.queue = []api.Track{{ID: "x", Title: "Song A", Artist: "Artist A"}}
+	m.current = m.queue[0]
+	m.hasCurrent = true
+	m.activeView = viewQueue
+
+	without := m.View()
+	m.setStatus("queued: Song A")
+	with := m.View()
+	if lipgloss.Height(without) != lipgloss.Height(with) {
+		t.Fatalf("status changed layout height: %d -> %d",
+			lipgloss.Height(without), lipgloss.Height(with))
+	}
+	if lipgloss.Height(with) != m.height {
+		t.Fatalf("height with status = %d, want %d", lipgloss.Height(with), m.height)
+	}
+}
+
 // TestViewsRenderWithoutPanic: every view renders.
 func TestViewsRenderWithoutPanic(t *testing.T) {
 	m := newTestModel()
@@ -290,7 +585,7 @@ func TestViewsRenderWithoutPanic(t *testing.T) {
 	m.artistName = "Artist A"
 	m.artistSongs = m.queue
 	m.artistAlbums = []api.AlbumRef{{ID: "MPREb1", Title: "Album One", Year: "2020"}}
-	for _, v := range []view{viewHome, viewSearch, viewQueue, viewFavorites, viewHistory, viewAlbum, viewArtist, viewGenres, viewHelp} {
+	for _, v := range []view{viewHome, viewSearch, viewQueue, viewFavorites, viewHistory, viewAlbum, viewArtist, viewGenres, viewPlaylists, viewHelp} {
 		m.activeView = v
 		out := m.View()
 		if out == "" {

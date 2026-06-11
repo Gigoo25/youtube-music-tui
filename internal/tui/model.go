@@ -9,9 +9,9 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/rob/ytmusic/internal/api"
-	"github.com/rob/ytmusic/internal/config"
-	"github.com/rob/ytmusic/internal/player"
+	"github.com/Gigoo25/youtube-music-tui/internal/api"
+	"github.com/Gigoo25/youtube-music-tui/internal/config"
+	"github.com/Gigoo25/youtube-music-tui/internal/player"
 )
 
 type view int
@@ -26,6 +26,7 @@ const (
 	viewArtist
 	viewGenres
 	viewHelp
+	viewPlaylists
 )
 
 type repeatMode int
@@ -57,6 +58,7 @@ var navEntries = []navEntry{
 	{"Queue", viewQueue},
 	{"Favorites", viewFavorites},
 	{"History", viewHistory},
+	{"Playlists", viewPlaylists},
 	{"Help", viewHelp},
 }
 
@@ -105,11 +107,26 @@ type model struct {
 	artistErr     string
 
 	// search (global YouTube Music search — its own view)
-	searchInput   textinput.Model
-	searchTyping  bool // true = editing query; false = browsing results
-	searching     bool
-	searchResults []api.Track
-	searchCursor  int
+	searchInput        textinput.Model
+	searchTyping       bool // true = editing query; false = browsing results
+	searching          bool
+	searchGen          int    // bumped per search; a slow older response must not clobber a newer one
+	searchContinuation string // token for the next page of results ("" = none / exhausted)
+	searchMoreLoading  bool   // a load-more page request is in flight
+	searchResults      []api.Track
+	searchCursor       int
+
+	// playlists (saved locally; a Quick Links view)
+	playlistCursor int
+
+	// naming overlay: capturing a name for "save queue as playlist".
+	naming        bool
+	playlistInput textinput.Model
+
+	// pending confirmation for a destructive action: while confirmFn is non-nil
+	// the next key either confirms (y) or cancels (anything else).
+	confirmPrompt string
+	confirmFn     func()
 
 	// local filter ("/"): narrows the CURRENT pane's list in-memory. filtering =
 	// editing the query; filter != "" = an applied filter being browsed.
@@ -179,6 +196,17 @@ const statusTTL = 5 * time.Second
 
 type searchDoneMsg struct {
 	tracks []api.Track
+	next   string // continuation token for the next page
+	gen    int    // searchGen at dispatch; stale responses are dropped
+	err    error
+}
+
+// searchMoreMsg carries an appended page of search results (load-more).
+type searchMoreMsg struct {
+	tracks []api.Track
+	next   string
+	token  string // the token this page was fetched with, restored on error so retry works
+	gen    int
 	err    error
 }
 
@@ -233,6 +261,10 @@ func New(p *player.Player, cfg *config.Config) *model {
 	fi.Placeholder = "filter…"
 	fi.CharLimit = 100
 
+	pi := textinput.New()
+	pi.Placeholder = "playlist name"
+	pi.CharLimit = 80
+
 	client := api.NewClient()
 	client.SetTimeout(api.RequestTimeout)
 
@@ -243,19 +275,50 @@ func New(p *player.Player, cfg *config.Config) *model {
 	}
 	applyTheme(themes[themeIdx])
 
-	return &model{
-		player:       p,
-		cfg:          cfg,
-		api:          client,
-		activeView:   viewHome,
-		focus:        focusPanel,
-		navCursor:    navIndexOf(viewHome),
-		searchInput:  ti,
-		filterInput:  fi,
-		searchTyping: false,
-		themeIdx:     themeIdx,
-		playerState:  player.State{Volume: cfg.Volume},
+	m := &model{
+		player:        p,
+		cfg:           cfg,
+		api:           client,
+		activeView:    viewHome,
+		focus:         focusPanel,
+		navCursor:     navIndexOf(viewHome),
+		searchInput:   ti,
+		filterInput:   fi,
+		playlistInput: pi,
+		searchTyping:  false,
+		themeIdx:      themeIdx,
+		playerState:   player.State{Volume: cfg.Volume},
 	}
+	m.restoreSession()
+	return m
+}
+
+// restoreSession reloads the queue and playback toggles saved on last exit. The
+// queue is copied (not aliased) and playback is left stopped — the user resumes
+// with Enter/p on the queue, so a launch never starts audio unprompted.
+func (m *model) restoreSession() {
+	if len(m.cfg.Queue) > 0 {
+		m.queue = append([]api.Track(nil), m.cfg.Queue...)
+		m.queuePos = m.cfg.QueuePos
+		if m.queuePos < 0 || m.queuePos >= len(m.queue) {
+			m.queuePos = 0
+		}
+		m.queueCursor = m.queuePos // land the cursor on the track that was playing
+	}
+	m.shuffle = m.cfg.Shuffle
+	if m.cfg.Repeat >= int(repeatOff) && m.cfg.Repeat <= int(repeatOne) {
+		m.repeat = repeatMode(m.cfg.Repeat)
+	}
+}
+
+// SnapshotSession copies the live session state into the config so the next
+// launch can restore it. Exported so main.go can call it on the final model
+// before the exit Save (the model holds the only authoritative queue).
+func (m *model) SnapshotSession() {
+	m.cfg.Queue = m.queue
+	m.cfg.QueuePos = m.queuePos
+	m.cfg.Shuffle = m.shuffle
+	m.cfg.Repeat = int(m.repeat)
 }
 
 // cycleTheme advances to the next color theme, persists it, and invalidates the
@@ -275,6 +338,9 @@ func (m *model) Init() tea.Cmd {
 	// Picks loads asynchronously.
 	m.refreshListenAgain()
 	m.homeLoaded = true
+	if len(m.queue) > 0 {
+		m.setStatus(fmt.Sprintf("restored %d queued tracks — press space to resume", len(m.queue)))
+	}
 	return tea.Batch(
 		textinput.Blink,
 		m.nextTick(),
@@ -313,14 +379,23 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, c)
 			}
 		}
+		// Surface stream-load/playback failures (otherwise a failed yt-dlp resolve
+		// leaves the UI silently stuck looking like it's playing).
+		if e := m.player.LoadError(); e != "" {
+			m.setError(e)
+		}
 		// Auto-clear a transient status message once it has been shown long enough.
 		if m.status != "" && time.Since(m.statusAt) >= statusTTL {
 			m.status = ""
 			m.statusErr = false
 		}
-		// Flush any debounced config changes.
+		// Flush any debounced config changes (capturing the live queue too, so a
+		// crash keeps a recent session, not just a clean exit).
 		if m.cfgDirty && time.Since(m.cfgDirtyAt) >= configSaveDelay {
-			m.cfg.Save()
+			m.SnapshotSession()
+			if err := m.cfg.Save(); err != nil {
+				m.setError("config save failed: " + err.Error())
+			}
 			m.cfgDirty = false
 		}
 		m.pushMPRIS()
@@ -450,12 +525,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case searchDoneMsg:
+		if msg.gen != m.searchGen {
+			return m, nil // a newer search superseded this response
+		}
 		m.searching = false
 		if msg.err != nil {
 			m.setError("search failed: " + msg.err.Error())
 		} else {
-			// Search lives in the secret-blocked ytmusic.go; clean its results here.
 			m.searchResults = api.CleanTracks(msg.tracks)
+			m.searchContinuation = msg.next
 			m.searchCursor = 0
 			if len(msg.tracks) == 0 {
 				m.setStatus("no results")
@@ -465,14 +543,47 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case searchMoreMsg:
+		if msg.gen != m.searchGen {
+			return m, nil // a newer search replaced the list this page belonged to
+		}
+		m.searchMoreLoading = false
+		if msg.err != nil {
+			// Restore the consumed token so scrolling down retries the page —
+			// otherwise one transient failure would end pagination for this search.
+			m.searchContinuation = msg.token
+			m.setError("load more failed: " + msg.err.Error())
+			return m, nil
+		}
+		// Append the new page, skipping ids already shown.
+		seen := make(map[string]bool, len(m.searchResults))
+		for _, t := range m.searchResults {
+			seen[t.ID] = true
+		}
+		for _, t := range api.CleanTracks(msg.tracks) {
+			if t.ID != "" && !seen[t.ID] {
+				m.searchResults = append(m.searchResults, t)
+				seen[t.ID] = true
+			}
+		}
+		m.searchContinuation = msg.next
+		m.setStatus(fmt.Sprintf("%d results", len(m.searchResults)))
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
 
-	// Forward any other message to the text input while typing (e.g. paste).
+	// Forward any other message to the active text input (e.g. paste, cursor
+	// blink) so its cursor animates.
 	if m.typing() {
 		var cmd tea.Cmd
 		m.searchInput, cmd = m.searchInput.Update(msg)
+		return m, cmd
+	}
+	if m.naming {
+		var cmd tea.Cmd
+		m.playlistInput, cmd = m.playlistInput.Update(msg)
 		return m, cmd
 	}
 	return m, nil
@@ -579,6 +690,8 @@ func (m *model) activeCursorPtr() *int {
 		return &m.albumCursor
 	case viewArtist:
 		return &m.artistCursor
+	case viewPlaylists:
+		return &m.playlistCursor
 	}
 	return nil
 }
@@ -599,6 +712,8 @@ func (m *model) activeFilteredLen() int {
 		return len(m.filt(m.albumTracks))
 	case viewArtist:
 		return len(m.filt(m.artistSongs)) + len(m.filtAlbums(m.artistAlbums))
+	case viewPlaylists:
+		return len(m.cfg.Playlists)
 	}
 	return 0
 }
@@ -630,6 +745,46 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// ctrl+c always quits, even while typing.
 	if msg.String() == "ctrl+c" {
 		return m, tea.Quit
+	}
+
+	// A pending destructive-action confirmation captures the next key: y runs
+	// the action, anything else cancels.
+	if m.confirmFn != nil {
+		fn, prompt := m.confirmFn, m.confirmPrompt
+		m.confirmFn = nil
+		m.confirmPrompt = ""
+		if s := msg.String(); s == "y" || s == "Y" {
+			fn()
+		} else {
+			m.setStatus("cancelled: " + prompt)
+		}
+		return m, nil
+	}
+
+	// Naming overlay (save queue as playlist) owns the keyboard until confirmed.
+	if m.naming {
+		switch msg.String() {
+		case "enter":
+			name := strings.TrimSpace(m.playlistInput.Value())
+			m.naming = false
+			m.playlistInput.Blur()
+			if name == "" {
+				m.setError("playlist name cannot be empty")
+				return m, nil
+			}
+			m.cfg.SavePlaylist(name, m.queue)
+			m.markConfigDirty()
+			m.setStatus(fmt.Sprintf("saved playlist %q (%d tracks)", name, len(m.queue)))
+			return m, nil
+		case "esc":
+			m.naming = false
+			m.playlistInput.Blur()
+			m.playlistInput.SetValue("")
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.playlistInput, cmd = m.playlistInput.Update(msg)
+		return m, cmd
 	}
 
 	// While typing in the search box, the input owns the keyboard except for
@@ -702,7 +857,18 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Playback: match Space by both string and key type so it fires reliably
 	// regardless of how the terminal reports the event.
 	if msg.Type == tea.KeySpace || msg.String() == " " {
-		m.player.PlayPause()
+		// Nothing loaded but a queue is present (a restored session, or the queue
+		// ran out): space starts playback at the queue position rather than
+		// toggling a paused mpv that has no file. So resuming is just "press play".
+		if !m.hasCurrent && len(m.queue) > 0 {
+			idx := m.queuePos
+			if idx < 0 || idx >= len(m.queue) {
+				idx = 0
+			}
+			m.playAt(idx)
+		} else {
+			m.player.PlayPause()
+		}
 		return m, nil
 	}
 
@@ -725,6 +891,14 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "-":
 		m.player.VolumeDown()
+		return m, nil
+	case "m":
+		m.player.ToggleMute()
+		if m.playerState.Muted {
+			m.setStatus("unmuted")
+		} else {
+			m.setStatus("muted")
+		}
 		return m, nil
 	case "s":
 		m.shuffle = !m.shuffle
@@ -789,6 +963,19 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "5":
 		m.activateView(viewHistory)
 		return m, nil
+	case "6":
+		m.activateView(viewPlaylists)
+		return m, nil
+	case "S":
+		// Save the current queue as a named playlist.
+		if len(m.queue) == 0 {
+			m.setError("queue is empty — nothing to save")
+			return m, nil
+		}
+		m.naming = true
+		m.playlistInput.SetValue("")
+		m.playlistInput.Focus()
+		return m, textinput.Blink
 	case "z":
 		m.openGenres()
 		return m, nil
@@ -874,6 +1061,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleArtistKey(msg)
 	case viewGenres:
 		return m.handleGenresKey(msg)
+	case viewPlaylists:
+		return m.handlePlaylistsKey(msg)
 	case viewHelp:
 		return m, nil
 	}
@@ -979,34 +1168,60 @@ func (m *model) handleAlbumKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch msg.String() {
 	case "enter":
-		// Play the whole album starting from the selected (filtered) track.
+		// Queue the selected track (consistent with every other list view).
 		if m.albumCursor < len(vis) {
-			m.playAlbumFrom(vis[m.albumCursor])
+			m.enqueue(m.albumTrackAt(vis[m.albumCursor]))
 		}
 	case "p":
-		// Play the whole album from the top.
-		m.playAlbumFrom(0)
+		// Play the selected track now.
+		if m.albumCursor < len(vis) {
+			m.playNow(m.albumTrackAt(vis[m.albumCursor]))
+		}
+	case "e":
+		// Append the whole album to the queue without disturbing playback.
+		m.enqueueAll(m.withAlbum(m.albumTracks))
 	}
 	return m, nil
 }
 
-// playAlbumFrom replaces the queue with the loaded album and plays from idx.
-func (m *model) playAlbumFrom(idx int) {
-	if idx < 0 || idx >= len(m.albumTracks) {
-		return
+// albumTrackAt returns the album track at idx with the (implied) album name
+// filled in, so the now-playing bar shows it.
+func (m *model) albumTrackAt(idx int) api.Track {
+	t := m.albumTracks[idx]
+	if t.Album == "" {
+		t.Album = m.albumTitle
 	}
-	tracks := append([]api.Track(nil), m.albumTracks...)
-	// Album rows carry the artist but not the album name; fill it so the
-	// now-playing bar shows the album.
-	for i := range tracks {
-		if tracks[i].Album == "" {
-			tracks[i].Album = m.albumTitle
+	return t
+}
+
+// withAlbum returns a copy of ts with the (implied) album name filled in, so the
+// now-playing bar shows it. Album rows carry the artist but not the album name.
+func (m *model) withAlbum(ts []api.Track) []api.Track {
+	out := append([]api.Track(nil), ts...)
+	for i := range out {
+		if out[i].Album == "" {
+			out[i].Album = m.albumTitle
 		}
 	}
-	m.queue = tracks
-	m.queueCursor = idx
-	m.playAt(idx)
-	m.setStatus("playing album: " + m.albumTitle)
+	return out
+}
+
+// enqueueAll appends every track to the queue. If nothing is playing it starts
+// at the first appended track; otherwise playback is undisturbed and the next
+// few tracks are warmed.
+func (m *model) enqueueAll(ts []api.Track) {
+	if len(ts) == 0 {
+		m.setError("nothing to queue")
+		return
+	}
+	start := len(m.queue)
+	m.queue = append(m.queue, ts...)
+	if !m.hasCurrent {
+		m.playAt(start)
+	} else {
+		m.prefetchNext()
+	}
+	m.setStatus(fmt.Sprintf("queued %d tracks", len(ts)))
 }
 
 // ── Home view ──
@@ -1141,35 +1356,43 @@ func (m *model) handleArtistKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch msg.String() {
 	case "enter":
+		// On a song, queue it (consistent with other views); on an album, open it.
 		if m.artistCursor < len(songVis) {
-			m.playArtistSongsFrom(songVis[m.artistCursor])
+			m.enqueue(m.artistSongAt(songVis[m.artistCursor]))
 		} else if ai := m.artistCursor - len(songVis); ai < len(albums) {
 			return m, m.openAlbumByID(albums[ai])
 		}
 	case "p":
-		m.playArtistSongsFrom(0)
+		// Play the selected song now (albums have no play-now; enter opens them).
+		if m.artistCursor < len(songVis) {
+			m.playNow(m.artistSongAt(songVis[m.artistCursor]))
+		}
+	case "e":
+		// Append the artist's top songs to the queue.
+		m.enqueueAll(m.withArtist(m.artistSongs))
 	}
 	return m, nil
 }
 
-// playArtistSongsFrom replaces the queue with the artist's top songs and plays
-// from idx.
-func (m *model) playArtistSongsFrom(idx int) {
-	if idx < 0 || idx >= len(m.artistSongs) {
-		return
+// artistSongAt returns the artist song at idx with the (implied) artist name
+// filled in.
+func (m *model) artistSongAt(idx int) api.Track {
+	t := m.artistSongs[idx]
+	if t.Artist == "" {
+		t.Artist = m.artistName
 	}
-	songs := append([]api.Track(nil), m.artistSongs...)
-	// Artist-page rows often omit the (implied) artist; fill it so the now-playing
-	// bar shows it.
-	for i := range songs {
-		if songs[i].Artist == "" {
-			songs[i].Artist = m.artistName
+	return t
+}
+
+// withArtist returns a copy of ts with the (implied) artist name filled in.
+func (m *model) withArtist(ts []api.Track) []api.Track {
+	out := append([]api.Track(nil), ts...)
+	for i := range out {
+		if out[i].Artist == "" {
+			out[i].Artist = m.artistName
 		}
 	}
-	m.queue = songs
-	m.queueCursor = idx
-	m.playAt(idx)
-	m.setStatus("playing: " + m.artistName)
+	return out
 }
 
 // openAlbumByID opens an album (by browse id) from the artist view; esc returns
@@ -1282,8 +1505,68 @@ func (m *model) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.historyCursor < len(hist) {
 			m.playNow(hist[m.historyCursor].Track)
 		}
+	case "c":
+		if len(m.cfg.History) == 0 {
+			m.setStatus("history is already empty")
+			return m, nil
+		}
+		m.confirmPrompt = fmt.Sprintf("clear all %d history entries?", len(m.cfg.History))
+		m.confirmFn = func() {
+			m.cfg.History = nil
+			m.historyCursor = 0
+			// Listen Again is built from history — rebuild it so Home matches.
+			m.refreshListenAgain()
+			if m.homeCursor >= m.homeLen() {
+				m.homeCursor = 0
+			}
+			m.markConfigDirty()
+			m.setStatus("history cleared")
+		}
 	}
 	return m, nil
+}
+
+func (m *model) handlePlaylistsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	pls := m.cfg.Playlists
+	if nc, ok := m.vimMove(msg.String(), m.playlistCursor, len(pls)); ok {
+		m.playlistCursor = nc
+		return m, nil
+	}
+	if m.playlistCursor >= len(pls) {
+		return m, nil
+	}
+	switch msg.String() {
+	case "enter", "p":
+		// Replace the queue with the playlist and start playing.
+		m.loadPlaylist(pls[m.playlistCursor], true)
+	case "e":
+		// Append the playlist to the queue without disturbing playback.
+		m.loadPlaylist(pls[m.playlistCursor], false)
+	case "d", "x":
+		name := pls[m.playlistCursor].Name
+		m.cfg.DeletePlaylist(name)
+		m.markConfigDirty()
+		m.clampActiveCursor()
+		m.setStatus("deleted playlist: " + name)
+	}
+	return m, nil
+}
+
+// loadPlaylist plays (replace == true) or appends (replace == false) a saved
+// playlist's tracks. Replacing starts playback from the top.
+func (m *model) loadPlaylist(pl config.Playlist, replace bool) {
+	if len(pl.Tracks) == 0 {
+		m.setError("playlist is empty")
+		return
+	}
+	if replace {
+		m.queue = append([]api.Track(nil), pl.Tracks...)
+		m.queueCursor = 0
+		m.playAt(0)
+		m.setStatus("playing playlist: " + pl.Name)
+		return
+	}
+	m.enqueueAll(pl.Tracks)
 }
 
 // activateView switches to v, syncs the sidebar selection, and moves focus to
@@ -1325,6 +1608,10 @@ func (m *model) handleSidebarKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if nc, ok := m.vimMove(msg.String(), m.searchCursor, len(m.searchResults)); ok {
 		m.searchCursor = nc
+		// Reaching the end of the loaded results pulls in the next page.
+		if nc >= len(m.searchResults)-1 && m.searchContinuation != "" {
+			return m, m.loadMoreSearch()
+		}
 		return m, nil
 	}
 	switch msg.String() {
@@ -1336,10 +1623,15 @@ func (m *model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.searchResults) > 0 {
 			m.playNow(m.searchResults[m.searchCursor])
 		}
+	case "e":
+		// Append every loaded result to the queue.
+		m.enqueueAll(m.searchResults)
 	case "esc":
 		// Already browsing results — clear them.
 		m.searchResults = nil
 		m.searchCursor = 0
+		m.searchContinuation = ""
+		m.searchMoreLoading = false
 		m.searchInput.SetValue("")
 	}
 	return m, nil
@@ -1385,7 +1677,18 @@ func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.queuePos--
 			}
 			m.clampActiveCursor() // keep cursor in range of the (refiltered) list
+			m.prefetchNext()      // the upcoming tracks may have shifted — re-warm them
 			m.setStatus("removed from queue")
+		}
+	case ".":
+		// Jump the cursor to the now-playing track.
+		if m.hasCurrent {
+			for i, orig := range vis {
+				if orig == m.queuePos {
+					m.queueCursor = i
+					break
+				}
+			}
 		}
 	case "c":
 		m.queue = nil
@@ -1413,6 +1716,8 @@ func (m *model) moveQueueItem(from, to int) {
 		m.queuePos = from
 	}
 	m.queueCursor = to
+	// Reordering changes what plays next — warm the new upcoming tracks.
+	m.prefetchNext()
 }
 
 func (m *model) handleFavKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1600,7 +1905,13 @@ func (m *model) nextTrack() tea.Cmd {
 	}
 	switch m.repeat {
 	case repeatOne:
-		m.playAt(m.queuePos)
+		if m.hasCurrent {
+			m.playAt(m.queuePos)
+		} else {
+			// The playing entry was removed from the queue (queuePos may be -1);
+			// resume with the track that shifted into its slot.
+			m.playAt(m.queuePos + 1)
+		}
 	case repeatAll:
 		if m.shuffle {
 			m.playAt(rand.Intn(len(m.queue)))
@@ -1652,11 +1963,34 @@ func (m *model) prevTrack() {
 }
 
 func (m *model) doSearch(query string) tea.Cmd {
+	m.searchGen++
+	m.searchContinuation = ""
+	m.searchMoreLoading = false
+	gen := m.searchGen
+	client := m.api
 	return func() tea.Msg {
-		// SearchSongs filters to the Songs tab so results are the official audio
-		// (ATV) versions with proper title/artist/album, not music videos.
-		tracks, err := m.api.SearchSongs(query)
-		return searchDoneMsg{tracks: tracks, err: err}
+		// SearchSongsPage filters to the Songs tab so results are the official
+		// audio (ATV) versions with proper title/artist/album, not music videos,
+		// and returns a continuation token for lazily loading further pages.
+		tracks, next, err := client.SearchSongsPage(query, "")
+		return searchDoneMsg{tracks: tracks, next: next, gen: gen, err: err}
+	}
+}
+
+// loadMoreSearch fetches the next page of search results and appends them. It is
+// triggered when the cursor reaches the end of the current results.
+func (m *model) loadMoreSearch() tea.Cmd {
+	token := m.searchContinuation
+	if token == "" || m.searchMoreLoading {
+		return nil
+	}
+	m.searchContinuation = "" // consume; the response refills it (prevents double-fire)
+	m.searchMoreLoading = true
+	gen := m.searchGen
+	client := m.api
+	return func() tea.Msg {
+		tracks, next, err := client.SearchSongsPage("", token)
+		return searchMoreMsg{tracks: tracks, next: next, token: token, gen: gen, err: err}
 	}
 }
 

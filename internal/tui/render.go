@@ -6,25 +6,34 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/rob/ytmusic/internal/api"
-	"github.com/rob/ytmusic/internal/player"
+	"github.com/Gigoo25/youtube-music-tui/internal/api"
+	"github.com/Gigoo25/youtube-music-tui/internal/player"
 )
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
-// truncate shortens s to max display runes, appending an ellipsis when cut.
+// truncate shortens s to max display *columns*, appending an ellipsis when cut.
+// Width-aware (CJK and other wide glyphs count as 2 columns), so a truncated row
+// can never overflow its container and wrap onto a second line.
 func truncate(s string, max int) string {
 	if max <= 0 {
 		return ""
 	}
-	r := []rune(s)
-	if len(r) <= max {
+	if lipgloss.Width(s) <= max {
 		return s
 	}
 	if max == 1 {
 		return "…"
 	}
-	return string(r[:max-1]) + "…"
+	w := 0
+	for i, r := range s {
+		rw := lipgloss.Width(string(r))
+		if w+rw > max-1 {
+			return s[:i] + "…"
+		}
+		w += rw
+	}
+	return s
 }
 
 // fmtDur formats seconds as M:SS.
@@ -91,10 +100,9 @@ func (m *model) View() string {
 	nowbar := m.renderNowBar(innerW)
 
 	// Height budget: outer border (2) + shortcuts + status + now-playing bar.
-	used := 2 + lipgloss.Height(shortcuts)
-	if status != "" {
-		used += lipgloss.Height(status)
-	}
+	// The status line is always reserved (blank when empty) so a transient
+	// message appearing/expiring doesn't shift the whole layout by a row.
+	used := 2 + lipgloss.Height(shortcuts) + lipgloss.Height(status)
 	if nowbar != "" {
 		used += lipgloss.Height(nowbar)
 	}
@@ -129,16 +137,20 @@ func (m *model) View() string {
 
 	content := padToHeight(body, contentH)
 
-	// Footer stack: content, persistent now-playing bar, status, shortcuts.
-	parts := []string{content}
+	// Footer stack: content, status, now-playing bar (info + seek), shortcuts.
+	// Status sits above the seek bar so it reads as part of the player area.
+	parts := []string{content, status}
 	if nowbar != "" {
 		parts = append(parts, nowbar)
 	}
-	if status != "" {
-		parts = append(parts, status)
-	}
 	parts = append(parts, shortcuts)
 	inner := lipgloss.JoinVertical(lipgloss.Left, parts...)
+
+	// Clamp to the frame so the output is exactly the terminal size even on a
+	// terminal too short for all the chrome (otherwise the wrapped shortcuts bar
+	// would overflow and corrupt the alt-screen). padToHeight truncates the
+	// excess from the bottom.
+	inner = padToHeight(inner, m.height-2)
 
 	// Pin the shell to the full terminal height (border consumes 2 rows).
 	return styleShell.Width(innerW).Height(m.height - 2).Render(inner)
@@ -162,6 +174,8 @@ func viewIcon(v view) string {
 		return iconAlbum
 	case viewArtist:
 		return iconArtist
+	case viewPlaylists:
+		return iconPlaylist
 	case viewHelp:
 		return iconHelp
 	}
@@ -189,7 +203,9 @@ func (m *model) renderSidebar(w, h int) string {
 }
 
 func (m *model) buildSidebar(w, h int) string {
-	inner := w - 4 // rounded border (2) + padding (2)
+	// lipgloss Width includes the padding but not the border, so the box totals
+	// exactly w columns when Width is w-2.
+	inner := w - 2
 	if inner < 1 {
 		inner = 1
 	}
@@ -224,9 +240,14 @@ func (m *model) buildSidebar(w, h int) string {
 	return styleSidebarBox.Width(inner).Height(h - 2).Render(body)
 }
 
-// renderPanel renders the active view's content, with a local-filter line on top
-// when a filter is being typed or applied.
+// renderPanel renders the active view's content, with a naming prompt or
+// local-filter line on top when one is active.
 func (m *model) renderPanel(w, h int) string {
+	if m.naming {
+		nl := m.renderNamingLine(w)
+		body := m.renderPanelBody(w, h-lipgloss.Height(nl))
+		return lipgloss.JoinVertical(lipgloss.Left, nl, body)
+	}
 	if m.filtering || m.filter != "" {
 		fl := m.renderFilterLine(w)
 		body := m.renderPanelBody(w, h-lipgloss.Height(fl))
@@ -235,15 +256,20 @@ func (m *model) renderPanel(w, h int) string {
 	return m.renderPanelBody(w, h)
 }
 
+// renderNamingLine shows the "save playlist as" prompt with its text input.
+func (m *model) renderNamingLine(w int) string {
+	return truncate2(stylePrimary.Render(iconPlaylist+" Save playlist as: ")+m.playlistInput.View(), w)
+}
+
 // renderFilterLine shows the active "/" filter and its match count.
 func (m *model) renderFilterLine(w int) string {
 	n := m.activeFilteredLen()
 	count := styleDim.Render(fmt.Sprintf("  (%d)", n))
 	if m.filtering {
-		return stylePrimary.Render(iconSearch+" ") + m.filterInput.View() + count
+		return truncate2(stylePrimary.Render(iconSearch+" ")+m.filterInput.View()+count, w)
 	}
-	return styleAccent.Render(iconSearch+" "+m.filter) + count +
-		styleDim.Render("  esc to clear")
+	return truncate2(styleAccent.Render(iconSearch+" "+m.filter)+count+
+		styleDim.Render("  esc to clear"), w)
 }
 
 // renderPanelBody renders the active view's content into the main panel.
@@ -265,15 +291,71 @@ func (m *model) renderPanelBody(w, h int) string {
 		return m.renderAlbum(w, h)
 	case viewGenres:
 		return m.renderGenres(w, h)
+	case viewPlaylists:
+		return m.renderPlaylists(w, h)
 	case viewHelp:
 		return m.renderHelp(w, h)
 	}
 	return ""
 }
 
+// renderPlaylists renders the saved-playlists list: name + track count.
+func (m *model) renderPlaylists(w, h int) string {
+	heading := styleSecondaryBold.Render(truncate(iconPlaylist+" Playlists", w))
+	pls := m.cfg.Playlists
+	if len(pls) == 0 {
+		return lipgloss.JoinVertical(lipgloss.Left, heading,
+			styleDim.Render(truncate("No playlists yet — build a queue and press S to save one.", w)))
+	}
+
+	listH := h - lipgloss.Height(heading)
+	if listH < 1 {
+		listH = 1
+	}
+	focused := m.focus == focusPanel
+	start, end := windowBounds(m.playlistCursor, len(pls), listH)
+	var rows []string
+	for i := start; i < end; i++ {
+		pl := pls[i]
+		selected := i == m.playlistCursor
+		count := fmt.Sprintf("%d", len(pl.Tracks))
+
+		if selected && focused {
+			plain := "▸ " + fmt.Sprintf("%d. ", i+1) + pl.Name
+			gap := w - lipgloss.Width(plain) - lipgloss.Width(count)
+			if gap < 1 {
+				plain = truncate(plain, w-lipgloss.Width(count)-1)
+				gap = w - lipgloss.Width(plain) - lipgloss.Width(count)
+				if gap < 1 {
+					gap = 1
+				}
+			}
+			rows = append(rows, styleSelected.Width(w).Render(plain+strings.Repeat(" ", gap)+count))
+			continue
+		}
+
+		marker := "  "
+		if selected {
+			marker = stylePrimary.Render("▸ ")
+		}
+		left := marker + styleDim.Render(fmt.Sprintf("%d. ", i+1)) + styleText.Render(pl.Name)
+		right := styleDim.Render(count + " tracks")
+		gap := w - lipgloss.Width(left) - lipgloss.Width(right)
+		if gap < 1 {
+			left = truncate2(left, w-lipgloss.Width(right)-1)
+			gap = w - lipgloss.Width(left) - lipgloss.Width(right)
+			if gap < 1 {
+				gap = 1
+			}
+		}
+		rows = append(rows, left+strings.Repeat(" ", gap)+right)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, heading, strings.Join(rows, "\n"))
+}
+
 // renderGenres renders the random-genre picker (row 0 = "Any").
 func (m *model) renderGenres(w, h int) string {
-	heading := styleSecondaryBold.Render(iconShuffle + " Random — pick a genre")
+	heading := styleSecondaryBold.Render(truncate(iconShuffle+" Random — pick a genre", w))
 	items := make([]string, 0, len(randomSeeds)+1)
 	items = append(items, "Any (surprise me)")
 	items = append(items, randomSeeds...)
@@ -302,13 +384,13 @@ func (m *model) renderGenres(w, h int) string {
 
 // renderAlbum renders the album-of-a-track view.
 func (m *model) renderAlbum(w, h int) string {
-	heading := styleSecondaryBold.Render(iconAlbum + " Album: " + m.albumTitle)
+	heading := styleSecondaryBold.Render(truncate(iconAlbum+" Album: "+m.albumTitle, w))
 
 	switch {
 	case m.albumLoading:
 		return lipgloss.JoinVertical(lipgloss.Left, heading, styleAccent.Render("Loading…"))
 	case m.albumErr != "":
-		return lipgloss.JoinVertical(lipgloss.Left, heading, styleError.Render(m.albumErr))
+		return lipgloss.JoinVertical(lipgloss.Left, heading, styleError.Render(truncate(m.albumErr, w)))
 	case len(m.albumTracks) == 0:
 		return lipgloss.JoinVertical(lipgloss.Left, heading, styleDim.Render("Album not found."))
 	}
@@ -352,7 +434,7 @@ func (m *model) renderHome(w, h int) string {
 
 	rows = append(rows, styleSecondaryBold.Render(iconListen+" Listen Again"))
 	if len(listenAgain) == 0 {
-		rows = append(rows, styleDim.Render("  Nothing yet — play a song and it'll show up here."))
+		rows = append(rows, styleDim.Render(truncate("  Nothing yet — play a song and it'll show up here.", w)))
 	}
 	for i, t := range listenAgain {
 		addTrack(i+1, t)
@@ -363,7 +445,7 @@ func (m *model) renderHome(w, h int) string {
 	case len(quickPicks) == 0 && m.homeQPLoading:
 		rows = append(rows, styleAccent.Render("  Loading…"))
 	case len(quickPicks) == 0 && m.homeQPErr != "":
-		rows = append(rows, styleError.Render("  "+m.homeQPErr))
+		rows = append(rows, styleError.Render(truncate("  "+m.homeQPErr, w)))
 	case len(quickPicks) == 0:
 		rows = append(rows, styleDim.Render("  Nothing here yet."))
 	}
@@ -379,13 +461,13 @@ func (m *model) renderHome(w, h int) string {
 // renderArtist renders the artist view: top songs plus albums, one flat cursor
 // spanning both (songs first, then albums).
 func (m *model) renderArtist(w, h int) string {
-	heading := styleSecondaryBold.Render(iconArtist + " Artist: " + m.artistName)
+	heading := styleSecondaryBold.Render(truncate(iconArtist+" Artist: "+m.artistName, w))
 
 	switch {
 	case m.artistLoading:
 		return lipgloss.JoinVertical(lipgloss.Left, heading, styleAccent.Render("Loading…"))
 	case m.artistErr != "":
-		return lipgloss.JoinVertical(lipgloss.Left, heading, styleError.Render(m.artistErr))
+		return lipgloss.JoinVertical(lipgloss.Left, heading, styleError.Render(truncate(m.artistErr, w)))
 	case len(m.artistSongs) == 0 && len(m.artistAlbums) == 0:
 		return lipgloss.JoinVertical(lipgloss.Left, heading, styleDim.Render("Artist not found."))
 	}
@@ -485,9 +567,16 @@ func windowRows(rows []string, center, h int) string {
 
 // ─── Status line ───────────────────────────────────────────────────────────────
 
+// renderStatusLine always renders exactly one row — blank when there is no
+// message — so the layout never shifts when a status appears or expires. A
+// pending destructive-action confirmation takes priority over status text.
 func (m *model) renderStatusLine(w int) string {
+	if m.confirmPrompt != "" {
+		st := lipgloss.NewStyle().Foreground(colorBackground).Background(colorWarning).Bold(true)
+		return st.Width(w).Render(truncate(" "+m.confirmPrompt+"  [y] yes  [any other key] cancel", w))
+	}
 	if m.status == "" {
-		return ""
+		return strings.Repeat(" ", w)
 	}
 	st := styleSuccess
 	if m.statusErr {
@@ -514,10 +603,13 @@ type shortcut struct {
 type shortcutsKey struct {
 	w          int
 	typing     bool
+	naming     bool
+	confirming bool
 	filtering  bool
 	filtered   bool
 	hasCurrent bool
 	paused     bool
+	muted      bool
 	volume     float64
 	shuffle    bool
 	repeat     repeatMode
@@ -528,9 +620,10 @@ type shortcutsKey struct {
 
 func (m *model) renderShortcutsBar(w int) string {
 	key := shortcutsKey{
-		w: w, typing: m.typing(), filtering: m.filtering, filtered: m.filter != "",
+		w: w, typing: m.typing(), naming: m.naming, confirming: m.confirmFn != nil,
+		filtering: m.filtering, filtered: m.filter != "",
 		hasCurrent: m.hasCurrent,
-		paused:     m.playerState.Paused, volume: m.playerState.Volume,
+		paused:     m.playerState.Paused, muted: m.playerState.Muted, volume: m.playerState.Volume,
 		shuffle: m.shuffle, repeat: m.repeat, autoCont: m.cfg.AutoContinue,
 		focus: m.focus, view: m.activeView,
 	}
@@ -570,17 +663,41 @@ func (m *model) buildShortcutsBar(w int) string {
 		return styleShortcutsBox.Width(inner).Render(wrapShortcuts(segs, inner))
 	}
 
+	// Awaiting a destructive-action confirmation.
+	if m.confirmFn != nil {
+		segs = append(segs,
+			shortcut{"y", "confirm", false},
+			shortcut{"any key", "cancel", false},
+		)
+		return styleShortcutsBox.Width(inner).Render(wrapShortcuts(segs, inner))
+	}
+
+	// Naming a playlist.
+	if m.naming {
+		segs = append(segs,
+			shortcut{"type", "name playlist", false},
+			shortcut{"enter", "save", false},
+			shortcut{"esc", "cancel", false},
+		)
+		return styleShortcutsBox.Width(inner).Render(wrapShortcuts(segs, inner))
+	}
+
 	// Playback globals (always available).
 	pp := "play"
 	if m.hasCurrent && !m.playerState.Paused {
 		pp = "pause"
+	}
+	volLabel := fmt.Sprintf("vol %d%%", int(m.playerState.Volume))
+	if m.playerState.Muted {
+		volLabel = "muted"
 	}
 	segs = append(segs,
 		shortcut{"space", pp, false},
 		shortcut{"b", "prev", false},
 		shortcut{"n", "next", false},
 		shortcut{"< >", "seek", false},
-		shortcut{"+/-", fmt.Sprintf("vol %d%%", int(m.playerState.Volume)), false},
+		shortcut{"+/-", volLabel, m.playerState.Muted},
+		shortcut{"m", "mute", m.playerState.Muted},
 		shortcut{"s", "shuffle", m.shuffle},
 	)
 	repLabel := "repeat"
@@ -612,27 +729,37 @@ func (m *model) buildShortcutsBar(w int) string {
 		case viewSearch:
 			segs = append(segs, shortcut{"j/k", "move", false},
 				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
-				shortcut{"f", "fav", false}, shortcut{"a", "album", false},
-				shortcut{"A", "artist", false})
+				shortcut{"e", "queue all", false}, shortcut{"f", "fav", false},
+				shortcut{"a", "album", false}, shortcut{"A", "artist", false})
 		case viewQueue:
 			segs = append(segs, shortcut{"j/k", "move", false},
 				shortcut{"J/K", "reorder", false},
 				shortcut{"enter", "play", false}, shortcut{"d", "remove", false},
-				shortcut{"c", "clear", false}, shortcut{"f", "fav", false},
+				shortcut{".", "now playing", false}, shortcut{"c", "clear", false},
+				shortcut{"S", "save", false}, shortcut{"f", "fav", false},
 				shortcut{"a", "album", false}, shortcut{"A", "artist", false})
-		case viewFavorites, viewHistory:
+		case viewFavorites:
 			segs = append(segs, shortcut{"j/k", "move", false},
 				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
 				shortcut{"f", "fav", false}, shortcut{"a", "album", false},
 				shortcut{"A", "artist", false})
+		case viewHistory:
+			segs = append(segs, shortcut{"j/k", "move", false},
+				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
+				shortcut{"c", "clear history", false}, shortcut{"f", "fav", false},
+				shortcut{"a", "album", false}, shortcut{"A", "artist", false})
 		case viewAlbum:
 			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "play album", false}, shortcut{"p", "play all", false},
-				shortcut{"f", "fav", false})
+				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
+				shortcut{"e", "queue all", false}, shortcut{"f", "fav", false})
 		case viewArtist:
 			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "play / open", false}, shortcut{"p", "play songs", false},
-				shortcut{"f", "fav", false})
+				shortcut{"enter", "queue / open", false}, shortcut{"p", "play now", false},
+				shortcut{"e", "queue all", false}, shortcut{"f", "fav", false})
+		case viewPlaylists:
+			segs = append(segs, shortcut{"j/k", "move", false},
+				shortcut{"enter", "play", false}, shortcut{"e", "queue", false},
+				shortcut{"d", "delete", false})
 		case viewGenres:
 			segs = append(segs, shortcut{"j/k", "move", false},
 				shortcut{"enter", "pick & play", false}, shortcut{"esc", "cancel", false})
@@ -734,6 +861,9 @@ func (m *model) renderNowBar(w int) string {
 	// from the timecode and kept one column off the right border (trailing space)
 	// so they don't get clipped by the shell.
 	var flags []string
+	if s.Muted {
+		flags = append(flags, styleError.Bold(true).Render(iconMute))
+	}
 	if m.shuffle {
 		flags = append(flags, stylePrimary.Bold(true).Render(iconShuffle))
 	}
@@ -798,8 +928,8 @@ func (m *model) renderSearch(w, h int) string {
 	blocks = append(blocks, heading)
 	used += lipgloss.Height(heading)
 
-	// Search bar
-	searchInner := w - 4 // single border + padding
+	// Search bar (lipgloss Width includes padding; border adds 2 more).
+	searchInner := w - 2
 	if searchInner < 1 {
 		searchInner = 1
 	}
@@ -818,13 +948,39 @@ func (m *model) renderSearch(w, h int) string {
 		used++
 	}
 
+	// A pagination footer (loading / more available / end) sits below the list.
+	footer := m.renderSearchFooter(w)
+
 	// Results list fills the remaining height (shortcuts live in the bottom bar).
 	listH := h - used
+	if footer != "" {
+		listH -= lipgloss.Height(footer)
+	}
 	if listH < 1 {
 		listH = 1
 	}
 	blocks = append(blocks, m.renderResultList(w, listH))
+	if footer != "" {
+		blocks = append(blocks, footer)
+	}
 	return lipgloss.JoinVertical(lipgloss.Left, blocks...)
+}
+
+// renderSearchFooter is the line below the search results that signals the
+// pagination state: a page loading, more available, or the end of the results.
+// Empty when there are no results to annotate.
+func (m *model) renderSearchFooter(w int) string {
+	if len(m.searchResults) == 0 {
+		return ""
+	}
+	switch {
+	case m.searchMoreLoading:
+		return styleAccent.Render(truncate("  loading more…", w))
+	case m.searchContinuation != "":
+		return styleDim.Render(truncate(fmt.Sprintf("  ↓ %d loaded — scroll down for more", len(m.searchResults)), w))
+	default:
+		return styleDim.Render(truncate(fmt.Sprintf("  — end of results (%d) —", len(m.searchResults)), w))
+	}
 }
 
 func (m *model) renderResultList(w, h int) string {
@@ -911,11 +1067,11 @@ func (m *model) renderResultRow(n int, t api.Track, selected, focused bool, w in
 // ─── Queue screen ──────────────────────────────────────────────────────────────
 
 func (m *model) renderQueue(w, h int) string {
-	header := styleSecondaryBold.Render(fmt.Sprintf("%s Up next (%d tracks)", iconQueue, len(m.queue)))
+	header := styleSecondaryBold.Render(truncate(fmt.Sprintf("%s Up next (%d tracks)", iconQueue, len(m.queue)), w))
 	if len(m.queue) == 0 {
 		return lipgloss.JoinVertical(lipgloss.Left,
 			header,
-			styleDim.Render("Queue is empty — search and press Enter to add."),
+			styleDim.Render(truncate("Queue is empty — search and press Enter to add.", w)),
 		)
 	}
 
@@ -980,7 +1136,7 @@ func (m *model) renderFavorites(w, h int) string {
 	if len(m.cfg.Favorites) == 0 {
 		return lipgloss.JoinVertical(lipgloss.Left,
 			heading,
-			styleDim.Render("No favorites yet (press f while playing)."),
+			styleDim.Render(truncate("No favorites yet (press f while playing).", w)),
 		)
 	}
 	favs := m.filt(m.cfg.Favorites)
@@ -1071,6 +1227,7 @@ func (m *model) renderHelp(w, h int) string {
 			{"n / b", "next / previous track"},
 			{"< / >", "seek backward / forward"},
 			{"+ / -", "volume up / down"},
+			{"m", "mute / unmute"},
 			{"s", "toggle shuffle"},
 			{"r", "cycle repeat mode"},
 			{"R", "start radio from current track"},
@@ -1079,10 +1236,19 @@ func (m *model) renderHelp(w, h int) string {
 		{"Queue & track", []binding{
 			{"enter", "queue / play selected"},
 			{"p", "play now"},
+			{"e", "queue all (album / artist / search / playlist)"},
 			{"f", "toggle favorite"},
 			{"d / x", "remove from queue"},
 			{"J / K", "move track down / up in queue"},
-			{"c", "clear queue"},
+			{".", "jump to now-playing (queue)"},
+			{"c", "clear queue / clear history (asks to confirm)"},
+		}},
+		{"Playlists", []binding{
+			{"6", "open Playlists"},
+			{"S", "save the queue as a playlist"},
+			{"enter", "play a saved playlist"},
+			{"e", "append a playlist to the queue"},
+			{"d", "delete a playlist"},
 		}},
 		{"Lists & navigation", []binding{
 			{"j / k", "navigate list"},
@@ -1093,7 +1259,7 @@ func (m *model) renderHelp(w, h int) string {
 			{"h / esc", "back to menu / previous"},
 		}},
 		{"Views & discovery", []binding{
-			{"1-5", "jump to view (Home…History)"},
+			{"1-6", "jump to view (Home…Playlists)"},
 			{"2", "global YouTube Music search"},
 			{"/", "filter the current pane (esc clears)"},
 			{"a", "open the track's album (Enter to play it)"},
@@ -1116,7 +1282,7 @@ func (m *model) renderHelp(w, h int) string {
 		}
 	}
 
-	inner := w - 4
+	inner := w - 2
 	if inner < 1 {
 		inner = 1
 	}

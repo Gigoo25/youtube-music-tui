@@ -4,14 +4,41 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/Gigoo25/youtube-music-tui/internal/config"
+	"github.com/Gigoo25/youtube-music-tui/internal/mpris"
+	"github.com/Gigoo25/youtube-music-tui/internal/player"
+	"github.com/Gigoo25/youtube-music-tui/internal/tui"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/rob/ytmusic/internal/config"
-	"github.com/rob/ytmusic/internal/mpris"
-	"github.com/rob/ytmusic/internal/player"
-	"github.com/rob/ytmusic/internal/tui"
 )
 
+// version is set at build time via -ldflags "-X main.version=…" (see the
+// Makefile). Defaults to "dev" for plain `go build`/`go run`.
+var version = "dev"
+
+const usage = `ytmusic — a terminal client for YouTube Music
+
+Usage:
+  ytmusic            launch the player
+  ytmusic --version  print the version and exit
+  ytmusic --help     show this help
+
+Requires the external binaries mpv and yt-dlp on PATH.
+Keybindings are listed in-app under "?".`
+
 func main() {
+	for _, a := range os.Args[1:] {
+		switch a {
+		case "-v", "--version", "version":
+			fmt.Println("ytmusic " + version)
+			return
+		case "-h", "--help", "help":
+			fmt.Println(usage)
+			return
+		default:
+			fmt.Fprintf(os.Stderr, "unknown argument %q\n\n%s\n", a, usage)
+			os.Exit(2)
+		}
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -44,11 +71,17 @@ func run() error {
 		defer srv.Close()
 	}
 
-	if _, err := prog.Run(); err != nil {
+	finalModel, err := prog.Run()
+	if err != nil {
 		return fmt.Errorf("error: %w", err)
 	}
 
 	cfg.Volume = p.State().Volume
+	// Capture the final queue/playback state for next launch. The model owns the
+	// authoritative queue, so pull it via the interface before saving.
+	if sp, ok := finalModel.(interface{ SnapshotSession() }); ok {
+		sp.SnapshotSession()
+	}
 	if err := cfg.Save(); err != nil {
 		fmt.Fprintf(os.Stderr, "save config: %v\n", err)
 	}

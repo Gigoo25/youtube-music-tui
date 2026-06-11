@@ -1,4 +1,4 @@
-module github.com/rob/ytmusic
+module github.com/Gigoo25/youtube-music-tui
 
 go 1.26.3
 
