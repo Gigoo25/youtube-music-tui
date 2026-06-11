@@ -98,9 +98,35 @@ func New(volume float64) (*Player, error) {
 		"--input-ipc-server=" + sockPath,
 		"--really-quiet",
 		"--no-terminal",
+
+		// Memory footprint: mpv's default demuxer cache (150 MiB forward +
+		// 50 MiB back) is sized for video. For audio-only streaming at up to
+		// 320 kbps (≈ 40 KB/s) a 4 MiB forward buffer holds ~100 s ahead,
+		// which is more than sufficient and cuts RSS by ~80–90 MB.
+		"--demuxer-max-bytes=4MiB",
+		"--demuxer-max-back-bytes=2MiB",
+
+		// We resolve stream URLs ourselves via yt-dlp; suppress mpv's own
+		// ytdl hook (a Lua script that would otherwise be loaded and run the
+		// separate yt-dlp path in parallel, wasting a Lua runtime and memory).
+		"--ytdl=no",
+
+		// Don't load user-installed mpv scripts or the on-screen controller —
+		// both irrelevant for a headless audio-only subprocess.
+		"--load-scripts=no",
+		"--osc=no",
 	}
 
 	cmd := exec.Command("mpv", args...)
+	// glibc creates up to 8×ncores 64 MiB malloc arenas for a threaded process
+	// and rarely returns freed pages, which alone accounts for tens of MB of
+	// mpv's RSS. One arena is plenty for audio decoding (allocation contention
+	// is negligible at ~44 kHz), and a low trim threshold hands freed pages
+	// back to the kernel between tracks.
+	cmd.Env = append(os.Environ(),
+		"MALLOC_ARENA_MAX=1",
+		"MALLOC_TRIM_THRESHOLD_=131072",
+	)
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start mpv: %w", err)
 	}
