@@ -11,9 +11,12 @@ build:
 	go build -ldflags='-X main.version=$(VERSION)' -o $(BINARY) $(PKG)
 
 # Stripped, reproducible release build (~34% smaller: omits the symbol table and
-# DWARF debug info; -trimpath removes local filesystem paths).
+# DWARF debug info; -trimpath removes local filesystem paths). CGO_ENABLED=0
+# makes the binary fully static — all deps are pure Go — so it runs on any
+# Linux of the same arch (a cgo build on NixOS embeds a /nix/store interpreter
+# path and won't start elsewhere).
 release:
-	go build -trimpath -ldflags='-s -w -X main.version=$(VERSION)' -o $(BINARY) $(PKG)
+	CGO_ENABLED=0 go build -trimpath -ldflags='-s -w -X main.version=$(VERSION)' -o $(BINARY) $(PKG)
 
 run:
 	go run $(PKG)
