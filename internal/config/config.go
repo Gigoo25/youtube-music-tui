@@ -145,6 +145,49 @@ func (c *Config) DeletePlaylist(name string) {
 	}
 }
 
+// AddToPlaylist appends t to the named playlist, creating the playlist when it
+// doesn't exist yet. Returns false when the track is already in it (no change).
+func (c *Config) AddToPlaylist(name string, t api.Track) bool {
+	for i := range c.Playlists {
+		if c.Playlists[i].Name == name {
+			for _, x := range c.Playlists[i].Tracks {
+				if x.ID == t.ID {
+					return false
+				}
+			}
+			c.Playlists[i].Tracks = append(c.Playlists[i].Tracks, t)
+			return true
+		}
+	}
+	c.Playlists = append(c.Playlists, Playlist{Name: name, Tracks: []api.Track{t}})
+	return true
+}
+
+// RemoveFromPlaylist deletes the track at index idx of the named playlist
+// (no-op when the playlist or index doesn't exist).
+func (c *Config) RemoveFromPlaylist(name string, idx int) {
+	for i := range c.Playlists {
+		if c.Playlists[i].Name == name {
+			ts := c.Playlists[i].Tracks
+			if idx < 0 || idx >= len(ts) {
+				return
+			}
+			c.Playlists[i].Tracks = append(ts[:idx], ts[idx+1:]...)
+			return
+		}
+	}
+}
+
+// PlaylistByName returns the named playlist, or nil when absent.
+func (c *Config) PlaylistByName(name string) *Playlist {
+	for i := range c.Playlists {
+		if c.Playlists[i].Name == name {
+			return &c.Playlists[i]
+		}
+	}
+	return nil
+}
+
 // AddHistory records a play at the front of the history list (newest first),
 // capped at maxHistory. Matches the original: each play is its own entry.
 func (c *Config) AddHistory(t api.Track) {

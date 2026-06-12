@@ -27,6 +27,8 @@ const (
 	viewGenres
 	viewHelp
 	viewPlaylists
+	viewPlaylistDetail // tracks of one saved playlist (contextual, from Playlists)
+	viewPlaylistPick   // "add track to playlist" picker (contextual, from any track list)
 )
 
 type repeatMode int
@@ -119,7 +121,16 @@ type model struct {
 	// playlists (saved locally; a Quick Links view)
 	playlistCursor int
 
-	// naming overlay: capturing a name for "save queue as playlist".
+	// playlist detail / add-to-playlist picker state.
+	openPlaylist   string    // name of the playlist shown in viewPlaylistDetail
+	plDetailCursor int       // cursor within that playlist's tracks
+	pickTrack      api.Track // track pending "add to playlist"
+	pickCursor     int       // cursor in the picker (len(playlists) = "new playlist…")
+	pickPrev       view      // view to return to when the picker closes
+
+	// naming overlay: capturing a name for "save queue as playlist" or, when
+	// nameTrack is set, "new playlist for this track".
+	nameTrack     *api.Track
 	naming        bool
 	playlistInput textinput.Model
 
@@ -159,6 +170,13 @@ type model struct {
 	playerState player.State
 	current     api.Track // the track currently loaded (value copy, not a slice ptr)
 	hasCurrent  bool
+
+	// playback robustness (see handlePlaybackFailure / watchdogCheck)
+	pendingSeek float64   // resume position to apply once a reloaded track is playing
+	retryID     string    // track id the retry budget applies to
+	retries     int       // failed attempts for retryID since it last played cleanly
+	stallPos    float64   // last observed position (stall watchdog)
+	stallAt     time.Time // when stallPos last advanced
 
 	// transient status line (auto-clears after statusTTL)
 	status    string
@@ -372,17 +390,39 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
-		m.playerState = m.player.State()
 		var cmds []tea.Cmd
+		// Handle an automatic mpv respawn before refreshing the snapshot: the
+		// stale snapshot still holds the pre-crash position needed to resume.
+		if m.player.Restarted() {
+			m.resumeAfterRestart()
+		}
+		m.playerState = m.player.State()
 		if m.player.TrackEnded() {
 			if c := m.nextTrack(); c != nil {
 				cmds = append(cmds, c)
 			}
 		}
-		// Surface stream-load/playback failures (otherwise a failed yt-dlp resolve
-		// leaves the UI silently stuck looking like it's playing).
+		// React to stream-load/playback failures: retry once with a fresh URL,
+		// then skip — playback must never silently stop mid-queue.
 		if e := m.player.LoadError(); e != "" {
-			m.setError(e)
+			if c := m.handlePlaybackFailure(e); c != nil {
+				cmds = append(cmds, c)
+			}
+		}
+		// A track that has played cleanly for a while earns its retry budget
+		// back (so one hiccup an hour ago doesn't turn the next into a skip).
+		if m.retries > 0 && m.hasCurrent && m.current.ID == m.retryID && m.playerState.Position > 30 {
+			m.retries = 0
+		}
+		if c := m.watchdogCheck(); c != nil {
+			cmds = append(cmds, c)
+		}
+		// Apply a deferred resume-seek once the reloaded track is actually up.
+		if m.pendingSeek > 0 && m.hasCurrent && !m.playerState.Loading && m.playerState.Duration > 0 {
+			if m.pendingSeek < m.playerState.Duration-2 {
+				m.player.SeekAbs(m.pendingSeek)
+			}
+			m.pendingSeek = 0
 		}
 		// Auto-clear a transient status message once it has been shown long enough.
 		if m.status != "" && time.Since(m.statusAt) >= statusTTL {
@@ -445,9 +485,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		start := len(m.queue)
-		m.queue = append(m.queue, tracks...)
+		added := m.appendNew(tracks)
+		if added == 0 {
+			m.setError("auto-continue: nothing new found")
+			return m, nil
+		}
 		m.playAt(start)
-		m.setStatus(fmt.Sprintf("auto-continue: added %d tracks", len(tracks)))
+		m.setStatus(fmt.Sprintf("auto-continue: added %d tracks", added))
 		return m, m.nextTick()
 
 	case randomDoneMsg:
@@ -468,11 +512,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setError("radio failed: " + msg.err.Error())
 		} else if len(msg.tracks) == 0 {
 			m.setError("no related tracks found")
+		} else if added := m.appendNew(msg.tracks); added > 0 {
+			m.setStatus(fmt.Sprintf("radio: added %d tracks", added))
 		} else {
-			for _, t := range msg.tracks {
-				m.queue = append(m.queue, t)
-			}
-			m.setStatus(fmt.Sprintf("radio: added %d tracks", len(msg.tracks)))
+			m.setStatus("radio: all already in queue")
 		}
 		return m, nil
 
@@ -769,7 +812,18 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.naming = false
 			m.playlistInput.Blur()
 			if name == "" {
+				m.nameTrack = nil
 				m.setError("playlist name cannot be empty")
+				return m, nil
+			}
+			if t := m.nameTrack; t != nil {
+				m.nameTrack = nil
+				if m.cfg.AddToPlaylist(name, *t) {
+					m.setStatus(fmt.Sprintf("added %q to playlist %q", t.Title, name))
+				} else {
+					m.setStatus(fmt.Sprintf("%q is already in playlist %q", t.Title, name))
+				}
+				m.markConfigDirty()
 				return m, nil
 			}
 			m.cfg.SavePlaylist(name, m.queue)
@@ -778,6 +832,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "esc":
 			m.naming = false
+			m.nameTrack = nil
 			m.playlistInput.Blur()
 			m.playlistInput.SetValue("")
 			return m, nil
@@ -976,6 +1031,16 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.playlistInput.SetValue("")
 		m.playlistInput.Focus()
 		return m, textinput.Blink
+	case "P":
+		// Add the selected song to a playlist (picker; works in any track list).
+		if t, ok := m.selectedTrack(); ok {
+			m.openPlaylistPicker(t)
+		} else if m.hasCurrent {
+			m.openPlaylistPicker(m.current)
+		} else {
+			m.setError("no song selected")
+		}
+		return m, nil
 	case "z":
 		m.openGenres()
 		return m, nil
@@ -1031,6 +1096,21 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.focus = focusPanel
 			return m, nil
 		}
+		// Playlist detail returns to the playlist list; the add-to-playlist
+		// picker returns to whatever track list it was opened from.
+		if m.activeView == viewPlaylistDetail {
+			m.clearFilter()
+			m.activeView = viewPlaylists
+			m.navCursor = navIndexOf(viewPlaylists)
+			m.focus = focusPanel
+			return m, nil
+		}
+		if m.activeView == viewPlaylistPick {
+			m.activeView = m.pickPrev
+			m.navCursor = navIndexOf(m.activeView)
+			m.focus = focusPanel
+			return m, nil
+		}
 		// In search results, esc clears results first; a second esc returns focus.
 		if m.activeView == viewSearch && len(m.searchResults) > 0 {
 			m.searchResults = nil
@@ -1063,10 +1143,130 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleGenresKey(msg)
 	case viewPlaylists:
 		return m.handlePlaylistsKey(msg)
+	case viewPlaylistDetail:
+		return m.handlePlaylistDetailKey(msg)
+	case viewPlaylistPick:
+		return m.handlePlaylistPickKey(msg)
 	case viewHelp:
 		return m, nil
 	}
 	return m, nil
+}
+
+// selectedTrack returns the track under the cursor in the current view's list
+// (mirroring each view's own filter/cursor logic), for actions that work on
+// "the selected song" from anywhere — e.g. add-to-playlist.
+func (m *model) selectedTrack() (api.Track, bool) {
+	switch m.activeView {
+	case viewHome:
+		return m.homeTrackAt(m.homeCursor)
+	case viewSearch:
+		if m.searchCursor < len(m.searchResults) {
+			return m.searchResults[m.searchCursor], true
+		}
+	case viewQueue:
+		vis := m.trackVisibleIndices(m.queue)
+		if m.queueCursor < len(vis) {
+			return m.queue[vis[m.queueCursor]], true
+		}
+	case viewFavorites:
+		favs := m.filt(m.cfg.Favorites)
+		if m.favCursor < len(favs) {
+			return favs[m.favCursor], true
+		}
+	case viewHistory:
+		hist := m.filtHistory(m.cfg.History)
+		if m.historyCursor < len(hist) {
+			return hist[m.historyCursor].Track, true
+		}
+	case viewAlbum:
+		vis := m.trackVisibleIndices(m.albumTracks)
+		if m.albumCursor < len(vis) {
+			return m.albumTrackAt(vis[m.albumCursor]), true
+		}
+	case viewArtist:
+		songVis := m.trackVisibleIndices(m.artistSongs)
+		if m.artistCursor < len(songVis) {
+			return m.artistSongAt(songVis[m.artistCursor]), true
+		}
+	case viewPlaylistDetail:
+		if pl := m.cfg.PlaylistByName(m.openPlaylist); pl != nil && m.plDetailCursor < len(pl.Tracks) {
+			return pl.Tracks[m.plDetailCursor], true
+		}
+	}
+	return api.Track{}, false
+}
+
+// openPlaylistPicker starts the add-to-playlist flow for t.
+func (m *model) openPlaylistPicker(t api.Track) {
+	m.pickTrack = t
+	m.pickCursor = 0
+	m.pickPrev = m.activeView
+	m.activeView = viewPlaylistPick
+	m.focus = focusPanel
+}
+
+func (m *model) handlePlaylistDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	pl := m.cfg.PlaylistByName(m.openPlaylist)
+	if pl == nil {
+		m.activeView = viewPlaylists
+		return m, nil
+	}
+	if nc, ok := m.vimMove(msg.String(), m.plDetailCursor, len(pl.Tracks)); ok {
+		m.plDetailCursor = nc
+		return m, nil
+	}
+	if m.plDetailCursor >= len(pl.Tracks) {
+		return m, nil
+	}
+	switch msg.String() {
+	case "enter":
+		m.enqueue(pl.Tracks[m.plDetailCursor])
+	case "p":
+		m.playNow(pl.Tracks[m.plDetailCursor])
+	case "e":
+		m.enqueueAll(pl.Tracks)
+	case "d", "x":
+		removed := pl.Tracks[m.plDetailCursor].Title
+		m.cfg.RemoveFromPlaylist(m.openPlaylist, m.plDetailCursor)
+		m.markConfigDirty()
+		if pl := m.cfg.PlaylistByName(m.openPlaylist); pl != nil && m.plDetailCursor >= len(pl.Tracks) && m.plDetailCursor > 0 {
+			m.plDetailCursor--
+		}
+		m.setStatus("removed from playlist: " + removed)
+	}
+	return m, nil
+}
+
+func (m *model) handlePlaylistPickKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	pls := m.cfg.Playlists
+	// One extra row at the end: "new playlist…".
+	if nc, ok := m.vimMove(msg.String(), m.pickCursor, len(pls)+1); ok {
+		m.pickCursor = nc
+		return m, nil
+	}
+	if msg.String() != "enter" {
+		return m, nil
+	}
+	m.activeView = m.pickPrev
+	m.navCursor = navIndexOf(m.activeView)
+	if m.pickCursor < len(pls) {
+		name := pls[m.pickCursor].Name
+		if m.cfg.AddToPlaylist(name, m.pickTrack) {
+			m.setStatus(fmt.Sprintf("added %q to playlist %q", m.pickTrack.Title, name))
+		} else {
+			m.setStatus(fmt.Sprintf("%q is already in playlist %q", m.pickTrack.Title, name))
+		}
+		m.markConfigDirty()
+		return m, nil
+	}
+	// "new playlist…": capture a name, then add the track on confirm.
+	t := m.pickTrack
+	m.nameTrack = &t
+	m.naming = true
+	m.playlistInput.SetValue("")
+	m.playlistInput.Focus()
+	return m, textinput.Blink
 }
 
 // goToAlbum opens the album the selected/playing track belongs to and loads it.
@@ -1093,12 +1293,20 @@ func (m *model) goToAlbum() tea.Cmd {
 	m.albumTitle = name
 	// The album panel shows its own "Loading…" — no transient status needed.
 
-	album, artist := t.Album, t.Artist
+	album, artist, albumID := t.Album, t.Artist, t.AlbumID
 	if album == "" {
 		album = t.Title
 	}
 	client := m.api
 	return func() tea.Msg {
+		// A track that carries the album's browse id skips search entirely —
+		// search can't find some albums by name (deluxe editions especially).
+		if albumID != "" {
+			tracks, title, err := api.AlbumByID(client, albumID)
+			if err == nil && len(tracks) > 0 {
+				return albumDoneMsg{tracks: tracks, title: title, err: nil}
+			}
+		}
 		tracks, title, err := api.AlbumByQuery(client, album, artist)
 		return albumDoneMsg{tracks: tracks, title: title, err: err}
 	}
@@ -1173,10 +1381,20 @@ func (m *model) handleAlbumKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.enqueue(m.albumTrackAt(vis[m.albumCursor]))
 		}
 	case "p":
-		// Play the selected track now.
-		if m.albumCursor < len(vis) {
-			m.playNow(m.albumTrackAt(vis[m.albumCursor]))
+		// Play the whole album: replace the queue with it and start at the
+		// selected track (mirrors p on a playlist).
+		tracks := m.withAlbum(m.albumTracks)
+		if len(tracks) == 0 {
+			return m, nil
 		}
+		start := 0
+		if m.albumCursor < len(vis) {
+			start = vis[m.albumCursor]
+		}
+		m.queue = append([]api.Track(nil), tracks...)
+		m.queueCursor = start
+		m.playAt(start)
+		m.setStatus(fmt.Sprintf("queue replaced with album %q", m.albumTitle))
 	case "e":
 		// Append the whole album to the queue without disturbing playback.
 		m.enqueueAll(m.withAlbum(m.albumTracks))
@@ -1214,14 +1432,36 @@ func (m *model) enqueueAll(ts []api.Track) {
 		m.setError("nothing to queue")
 		return
 	}
-	start := len(m.queue)
-	m.queue = append(m.queue, ts...)
+	added := m.appendNew(ts)
+	if added == 0 {
+		m.setStatus("all already in queue")
+		return
+	}
 	if !m.hasCurrent {
-		m.playAt(start)
+		m.playAt(len(m.queue) - added)
 	} else {
 		m.prefetchNext()
 	}
-	m.setStatus(fmt.Sprintf("queued %d tracks", len(ts)))
+	m.setStatus(fmt.Sprintf("queued %d tracks", added))
+}
+
+// appendNew appends only the tracks not already present in the queue (also
+// deduping within the batch) and returns how many were added.
+func (m *model) appendNew(ts []api.Track) int {
+	seen := make(map[string]bool, len(m.queue))
+	for i := range m.queue {
+		seen[m.queue[i].ID] = true
+	}
+	added := 0
+	for _, t := range ts {
+		if t.ID == "" || seen[t.ID] {
+			continue
+		}
+		seen[t.ID] = true
+		m.queue = append(m.queue, t)
+		added++
+	}
+	return added
 }
 
 // ── Home view ──
@@ -1536,7 +1776,13 @@ func (m *model) handlePlaylistsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	switch msg.String() {
-	case "enter", "p":
+	case "enter", "l", "right":
+		// Open the playlist's track list (play/queue happen from there or via
+		// p/e). l/right mirror the sidebar's "enter the thing" navigation.
+		m.openPlaylist = pls[m.playlistCursor].Name
+		m.plDetailCursor = 0
+		m.activeView = viewPlaylistDetail
+	case "p":
 		// Replace the queue with the playlist and start playing.
 		m.loadPlaylist(pls[m.playlistCursor], true)
 	case "e":
@@ -1563,7 +1809,7 @@ func (m *model) loadPlaylist(pl config.Playlist, replace bool) {
 		m.queue = append([]api.Track(nil), pl.Tracks...)
 		m.queueCursor = 0
 		m.playAt(0)
-		m.setStatus("playing playlist: " + pl.Name)
+		m.setStatus(fmt.Sprintf("queue replaced with playlist %q (%d tracks)", pl.Name, len(pl.Tracks)))
 		return
 	}
 	m.enqueueAll(pl.Tracks)
@@ -1814,7 +2060,27 @@ func (m *model) contextTrack() *api.Track {
 
 // ── Action methods ──
 
+// queueIndexOf returns the queue index of the track with the given id, or -1.
+func (m *model) queueIndexOf(id string) int {
+	for i := range m.queue {
+		if m.queue[i].ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
 func (m *model) enqueue(t api.Track) {
+	// Never add the same track twice: double key-presses and radio batches
+	// that already contain it otherwise litter the queue with duplicates.
+	if idx := m.queueIndexOf(t.ID); idx >= 0 {
+		if !m.hasCurrent {
+			m.playAt(idx)
+			return
+		}
+		m.setStatus("already in queue: " + t.Title)
+		return
+	}
 	m.queue = append(m.queue, t)
 	m.setStatus("queued: " + t.Title)
 	if !m.hasCurrent {
@@ -1828,6 +2094,11 @@ func (m *model) enqueue(t api.Track) {
 }
 
 func (m *model) playNow(t api.Track) {
+	// Already queued: jump to the existing entry instead of inserting a twin.
+	if idx := m.queueIndexOf(t.ID); idx >= 0 {
+		m.playAt(idx)
+		return
+	}
 	m.queue = append([]api.Track{t}, m.queue...)
 	if m.queueCursor > 0 {
 		m.queueCursor++
@@ -1847,6 +2118,9 @@ func (m *model) playAt(idx int) {
 	// show the previous track's values before the next tick refreshes them.
 	m.playerState.Position = 0
 	m.playerState.Duration = 0
+	// A stale resume target must not carry over to a different track (the
+	// retry/restart paths re-set it right after calling playAt when needed).
+	m.pendingSeek = 0
 	// Set MPRIS title so shells (noctalia/playerctl) show the song, not the URL.
 	title := t.Title
 	if t.Artist != "" {
@@ -1944,6 +2218,83 @@ func (m *model) continueRadio() tea.Cmd {
 		tracks, err := client.Related(seed)
 		return autoContinueMsg{tracks: tracks, err: err}
 	}
+}
+
+// maxTrackRetries is how many times a failing track is reloaded (with a freshly
+// resolved stream URL) before being skipped so the queue keeps moving.
+const maxTrackRetries = 1
+
+// handlePlaybackFailure reacts to a load/stream failure: retry the current
+// track once with a fresh URL, then give up and advance the queue. Worst case
+// is a skipped track — never silently stopped playback.
+func (m *model) handlePlaybackFailure(errMsg string) tea.Cmd {
+	if !m.hasCurrent || m.queuePos < 0 || m.queuePos >= len(m.queue) {
+		m.setError(errMsg)
+		return nil
+	}
+	if !m.player.Alive() {
+		m.setError(errMsg + " — audio engine down, restart the app")
+		return nil
+	}
+	if m.retryID != m.current.ID {
+		m.retryID = m.current.ID
+		m.retries = 0
+	}
+	if m.retries < maxTrackRetries {
+		m.retries++
+		pos := m.playerState.Position
+		m.setStatus("stream failed — retrying…")
+		m.playAt(m.queuePos)
+		if pos > 5 {
+			m.pendingSeek = pos // mid-track failure: resume there, don't restart
+		}
+		return nil
+	}
+	m.setError(errMsg + " — skipping track")
+	return m.nextTrack()
+}
+
+// resumeAfterRestart reloads the current track after the player auto-respawned
+// a crashed mpv, seeking back to (roughly) where playback died. Must run while
+// m.playerState still holds the pre-crash snapshot.
+func (m *model) resumeAfterRestart() {
+	if !m.hasCurrent || m.queuePos < 0 || m.queuePos >= len(m.queue) {
+		m.setStatus("audio engine restarted")
+		return
+	}
+	pos := m.playerState.Position
+	m.setStatus("audio engine restarted — resuming")
+	m.playAt(m.queuePos)
+	if pos > 1 {
+		m.pendingSeek = pos
+	}
+}
+
+// stallTimeout is how long the position may stay frozen while nominally
+// playing before the watchdog treats the track as stalled. Generous enough to
+// ride out buffering after a network blip (mpv's own reconnect window is 15s).
+const stallTimeout = 20 * time.Second
+
+// watchdogCheck catches the silent failure mode: mpv neither playing nor
+// erroring (e.g. stuck paused-for-cache forever after the network dropped).
+// A frozen position while unpaused is treated like a stream failure.
+func (m *model) watchdogCheck() tea.Cmd {
+	st := m.playerState
+	playing := m.hasCurrent && !st.Paused && !st.Idle && !st.Loading && st.Duration > 0
+	if !playing {
+		m.stallAt = time.Time{}
+		return nil
+	}
+	if st.Position != m.stallPos || m.stallAt.IsZero() {
+		m.stallPos = st.Position
+		m.stallAt = time.Now()
+		return nil
+	}
+	if time.Since(m.stallAt) >= stallTimeout {
+		m.stallAt = time.Now() // re-arm; the failure handler takes over
+		return m.handlePlaybackFailure("playback stalled")
+	}
+	return nil
 }
 
 func (m *model) prevTrack() {

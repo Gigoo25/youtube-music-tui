@@ -597,3 +597,86 @@ func TestViewsRenderWithoutPanic(t *testing.T) {
 		t.Error("sidebar missing from view")
 	}
 }
+
+// ── Playlist detail / add-to-playlist flows ─────────────────────────────────────
+
+func TestPlaylistDetailViewAndRemove(t *testing.T) {
+	m := newTestModel()
+	m.cfg.Playlists = []config.Playlist{{Name: "road trip", Tracks: []api.Track{
+		{ID: "id1", Title: "One", Artist: "A"},
+		{ID: "id2", Title: "Two", Artist: "B"},
+	}}}
+	m.activeView = viewPlaylists
+	m.focus = focusPanel
+
+	press(m, "enter")
+	if m.activeView != viewPlaylistDetail || m.openPlaylist != "road trip" {
+		t.Fatalf("enter did not open playlist detail: view=%v open=%q", m.activeView, m.openPlaylist)
+	}
+	if !strings.Contains(m.View(), "road trip") {
+		t.Fatal("detail header missing")
+	}
+
+	press(m, "j") // select Two
+	press(m, "d")
+	pl := m.cfg.PlaylistByName("road trip")
+	if len(pl.Tracks) != 1 || pl.Tracks[0].ID != "id1" {
+		t.Fatalf("remove failed: %+v", pl.Tracks)
+	}
+
+	press(m, "esc")
+	if m.activeView != viewPlaylists {
+		t.Fatalf("esc did not return to playlists: %v", m.activeView)
+	}
+}
+
+func TestAddToPlaylistPicker(t *testing.T) {
+	m := newTestModel()
+	m.cfg.Playlists = []config.Playlist{{Name: "mix", Tracks: []api.Track{{ID: "x", Title: "X"}}}}
+	m.searchResults = []api.Track{{ID: "id9", Title: "Nine", Artist: "N"}}
+	m.activeView = viewSearch
+	m.focus = focusPanel
+
+	press(m, "P")
+	if m.activeView != viewPlaylistPick || m.pickTrack.ID != "id9" {
+		t.Fatalf("P did not open picker: view=%v track=%+v", m.activeView, m.pickTrack)
+	}
+
+	press(m, "enter") // first row = "mix"
+	if m.activeView != viewSearch {
+		t.Fatalf("picker did not return to origin view: %v", m.activeView)
+	}
+	pl := m.cfg.PlaylistByName("mix")
+	if len(pl.Tracks) != 2 || pl.Tracks[1].ID != "id9" {
+		t.Fatalf("track not added: %+v", pl.Tracks)
+	}
+
+	// Same again: dedupe, no double add.
+	press(m, "P")
+	press(m, "enter")
+	if pl := m.cfg.PlaylistByName("mix"); len(pl.Tracks) != 2 {
+		t.Fatalf("duplicate added: %+v", pl.Tracks)
+	}
+}
+
+func TestAddToNewPlaylistViaNaming(t *testing.T) {
+	m := newTestModel()
+	m.searchResults = []api.Track{{ID: "id5", Title: "Five"}}
+	m.activeView = viewSearch
+	m.focus = focusPanel
+
+	press(m, "P")
+	press(m, "j") // move to "new playlist…" (no playlists exist: row 0 is it already; j clamps)
+	press(m, "enter")
+	if !m.naming || m.nameTrack == nil {
+		t.Fatalf("new-playlist row did not open naming: naming=%v", m.naming)
+	}
+	for _, r := range "fresh" {
+		press(m, string(r))
+	}
+	press(m, "enter")
+	pl := m.cfg.PlaylistByName("fresh")
+	if pl == nil || len(pl.Tracks) != 1 || pl.Tracks[0].ID != "id5" {
+		t.Fatalf("naming flow did not create playlist: %+v", pl)
+	}
+}

@@ -174,7 +174,7 @@ func viewIcon(v view) string {
 		return iconAlbum
 	case viewArtist:
 		return iconArtist
-	case viewPlaylists:
+	case viewPlaylists, viewPlaylistDetail, viewPlaylistPick:
 		return iconPlaylist
 	case viewHelp:
 		return iconHelp
@@ -293,10 +293,91 @@ func (m *model) renderPanelBody(w, h int) string {
 		return m.renderGenres(w, h)
 	case viewPlaylists:
 		return m.renderPlaylists(w, h)
+	case viewPlaylistDetail:
+		return m.renderPlaylistDetail(w, h)
+	case viewPlaylistPick:
+		return m.renderPlaylistPick(w, h)
 	case viewHelp:
 		return m.renderHelp(w, h)
 	}
 	return ""
+}
+
+// renderPlaylistDetail lists the tracks of one saved playlist (standard track
+// rows). Playing/queueing happens via the queue: p replaces the queue with the
+// playlist, e appends it — the header spells that out.
+func (m *model) renderPlaylistDetail(w, h int) string {
+	pl := m.cfg.PlaylistByName(m.openPlaylist)
+	if pl == nil {
+		return styleDim.Render("Playlist no longer exists.")
+	}
+	heading := styleSecondaryBold.Render(truncate(
+		fmt.Sprintf("%s Playlist: %s (%d tracks)", iconPlaylist, pl.Name, len(pl.Tracks)), w))
+	if len(pl.Tracks) == 0 {
+		return lipgloss.JoinVertical(lipgloss.Left, heading,
+			styleDim.Render(truncate("Playlist is empty — press P on any song to add it.", w)))
+	}
+
+	listH := h - lipgloss.Height(heading)
+	if listH < 1 {
+		listH = 1
+	}
+	focused := m.focus == focusPanel
+	start, end := windowBounds(m.plDetailCursor, len(pl.Tracks), listH)
+	var rows []string
+	for i := start; i < end; i++ {
+		rows = append(rows, m.renderResultRow(i+1, pl.Tracks[i], i == m.plDetailCursor, focused, w, false))
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, heading, strings.Join(rows, "\n"))
+}
+
+// renderPlaylistPick renders the add-to-playlist picker: every saved playlist
+// plus a trailing "new playlist…" row.
+func (m *model) renderPlaylistPick(w, h int) string {
+	heading := styleSecondaryBold.Render(truncate(
+		fmt.Sprintf("%s Add to playlist: %s", iconPlaylist, m.pickTrack.Title), w))
+	pls := m.cfg.Playlists
+
+	listH := h - lipgloss.Height(heading)
+	if listH < 1 {
+		listH = 1
+	}
+	focused := m.focus == focusPanel
+	start, end := windowBounds(m.pickCursor, len(pls)+1, listH)
+	var rows []string
+	for i := start; i < end; i++ {
+		label := "+ New playlist…"
+		right := ""
+		if i < len(pls) {
+			label = pls[i].Name
+			right = fmt.Sprintf("%d tracks", len(pls[i].Tracks))
+		}
+		selected := i == m.pickCursor
+
+		if selected && focused {
+			plain := "▸ " + label
+			gap := w - lipgloss.Width(plain) - lipgloss.Width(right)
+			if gap < 1 {
+				plain = truncate(plain, w-lipgloss.Width(right)-1)
+				gap = max(1, w-lipgloss.Width(plain)-lipgloss.Width(right))
+			}
+			rows = append(rows, styleSelected.Width(w).Render(plain+strings.Repeat(" ", gap)+right))
+			continue
+		}
+		marker := "  "
+		if selected {
+			marker = stylePrimary.Render("▸ ")
+		}
+		left := marker + styleText.Render(label)
+		rightStr := styleDim.Render(right)
+		gap := w - lipgloss.Width(left) - lipgloss.Width(rightStr)
+		if gap < 1 {
+			left = truncate2(left, w-lipgloss.Width(rightStr)-1)
+			gap = max(1, w-lipgloss.Width(left)-lipgloss.Width(rightStr))
+		}
+		rows = append(rows, left+strings.Repeat(" ", gap)+rightStr)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, heading, strings.Join(rows, "\n"))
 }
 
 // renderPlaylists renders the saved-playlists list: name + track count.
@@ -750,7 +831,8 @@ func (m *model) buildShortcutsBar(w int) string {
 				shortcut{"a", "album", false}, shortcut{"A", "artist", false})
 		case viewAlbum:
 			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
+				shortcut{"enter", "queue", false},
+				shortcut{"p", "play album (replaces queue)", false},
 				shortcut{"e", "queue all", false}, shortcut{"f", "fav", false})
 		case viewArtist:
 			segs = append(segs, shortcut{"j/k", "move", false},
@@ -758,8 +840,18 @@ func (m *model) buildShortcutsBar(w int) string {
 				shortcut{"e", "queue all", false}, shortcut{"f", "fav", false})
 		case viewPlaylists:
 			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "play", false}, shortcut{"e", "queue", false},
+				shortcut{"enter", "view tracks", false},
+				shortcut{"p", "play (replaces queue)", false},
+				shortcut{"e", "add to queue", false},
 				shortcut{"d", "delete", false})
+		case viewPlaylistDetail:
+			segs = append(segs, shortcut{"j/k", "move", false},
+				shortcut{"enter", "queue song", false}, shortcut{"p", "play now", false},
+				shortcut{"e", "queue all", false}, shortcut{"d", "remove", false},
+				shortcut{"esc", "back", false})
+		case viewPlaylistPick:
+			segs = append(segs, shortcut{"j/k", "move", false},
+				shortcut{"enter", "add", false}, shortcut{"esc", "cancel", false})
 		case viewGenres:
 			segs = append(segs, shortcut{"j/k", "move", false},
 				shortcut{"enter", "pick & play", false}, shortcut{"esc", "cancel", false})
@@ -1002,6 +1094,14 @@ func (m *model) renderResultList(w, h int) string {
 // full-width inverse highlight only when its pane is focused, so the cursor is
 // unambiguous; an unfocused selection shows a subtle marker instead.
 func (m *model) renderResultRow(n int, t api.Track, selected, focused bool, w int, forceHeart bool) string {
+	return m.renderTrackRow(n, t, selected, focused, w, forceHeart, "", styleDim)
+}
+
+// renderTrackRow is the one standard track row: cursor marker, optional
+// per-view prefix (queue: now-playing glyph; history: played-at timestamp),
+// number, heart, title • artist • album, right-aligned duration. Every screen
+// that lists songs goes through here so rows look identical app-wide.
+func (m *model) renderTrackRow(n int, t api.Track, selected, focused bool, w int, forceHeart bool, prefix string, prefixStyle lipgloss.Style) string {
 	marker := "  "
 	if selected {
 		if focused {
@@ -1028,7 +1128,7 @@ func (m *model) renderResultRow(n int, t api.Track, selected, focused bool, w in
 
 	// Focused + selected: whole-row inverse highlight (single color).
 	if selected && focused {
-		plain := marker + numStr + heartGlyph + t.Title + artistPart
+		plain := marker + prefix + numStr + heartGlyph + t.Title + artistPart
 		gap := w - lipgloss.Width(plain) - lipgloss.Width(dur)
 		if gap < 1 {
 			plain = truncate(plain, w-lipgloss.Width(dur)-1)
@@ -1049,7 +1149,11 @@ func (m *model) renderResultRow(n int, t api.Track, selected, focused bool, w in
 	if hasHeart {
 		heart = styleHeart.Render(iconHeart) + " "
 	}
-	left := markerStr + styleDim.Render(numStr) + heart + styleText.Render(t.Title) + styleDim.Render(artistPart)
+	prefixStr := ""
+	if prefix != "" {
+		prefixStr = prefixStyle.Render(prefix)
+	}
+	left := markerStr + prefixStr + styleDim.Render(numStr) + heart + styleText.Render(t.Title) + styleDim.Render(artistPart)
 	durStr := styleDim.Render(dur)
 
 	gap := w - lipgloss.Width(left) - lipgloss.Width(durStr)
@@ -1098,32 +1202,7 @@ func (m *model) renderQueue(w, h int) string {
 		if m.hasCurrent && orig == m.queuePos {
 			nowMark = iconPlay + " "
 		}
-		artistPart := ""
-		if t.Artist != "" {
-			artistPart = " • " + t.Artist
-		}
-
-		if selected && focused {
-			plain := nowMark + fmt.Sprintf("%d. ", i+1) + t.Title + artistPart
-			rows = append(rows, styleSelected.Width(w).Render(truncate(plain, w)))
-			continue
-		}
-
-		nowStr := styleDim.Render(nowMark)
-		if m.hasCurrent && orig == m.queuePos {
-			nowStr = stylePrimary.Render(nowMark)
-		}
-		heart := ""
-		if m.cfg.IsFavorite(t.ID) {
-			heart = styleHeart.Render(iconHeart) + " "
-		}
-		marker := "  "
-		if selected {
-			marker = stylePrimary.Render("▸ ")
-		}
-		row := marker + nowStr + styleDim.Render(fmt.Sprintf("%d. ", i+1)) + heart +
-			styleText.Render(t.Title) + styleDim.Render(artistPart)
-		rows = append(rows, truncate2(row, w))
+		rows = append(rows, m.renderTrackRow(i+1, t, selected, focused, w, false, nowMark, stylePrimary))
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, strings.Join(rows, "\n"))
@@ -1183,29 +1262,9 @@ func (m *model) renderHistory(w, h int) string {
 	for i := start; i < end; i++ {
 		e := hist[i]
 		selected := i == m.historyCursor
+		// Standard track row, with the played-at timestamp as history's prefix.
 		tsText := e.PlayedAt.Format(tsLayout) + "  "
-		artistPart := ""
-		if e.Track.Artist != "" {
-			artistPart = " • " + e.Track.Artist
-		}
-
-		if selected && focused {
-			plain := "▸ " + tsText + e.Track.Title + artistPart
-			rows = append(rows, styleSelected.Width(w).Render(truncate(plain, w)))
-			continue
-		}
-
-		marker := "  "
-		if selected {
-			marker = stylePrimary.Render("▸ ")
-		}
-		heart := ""
-		if m.cfg.IsFavorite(e.Track.ID) {
-			heart = styleHeart.Render(iconHeart) + " "
-		}
-		body := marker + styleSecondary.Render(tsText) + heart +
-			styleText.Render(e.Track.Title) + styleDim.Render(artistPart)
-		rows = append(rows, truncate2(body, w))
+		rows = append(rows, m.renderTrackRow(i+1, e.Track, selected, focused, w, false, tsText, styleSecondary))
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left,
@@ -1235,7 +1294,7 @@ func (m *model) renderHelp(w, h int) string {
 		}},
 		{"Queue & track", []binding{
 			{"enter", "queue / play selected"},
-			{"p", "play now"},
+			{"p", "play now (album view: play album, replaces queue)"},
 			{"e", "queue all (album / artist / search / playlist)"},
 			{"f", "toggle favorite"},
 			{"d / x", "remove from queue"},
@@ -1246,9 +1305,11 @@ func (m *model) renderHelp(w, h int) string {
 		{"Playlists", []binding{
 			{"6", "open Playlists"},
 			{"S", "save the queue as a playlist"},
-			{"enter", "play a saved playlist"},
+			{"P", "add the selected song to a playlist"},
+			{"enter", "view a playlist's tracks"},
+			{"p", "play a playlist (replaces the queue)"},
 			{"e", "append a playlist to the queue"},
-			{"d", "delete a playlist"},
+			{"d", "delete a playlist / remove a song (in playlist view)"},
 		}},
 		{"Lists & navigation", []binding{
 			{"j / k", "navigate list"},
