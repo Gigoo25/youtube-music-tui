@@ -919,18 +919,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Playback: match Space by both string and key type so it fires reliably
 	// regardless of how the terminal reports the event.
 	if msg.Type == tea.KeySpace || msg.String() == " " {
-		// Nothing loaded but a queue is present (a restored session, or the queue
-		// ran out): space starts playback at the queue position rather than
-		// toggling a paused mpv that has no file. So resuming is just "press play".
-		if !m.hasCurrent && len(m.queue) > 0 {
-			idx := m.queuePos
-			if idx < 0 || idx >= len(m.queue) {
-				idx = 0
-			}
-			m.playAt(idx)
-		} else {
-			m.player.PlayPause()
-		}
+		m.togglePlayback()
 		return m, nil
 	}
 
@@ -1106,6 +1095,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.activeView == viewSearch && len(m.searchResults) > 0 {
 			m.searchResults = nil
 			m.searchCursor = 0
+			// Drop pagination state with the results — a leftover continuation
+			// token would let j/k on the now-empty list fetch a page of the old
+			// query as orphan results.
+			m.searchContinuation = ""
+			m.searchMoreLoading = false
 			m.searchInput.SetValue("")
 			return m, nil
 		}
@@ -1239,7 +1233,11 @@ func (m *model) selectedTrack() (api.Track, bool) {
 func (m *model) openPlaylistPicker(t api.Track) {
 	m.pickTrack = t
 	m.pickCursor = 0
-	m.pickPrev = m.activeView
+	// P inside the picker re-targets it; keep the original return view so esc
+	// can't loop the picker back into itself.
+	if m.activeView != viewPlaylistPick {
+		m.pickPrev = m.activeView
+	}
 	m.activeView = viewPlaylistPick
 	m.focus = focusPanel
 }
@@ -1849,11 +1847,16 @@ func (m *model) handlePlaylistsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Append the playlist to the queue without disturbing playback.
 		m.loadPlaylist(pls[m.playlistCursor], false)
 	case "d", "x":
+		// A playlist is durable user data — confirm before deleting (same as
+		// clearing history), unlike removing a single queue/favorite entry.
 		name := pls[m.playlistCursor].Name
-		m.cfg.DeletePlaylist(name)
-		m.markConfigDirty()
-		m.clampActiveCursor()
-		m.setStatus("deleted playlist: " + name)
+		m.confirmPrompt = fmt.Sprintf("delete playlist %q (%d tracks)?", name, len(pls[m.playlistCursor].Tracks))
+		m.confirmFn = func() {
+			m.cfg.DeletePlaylist(name)
+			m.markConfigDirty()
+			m.clampActiveCursor()
+			m.setStatus("deleted playlist: " + name)
+		}
 	}
 	return m, nil
 }
@@ -1917,7 +1920,7 @@ func (m *model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if nc, ok := m.vimMove(msg.String(), m.searchCursor, len(m.searchResults)); ok {
 		m.searchCursor = nc
 		// Reaching the end of the loaded results pulls in the next page.
-		if nc >= len(m.searchResults)-1 && m.searchContinuation != "" {
+		if len(m.searchResults) > 0 && nc >= len(m.searchResults)-1 && m.searchContinuation != "" {
 			return m, m.loadMoreSearch()
 		}
 		return m, nil
@@ -1934,13 +1937,6 @@ func (m *model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "e":
 		// Append every loaded result to the queue.
 		m.enqueueAll(m.searchResults)
-	case "esc":
-		// Already browsing results — clear them.
-		m.searchResults = nil
-		m.searchCursor = 0
-		m.searchContinuation = ""
-		m.searchMoreLoading = false
-		m.searchInput.SetValue("")
 	}
 	return m, nil
 }
@@ -2068,8 +2064,10 @@ func (m *model) toggleFavoriteContext() {
 		m.setStatus("favorited: " + t.Title)
 	} else {
 		m.setStatus("unfavorited: " + t.Title)
-		if m.activeView == viewFavorites && m.favCursor >= len(m.cfg.Favorites) && m.favCursor > 0 {
-			m.favCursor--
+		if m.activeView == viewFavorites {
+			// Clamp against the filtered list — the manual len(Favorites) check
+			// undershot when a "/" filter was narrowing the view.
+			m.clampActiveCursor()
 		}
 	}
 }
@@ -2327,6 +2325,22 @@ func (m *model) watchdogCheck() tea.Cmd {
 		return m.handlePlaybackFailure("playback stalled")
 	}
 	return nil
+}
+
+// togglePlayback is the play/pause action (Space, MPRIS PlayPause). When
+// nothing is loaded but a queue is present (a restored session, or the queue
+// ran out) it starts playback at the queue position rather than toggling a
+// paused mpv that has no file — so resuming is just "press play".
+func (m *model) togglePlayback() {
+	if !m.hasCurrent && len(m.queue) > 0 {
+		idx := m.queuePos
+		if idx < 0 || idx >= len(m.queue) {
+			idx = 0
+		}
+		m.playAt(idx)
+		return
+	}
+	m.player.PlayPause()
 }
 
 func (m *model) prevTrack() {

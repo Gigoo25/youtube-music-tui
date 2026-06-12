@@ -86,11 +86,17 @@ func (m *model) handleMPRISAction(a mprisAction) (tea.Model, tea.Cmd) {
 	case mprisPrev:
 		m.prevTrack()
 	case mprisPlay:
-		m.player.Play()
+		// Like Space: a restored/ended queue with nothing loaded starts playing
+		// instead of unpausing an mpv that has no file.
+		if !m.hasCurrent && len(m.queue) > 0 {
+			m.togglePlayback()
+		} else {
+			m.player.Play()
+		}
 	case mprisPause:
 		m.player.Pause()
 	case mprisPlayPause:
-		m.player.PlayPause()
+		m.togglePlayback()
 	case mprisStop:
 		m.player.Stop()
 		m.hasCurrent = false
