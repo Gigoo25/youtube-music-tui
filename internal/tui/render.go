@@ -733,6 +733,7 @@ func (m *model) buildShortcutsBar(w int) string {
 	if m.typing() {
 		segs = append(segs,
 			shortcut{"enter", "search", false},
+			shortcut{"ctrl+u", "clear", false},
 			shortcut{"esc", "cancel", false},
 			shortcut{"tab", "menu", false},
 		)
@@ -1329,6 +1330,7 @@ func (m *model) renderHelp(w, h int) string {
 		{"Views & discovery", []binding{
 			{"1-6", "jump to view (Home…Playlists)"},
 			{"2", "global YouTube Music search"},
+			{"ctrl+u / ctrl+w", "clear query / delete word back (while typing)"},
 			{"/", "filter the current pane (esc clears)"},
 			{"a", "open the track's album (Enter to play it)"},
 			{"A", "open the track's artist (top songs + albums)"},

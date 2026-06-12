@@ -23,13 +23,19 @@ func newTestModel() *model {
 func key(s string) tea.KeyMsg {
 	switch s {
 	case " ":
-		return tea.KeyMsg{Type: tea.KeySpace}
+		// Terminals report space with its rune attached; textinput inserts from
+		// Runes, so include it.
+		return tea.KeyMsg{Type: tea.KeySpace, Runes: []rune(" ")}
 	case "enter":
 		return tea.KeyMsg{Type: tea.KeyEnter}
 	case "tab":
 		return tea.KeyMsg{Type: tea.KeyTab}
 	case "esc":
 		return tea.KeyMsg{Type: tea.KeyEsc}
+	case "ctrl+u":
+		return tea.KeyMsg{Type: tea.KeyCtrlU}
+	case "ctrl+w":
+		return tea.KeyMsg{Type: tea.KeyCtrlW}
 	}
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
 }
@@ -798,6 +804,118 @@ func TestArtistAlbumOpensWithL(t *testing.T) {
 	press(m2, "l")
 	if m2.activeView != viewArtist {
 		t.Fatalf("l on song row changed view: %v", m2.activeView)
+	}
+}
+
+// TestSearchTypingCtrlUClears: ctrl+u in the search box clears the query
+// (vim/readline kill-line), so starting a fresh search is one keystroke. The
+// binding comes from bubbles' textinput defaults — this guards that the key
+// handler keeps passing it through while typing.
+func TestSearchTypingCtrlUClears(t *testing.T) {
+	m := newTestModel()
+	m.activeView = viewSearch
+	m.focus = focusPanel
+	m.searchTyping = true
+	m.searchInput.Focus()
+	for _, r := range "old query" {
+		press(m, string(r))
+	}
+	if m.searchInput.Value() != "old query" {
+		t.Fatalf("setup: query = %q", m.searchInput.Value())
+	}
+
+	press(m, "ctrl+u")
+	if m.searchInput.Value() != "" {
+		t.Fatalf("ctrl+u did not clear the query: %q", m.searchInput.Value())
+	}
+
+	// ctrl+w deletes the word before the cursor.
+	for _, r := range "two words" {
+		press(m, string(r))
+	}
+	press(m, "ctrl+w")
+	if m.searchInput.Value() != "two " {
+		t.Fatalf("ctrl+w did not delete last word: %q", m.searchInput.Value())
+	}
+}
+
+// TestSearchEscDropsContinuation: esc-clearing search results must also drop the
+// pagination token — otherwise j/k on the now-empty list fetches a page of the
+// old query as orphan results.
+func TestSearchEscDropsContinuation(t *testing.T) {
+	m := newTestModel()
+	m.activeView = viewSearch
+	m.focus = focusPanel
+	m.searchResults = []api.Track{{ID: "s1", Title: "Song"}}
+	m.searchContinuation = "tok123"
+
+	press(m, "esc")
+	if len(m.searchResults) != 0 {
+		t.Fatalf("esc did not clear results: %v", m.searchResults)
+	}
+	if m.searchContinuation != "" {
+		t.Fatalf("esc left a stale continuation token: %q", m.searchContinuation)
+	}
+
+	// Belt and braces: even with a stale token, moving on an empty list must
+	// not fire a load-more.
+	m.searchContinuation = "tok123"
+	_, cmd := m.handleKey(key("j"))
+	if cmd != nil {
+		t.Fatal("j on empty results fired a load-more command")
+	}
+}
+
+// TestPickerReopenKeepsReturnView: P inside the add-to-playlist picker (with a
+// playing track) re-targets it but must keep the original return view — pickPrev
+// pointing at the picker itself made esc loop forever.
+func TestPickerReopenKeepsReturnView(t *testing.T) {
+	m := newTestModel()
+	m.activeView = viewQueue
+	m.focus = focusPanel
+	m.queue = []api.Track{{ID: "a", Title: "A"}}
+	m.queueCursor = 0
+	m.current = m.queue[0]
+	m.hasCurrent = true
+
+	press(m, "P") // queue → picker
+	if m.activeView != viewPlaylistPick || m.pickPrev != viewQueue {
+		t.Fatalf("picker setup: view=%v pickPrev=%v", m.activeView, m.pickPrev)
+	}
+	press(m, "P") // P again inside the picker
+	if m.pickPrev != viewQueue {
+		t.Fatalf("pickPrev clobbered to %v, want viewQueue", m.pickPrev)
+	}
+	press(m, "esc")
+	if m.activeView != viewQueue {
+		t.Fatalf("esc did not leave the picker: %v", m.activeView)
+	}
+}
+
+// TestPlaylistDeleteConfirms: deleting a playlist asks for confirmation; y
+// deletes, anything else keeps it.
+func TestPlaylistDeleteConfirms(t *testing.T) {
+	m := newTestModel()
+	m.cfg.Playlists = []config.Playlist{{Name: "keep", Tracks: []api.Track{{ID: "a", Title: "A"}}}}
+	m.activeView = viewPlaylists
+	m.focus = focusPanel
+
+	press(m, "d")
+	if m.cfg.PlaylistByName("keep") == nil {
+		t.Fatal("playlist deleted without confirmation")
+	}
+	if m.confirmFn == nil {
+		t.Fatal("d on a playlist did not arm a confirmation")
+	}
+	press(m, "n") // decline
+	if m.cfg.PlaylistByName("keep") == nil {
+		t.Fatal("declined confirmation still deleted the playlist")
+	}
+
+	press(m, "d")
+	press(m, "y") // confirm
+	if m.cfg.PlaylistByName("keep") != nil {
+		t.Fatal("confirmed delete did not remove the playlist")
 	}
 }
 
