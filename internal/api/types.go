@@ -5,6 +5,7 @@ type Track struct {
 	Title    string
 	Artist   string
 	Album    string
+	AlbumID  string // album browse id (MPREb…) when the source row linked one
 	Duration string
 	Year     string
 }

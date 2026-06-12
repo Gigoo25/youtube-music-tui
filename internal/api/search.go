@@ -1,6 +1,9 @@
 package api
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // songsFilterParam restricts a YouTube Music search to the "Songs" tab — the
 // official audio tracks (videoType ATV) rather than music videos (OMV), so the
@@ -115,6 +118,16 @@ func extractSongRow(r map[string]any) Track {
 		t.Title = str(dig(titleRuns[0], "text"))
 		if t.ID == "" {
 			t.ID = str(dig(titleRuns[0], "navigationEndpoint", "watchEndpoint", "videoId"))
+		}
+	}
+
+	// The album run links the album page — keep its browse id so "open album"
+	// can browse directly instead of relying on search (which can't find some
+	// albums, e.g. deluxe editions, by name).
+	for _, run := range col(1) {
+		if id := str(dig(run, "navigationEndpoint", "browseEndpoint", "browseId")); strings.HasPrefix(id, "MPREb") {
+			t.AlbumID = id
+			break
 		}
 	}
 

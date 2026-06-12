@@ -49,8 +49,67 @@ func ArtistByQuery(c *Client, name string) (ArtistResult, error) {
 		res.Name = name
 	}
 	res.Songs = CleanTracks(parseArtistSongs(broot))
-	res.Albums = parseArtistAlbums(broot)
+	res.Albums = parseArtistAlbums(broot, 20)
+
+	// The landing page shows only a curated subset of releases (~10 album cards
+	// for big artists). The full discography lives behind the shelf's "More"
+	// button — a MUSIC_PAGE_TYPE_ARTIST_DISCOGRAPHY browse. Merge it in (landing
+	// order first, so the curated albums stay on top). Note: YouTube Music's
+	// artist catalog itself omits some editions (deluxe/reissues are often
+	// search-only), so this is best-effort completeness, not a guarantee.
+	if discoID := discographyBrowseID(broot); discoID != "" {
+		dp := c.clientCtx()
+		dp["browseId"] = discoID
+		if dbody, derr := c.post("browse", dp); derr == nil {
+			if droot, perr := parseJSON(dbody); perr == nil {
+				res.Albums = mergeAlbumRefs(res.Albums, parseArtistAlbums(droot, 60))
+			}
+		}
+	}
 	return res, nil
+}
+
+// discographyBrowseID finds the artist's full-discography browse id (MPAD…)
+// from the albums shelf's "More" endpoint, or "" when the page has none.
+func discographyBrowseID(node any) string {
+	switch v := node.(type) {
+	case map[string]any:
+		if be, ok := v["browseEndpoint"].(map[string]any); ok {
+			pageType := str(dig(be, "browseEndpointContextSupportedConfigs",
+				"browseEndpointContextMusicConfig", "pageType"))
+			if id := str(be["browseId"]); pageType == "MUSIC_PAGE_TYPE_ARTIST_DISCOGRAPHY" &&
+				strings.HasPrefix(id, "MPAD") {
+				return id
+			}
+		}
+		for _, child := range v {
+			if id := discographyBrowseID(child); id != "" {
+				return id
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if id := discographyBrowseID(child); id != "" {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
+// mergeAlbumRefs appends extra albums not already present in base (by id).
+func mergeAlbumRefs(base, extra []AlbumRef) []AlbumRef {
+	seen := make(map[string]bool, len(base))
+	for _, a := range base {
+		seen[a.ID] = true
+	}
+	for _, a := range extra {
+		if !seen[a.ID] {
+			seen[a.ID] = true
+			base = append(base, a)
+		}
+	}
+	return base
 }
 
 // firstArtistBrowseID finds the first browseEndpoint whose page type marks it as
@@ -181,11 +240,11 @@ func cleanArtist(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// parseArtistAlbums extracts the artist's album/single cards (cap 20), deduped by
-// browse id. Cards that don't point at an album (e.g. related-artist channels,
-// playable videos) are skipped because their browse id lacks the MPREb prefix.
-func parseArtistAlbums(root any) []AlbumRef {
-	const limit = 20
+// parseArtistAlbums extracts the artist's album/single cards (capped at limit),
+// deduped by browse id. Cards that don't point at an album (e.g. related-artist
+// channels, playable videos) are skipped because their browse id lacks the
+// MPREb prefix.
+func parseArtistAlbums(root any, limit int) []AlbumRef {
 	var out []AlbumRef
 	seen := map[string]bool{}
 	walkRenderers(root, "musicTwoRowItemRenderer", func(r map[string]any) {
