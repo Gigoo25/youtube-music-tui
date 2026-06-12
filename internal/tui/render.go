@@ -322,11 +322,16 @@ func (m *model) renderPlaylistDetail(w, h int) string {
 	if listH < 1 {
 		listH = 1
 	}
+	// vis maps filtered rows to playlist indices (identity when no filter).
+	vis := m.trackVisibleIndices(pl.Tracks)
+	if len(vis) == 0 {
+		return lipgloss.JoinVertical(lipgloss.Left, heading, styleDim.Render("No matching tracks."))
+	}
 	focused := m.focus == focusPanel
-	start, end := windowBounds(m.plDetailCursor, len(pl.Tracks), listH)
+	start, end := windowBounds(m.plDetailCursor, len(vis), listH)
 	var rows []string
 	for i := start; i < end; i++ {
-		rows = append(rows, m.renderResultRow(i+1, pl.Tracks[i], i == m.plDetailCursor, focused, w, false))
+		rows = append(rows, m.renderResultRow(i+1, pl.Tracks[vis[i]], i == m.plDetailCursor, focused, w, false))
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, heading, strings.Join(rows, "\n"))
 }
@@ -827,7 +832,8 @@ func (m *model) buildShortcutsBar(w int) string {
 		case viewHistory:
 			segs = append(segs, shortcut{"j/k", "move", false},
 				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
-				shortcut{"c", "clear history", false}, shortcut{"f", "fav", false},
+				shortcut{"d", "remove", false}, shortcut{"c", "clear history", false},
+				shortcut{"f", "fav", false},
 				shortcut{"a", "album", false}, shortcut{"A", "artist", false})
 		case viewAlbum:
 			segs = append(segs, shortcut{"j/k", "move", false},
@@ -836,11 +842,11 @@ func (m *model) buildShortcutsBar(w int) string {
 				shortcut{"e", "queue all", false}, shortcut{"f", "fav", false})
 		case viewArtist:
 			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "queue / open", false}, shortcut{"p", "play now", false},
+				shortcut{"enter/l", "queue / open", false}, shortcut{"p", "play now", false},
 				shortcut{"e", "queue all", false}, shortcut{"f", "fav", false})
 		case viewPlaylists:
 			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "view tracks", false},
+				shortcut{"enter/l", "view tracks", false},
 				shortcut{"p", "play (replaces queue)", false},
 				shortcut{"e", "add to queue", false},
 				shortcut{"d", "delete", false})
@@ -1297,7 +1303,7 @@ func (m *model) renderHelp(w, h int) string {
 			{"p", "play now (album view: play album, replaces queue)"},
 			{"e", "queue all (album / artist / search / playlist)"},
 			{"f", "toggle favorite"},
-			{"d / x", "remove from queue"},
+			{"d / x", "remove (queue / favorites / history / playlist)"},
 			{"J / K", "move track down / up in queue"},
 			{".", "jump to now-playing (queue)"},
 			{"c", "clear queue / clear history (asks to confirm)"},
@@ -1306,18 +1312,19 @@ func (m *model) renderHelp(w, h int) string {
 			{"6", "open Playlists"},
 			{"S", "save the queue as a playlist"},
 			{"P", "add the selected song to a playlist"},
-			{"enter", "view a playlist's tracks"},
+			{"enter / l", "view a playlist's tracks"},
 			{"p", "play a playlist (replaces the queue)"},
 			{"e", "append a playlist to the queue"},
 			{"d", "delete a playlist / remove a song (in playlist view)"},
 		}},
 		{"Lists & navigation", []binding{
 			{"j / k", "navigate list"},
+			{"l / right", "open selected (sidebar / playlist / artist album)"},
 			{"gg / G", "jump to top / bottom"},
 			{"ctrl+d / ctrl+u", "scroll half page down / up"},
 			{"ctrl+f / ctrl+b", "scroll full page down / up"},
 			{"tab", "toggle sidebar / panel focus"},
-			{"h / esc", "back to menu / previous"},
+			{"h / esc", "step back (contextual view) / back to menu"},
 		}},
 		{"Views & discovery", []binding{
 			{"1-6", "jump to view (Home…Playlists)"},

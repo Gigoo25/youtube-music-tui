@@ -680,3 +680,95 @@ func TestAddToNewPlaylistViaNaming(t *testing.T) {
 		t.Fatalf("naming flow did not create playlist: %+v", pl)
 	}
 }
+
+// ── Navigation consistency ──────────────────────────────────────────────────────
+
+func TestContextualBackWithH(t *testing.T) {
+	m := newTestModel()
+	// Album opened from search: h steps back to search, like esc.
+	m.activeView = viewSearch
+	m.prevView = viewSearch
+	m.activeView = viewAlbum
+	m.focus = focusPanel
+	press(m, "h")
+	if m.activeView != viewSearch || m.focus != focusPanel {
+		t.Fatalf("h in album did not step back: view=%v focus=%v", m.activeView, m.focus)
+	}
+
+	// Playlist detail: h steps back to the playlist list.
+	m.cfg.Playlists = []config.Playlist{{Name: "mix", Tracks: []api.Track{{ID: "a", Title: "A"}}}}
+	m.activeView = viewPlaylists
+	press(m, "enter")
+	if m.activeView != viewPlaylistDetail {
+		t.Fatalf("setup: detail not opened: %v", m.activeView)
+	}
+	press(m, "h")
+	if m.activeView != viewPlaylists {
+		t.Fatalf("h in playlist detail did not step back: %v", m.activeView)
+	}
+
+	// Top-level view: h hands focus to the sidebar.
+	m.activeView = viewFavorites
+	m.focus = focusPanel
+	press(m, "h")
+	if m.focus != focusSidebar {
+		t.Fatalf("h in top-level view did not focus sidebar: %v", m.focus)
+	}
+}
+
+func TestHistoryRemoveEntry(t *testing.T) {
+	m := newTestModel()
+	m.cfg.History = []config.HistoryEntry{
+		{Track: api.Track{ID: "one", Title: "One"}},
+		{Track: api.Track{ID: "two", Title: "Two"}},
+	}
+	m.activeView = viewHistory
+	m.focus = focusPanel
+	press(m, "j") // select second entry
+	press(m, "d")
+	if len(m.cfg.History) != 1 || m.cfg.History[0].Track.ID != "one" {
+		t.Fatalf("history remove failed: %+v", m.cfg.History)
+	}
+}
+
+func TestArtistAlbumOpensWithL(t *testing.T) {
+	m := newTestModel()
+	m.activeView = viewArtist
+	m.focus = focusPanel
+	m.artistSongs = []api.Track{{ID: "s1", Title: "Song"}}
+	m.artistAlbums = []api.AlbumRef{{ID: "MPREb_x", Title: "Alb"}}
+	m.artistCursor = 1 // album row (after the one song)
+	press(m, "l")
+	if m.activeView != viewAlbum {
+		t.Fatalf("l on artist album did not open album view: %v", m.activeView)
+	}
+	// On a song row, l must not open anything.
+	m2 := newTestModel()
+	m2.activeView = viewArtist
+	m2.focus = focusPanel
+	m2.artistSongs = []api.Track{{ID: "s1", Title: "Song"}}
+	m2.artistCursor = 0
+	press(m2, "l")
+	if m2.activeView != viewArtist {
+		t.Fatalf("l on song row changed view: %v", m2.activeView)
+	}
+}
+
+func TestPlaylistDetailFilter(t *testing.T) {
+	m := newTestModel()
+	m.cfg.Playlists = []config.Playlist{{Name: "mix", Tracks: []api.Track{
+		{ID: "a", Title: "Alpha"},
+		{ID: "b", Title: "Beta"},
+		{ID: "g", Title: "Gamma"},
+	}}}
+	m.activeView = viewPlaylistDetail
+	m.openPlaylist = "mix"
+	m.focus = focusPanel
+	m.filter = "gam" // as if typed via "/"
+	m.plDetailCursor = 0
+	press(m, "d") // must remove Gamma (the only visible row), not Alpha
+	pl := m.cfg.PlaylistByName("mix")
+	if len(pl.Tracks) != 2 || pl.Tracks[0].ID != "a" || pl.Tracks[1].ID != "b" {
+		t.Fatalf("filtered remove hit wrong track: %+v", pl.Tracks)
+	}
+}

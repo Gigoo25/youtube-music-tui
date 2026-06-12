@@ -644,7 +644,7 @@ func (m *model) typing() bool {
 func (m *model) filterableView() bool {
 	switch m.activeView {
 	case viewHome, viewQueue, viewFavorites, viewHistory,
-		viewAlbum, viewArtist:
+		viewAlbum, viewArtist, viewPlaylistDetail:
 		return true
 	}
 	return false
@@ -735,6 +735,8 @@ func (m *model) activeCursorPtr() *int {
 		return &m.artistCursor
 	case viewPlaylists:
 		return &m.playlistCursor
+	case viewPlaylistDetail:
+		return &m.plDetailCursor
 	}
 	return nil
 }
@@ -757,6 +759,11 @@ func (m *model) activeFilteredLen() int {
 		return len(m.filt(m.artistSongs)) + len(m.filtAlbums(m.artistAlbums))
 	case viewPlaylists:
 		return len(m.cfg.Playlists)
+	case viewPlaylistDetail:
+		if pl := m.cfg.PlaylistByName(m.openPlaylist); pl != nil {
+			return len(m.filt(pl.Tracks))
+		}
+		return 0
 	}
 	return 0
 }
@@ -1075,6 +1082,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// ── Panel focus: return-to-sidebar keys ──
 	switch msg.String() {
 	case "h", "left":
+		// Contextual views step back to where they were opened from (same as
+		// esc); top-level views hand focus to the sidebar.
+		if m.backFromContextual() {
+			return m, nil
+		}
 		m.focus = focusSidebar
 		m.navCursor = navIndexOf(m.activeView)
 		return m, nil
@@ -1087,28 +1099,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		// The album, artist and genre-picker views are contextual: esc returns to
-		// the screen they were opened from.
-		if m.activeView == viewAlbum || m.activeView == viewArtist || m.activeView == viewGenres {
-			m.clearFilter()
-			m.activeView = m.prevView
-			m.navCursor = navIndexOf(m.activeView)
-			m.focus = focusPanel
-			return m, nil
-		}
-		// Playlist detail returns to the playlist list; the add-to-playlist
-		// picker returns to whatever track list it was opened from.
-		if m.activeView == viewPlaylistDetail {
-			m.clearFilter()
-			m.activeView = viewPlaylists
-			m.navCursor = navIndexOf(viewPlaylists)
-			m.focus = focusPanel
-			return m, nil
-		}
-		if m.activeView == viewPlaylistPick {
-			m.activeView = m.pickPrev
-			m.navCursor = navIndexOf(m.activeView)
-			m.focus = focusPanel
+		if m.backFromContextual() {
 			return m, nil
 		}
 		// In search results, esc clears results first; a second esc returns focus.
@@ -1153,6 +1144,28 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// backFromContextual steps a contextual view back to the screen it was opened
+// from: album/artist/genre-picker → prevView, playlist detail → the playlist
+// list, the add-to-playlist picker → its origin view. Returns false when the
+// active view is a top-level screen (nothing to step back from).
+func (m *model) backFromContextual() bool {
+	switch m.activeView {
+	case viewAlbum, viewArtist, viewGenres:
+		m.clearFilter()
+		m.activeView = m.prevView
+	case viewPlaylistDetail:
+		m.clearFilter()
+		m.activeView = viewPlaylists
+	case viewPlaylistPick:
+		m.activeView = m.pickPrev
+	default:
+		return false
+	}
+	m.navCursor = navIndexOf(m.activeView)
+	m.focus = focusPanel
+	return true
+}
+
 // selectedTrack returns the track under the cursor in the current view's list
 // (mirroring each view's own filter/cursor logic), for actions that work on
 // "the selected song" from anywhere — e.g. add-to-playlist.
@@ -1190,8 +1203,11 @@ func (m *model) selectedTrack() (api.Track, bool) {
 			return m.artistSongAt(songVis[m.artistCursor]), true
 		}
 	case viewPlaylistDetail:
-		if pl := m.cfg.PlaylistByName(m.openPlaylist); pl != nil && m.plDetailCursor < len(pl.Tracks) {
-			return pl.Tracks[m.plDetailCursor], true
+		if pl := m.cfg.PlaylistByName(m.openPlaylist); pl != nil {
+			vis := m.trackVisibleIndices(pl.Tracks)
+			if m.plDetailCursor < len(vis) {
+				return pl.Tracks[vis[m.plDetailCursor]], true
+			}
 		}
 	}
 	return api.Track{}, false
@@ -1212,27 +1228,29 @@ func (m *model) handlePlaylistDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.activeView = viewPlaylists
 		return m, nil
 	}
-	if nc, ok := m.vimMove(msg.String(), m.plDetailCursor, len(pl.Tracks)); ok {
+	// vis maps filtered rows back to playlist indices ("/" works here like in
+	// every other track list).
+	vis := m.trackVisibleIndices(pl.Tracks)
+	if nc, ok := m.vimMove(msg.String(), m.plDetailCursor, len(vis)); ok {
 		m.plDetailCursor = nc
 		return m, nil
 	}
-	if m.plDetailCursor >= len(pl.Tracks) {
+	if m.plDetailCursor >= len(vis) {
 		return m, nil
 	}
 	switch msg.String() {
 	case "enter":
-		m.enqueue(pl.Tracks[m.plDetailCursor])
+		m.enqueue(pl.Tracks[vis[m.plDetailCursor]])
 	case "p":
-		m.playNow(pl.Tracks[m.plDetailCursor])
+		m.playNow(pl.Tracks[vis[m.plDetailCursor]])
 	case "e":
 		m.enqueueAll(pl.Tracks)
 	case "d", "x":
-		removed := pl.Tracks[m.plDetailCursor].Title
-		m.cfg.RemoveFromPlaylist(m.openPlaylist, m.plDetailCursor)
+		orig := vis[m.plDetailCursor]
+		removed := pl.Tracks[orig].Title
+		m.cfg.RemoveFromPlaylist(m.openPlaylist, orig)
 		m.markConfigDirty()
-		if pl := m.cfg.PlaylistByName(m.openPlaylist); pl != nil && m.plDetailCursor >= len(pl.Tracks) && m.plDetailCursor > 0 {
-			m.plDetailCursor--
-		}
+		m.clampActiveCursor()
 		m.setStatus("removed from playlist: " + removed)
 	}
 	return m, nil
@@ -1602,6 +1620,11 @@ func (m *model) handleArtistKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else if ai := m.artistCursor - len(songVis); ai < len(albums) {
 			return m, m.openAlbumByID(albums[ai])
 		}
+	case "l", "right":
+		// l/right open things (sidebar, playlists) — here: the selected album.
+		if ai := m.artistCursor - len(songVis); ai >= 0 && ai < len(albums) {
+			return m, m.openAlbumByID(albums[ai])
+		}
 	case "p":
 		// Play the selected song now (albums have no play-now; enter opens them).
 		if m.artistCursor < len(songVis) {
@@ -1744,6 +1767,21 @@ func (m *model) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "p":
 		if m.historyCursor < len(hist) {
 			m.playNow(hist[m.historyCursor].Track)
+		}
+	case "d", "x":
+		// Remove a single history entry (consistent with queue/favorites).
+		if m.historyCursor < len(hist) {
+			e := hist[m.historyCursor]
+			for i := range m.cfg.History {
+				if m.cfg.History[i].PlayedAt.Equal(e.PlayedAt) && m.cfg.History[i].Track.ID == e.Track.ID {
+					m.cfg.History = append(m.cfg.History[:i], m.cfg.History[i+1:]...)
+					break
+				}
+			}
+			m.refreshListenAgain() // Listen Again is built from history
+			m.markConfigDirty()
+			m.clampActiveCursor()
+			m.setStatus("removed from history")
 		}
 	case "c":
 		if len(m.cfg.History) == 0 {
@@ -1981,7 +2019,7 @@ func (m *model) handleFavKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.favCursor < len(favs) {
 			m.playNow(favs[m.favCursor])
 		}
-	case "d":
+	case "d", "x":
 		// Remove from favorites (f is the global toggle handled above).
 		if m.favCursor < len(favs) {
 			m.cfg.ToggleFavorite(favs[m.favCursor])
@@ -2014,41 +2052,11 @@ func (m *model) toggleFavoriteContext() {
 
 // contextTrack resolves the track the user is currently acting on, by view.
 func (m *model) contextTrack() *api.Track {
-	switch m.activeView {
-	case viewHome:
-		if t, ok := m.homeTrackAt(m.homeCursor); ok {
-			return &t
-		}
-	case viewArtist:
-		if songs := m.filt(m.artistSongs); m.artistCursor < len(songs) {
-			t := songs[m.artistCursor]
-			return &t
-		}
-	case viewSearch:
-		if m.searchCursor < len(m.searchResults) {
-			t := m.searchResults[m.searchCursor]
-			return &t
-		}
-	case viewQueue:
-		if q := m.filt(m.queue); m.queueCursor < len(q) {
-			t := q[m.queueCursor]
-			return &t
-		}
-	case viewFavorites:
-		if favs := m.filt(m.cfg.Favorites); m.favCursor < len(favs) {
-			t := favs[m.favCursor]
-			return &t
-		}
-	case viewHistory:
-		if hist := m.filtHistory(m.cfg.History); m.historyCursor < len(hist) {
-			t := hist[m.historyCursor].Track
-			return &t
-		}
-	case viewAlbum:
-		if tracks := m.filt(m.albumTracks); m.albumCursor < len(tracks) {
-			t := tracks[m.albumCursor]
-			return &t
-		}
+	// One selection source for every view (see selectedTrack), so f/a/A/P all
+	// agree on what "the selected song" is — including filled-in album/artist
+	// names and the playlist-detail view.
+	if t, ok := m.selectedTrack(); ok {
+		return &t
 	}
 	// Fall back to the currently playing track (Help and empty lists).
 	if m.hasCurrent {

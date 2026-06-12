@@ -106,8 +106,16 @@ album, radio, random) runs in `tea.Cmd`s returning typed messages
   `z` random, and `C` auto-continue.
 - **Per-tab icons**: each sidebar tab + its panel heading uses a distinct Nerd Font
   glyph (`viewIcon`). Nerd Font required; glyphs are width-1 so the layout aligns.
-- **Focus model**: `focusSidebar` / `focusPanel`. `tab` toggles focus; `h/left/esc`
-  return to the sidebar; `esc` in Album returns to `prevView`. `1-5` jump to views.
+- **Focus model**: `focusSidebar` / `focusPanel`. `tab` toggles focus. Unified
+  back/open rules (keep them consistent when adding views): `h`/`left`/`esc` step a
+  *contextual* view (Album/Artist/Genres/PlaylistDetail/PlaylistPick) back to where
+  it was opened from (`backFromContextual`), and return a *top-level* view's focus
+  to the sidebar; `l`/`right` "open" the selection wherever something can be opened
+  (sidebar entry, playlist → detail, artist album → album view). `1-6` jump to
+  views. Track-list keys are uniform: `enter` queue, `p` play (album/playlist
+  views: replace queue), `e` queue all, `d`/`x` remove, `f` fav, `P` add-to-
+  playlist, `/` filter — selection for global actions comes from `selectedTrack`
+  (one source; `contextTrack` adds the now-playing fallback).
 - **Selection rendering**: the focused pane's selected row gets a full-width inverse
   highlight; unfocused/secondary selection gets a subtle marker. Use
   display-width-aware helpers (`truncate2`, `padRight`) for any styled/ANSI row —
