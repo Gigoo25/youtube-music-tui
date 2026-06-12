@@ -164,7 +164,7 @@ type model struct {
 	albumTitle   string
 	albumLoading bool
 	albumErr     string
-	prevView     view // the view to return to from the album view
+	viewStack    []view // return path for contextual views (album/artist/genres)
 
 	// player snapshot (refreshed each tick)
 	playerState player.State
@@ -1144,15 +1144,37 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// pushView records the current view as the place a contextual view (album,
+// artist, genres) returns to. Chained hops (album → artist → album …) stack up
+// so back unwinds them in order instead of ping-ponging between the last two.
+func (m *model) pushView() {
+	const maxDepth = 16
+	m.viewStack = append(m.viewStack, m.activeView)
+	if len(m.viewStack) > maxDepth {
+		m.viewStack = m.viewStack[len(m.viewStack)-maxDepth:]
+	}
+}
+
+// popView returns the view to go back to, falling back to Home when the
+// stack is empty.
+func (m *model) popView() view {
+	if n := len(m.viewStack); n > 0 {
+		v := m.viewStack[n-1]
+		m.viewStack = m.viewStack[:n-1]
+		return v
+	}
+	return viewHome
+}
+
 // backFromContextual steps a contextual view back to the screen it was opened
-// from: album/artist/genre-picker → prevView, playlist detail → the playlist
-// list, the add-to-playlist picker → its origin view. Returns false when the
-// active view is a top-level screen (nothing to step back from).
+// from: album/artist/genre-picker → the view stack, playlist detail → the
+// playlist list, the add-to-playlist picker → its origin view. Returns false
+// when the active view is a top-level screen (nothing to step back from).
 func (m *model) backFromContextual() bool {
 	switch m.activeView {
 	case viewAlbum, viewArtist, viewGenres:
 		m.clearFilter()
-		m.activeView = m.prevView
+		m.activeView = m.popView()
 	case viewPlaylistDetail:
 		m.clearFilter()
 		m.activeView = viewPlaylists
@@ -1295,7 +1317,7 @@ func (m *model) goToAlbum() tea.Cmd {
 		return nil
 	}
 	if m.activeView != viewAlbum {
-		m.prevView = m.activeView
+		m.pushView()
 	}
 	m.clearFilter()
 	m.activeView = viewAlbum
@@ -1584,7 +1606,7 @@ func (m *model) goToArtist() tea.Cmd {
 		return nil
 	}
 	if m.activeView != viewArtist {
-		m.prevView = m.activeView
+		m.pushView()
 	}
 	m.clearFilter()
 	m.activeView = viewArtist
@@ -1662,7 +1684,7 @@ func (m *model) withArtist(ts []api.Track) []api.Track {
 // to the artist.
 func (m *model) openAlbumByID(a api.AlbumRef) tea.Cmd {
 	m.clearFilter()
-	m.prevView = viewArtist
+	m.pushView()
 	m.activeView = viewAlbum
 	m.focus = focusPanel
 	m.albumLoading = true
@@ -1692,7 +1714,7 @@ func firstArtistOf(s string) string {
 // openGenres opens the random-genre picker.
 func (m *model) openGenres() {
 	if m.activeView != viewGenres {
-		m.prevView = m.activeView
+		m.pushView()
 	}
 	m.clearFilter()
 	m.activeView = viewGenres
@@ -1716,7 +1738,7 @@ func (m *model) handleGenresKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			cmd = m.playRandomGenre(randomSeeds[m.genreCursor-1])
 		}
-		m.activeView = m.prevView
+		m.activeView = m.popView()
 		m.navCursor = navIndexOf(m.activeView)
 		return m, cmd
 	}
@@ -1857,6 +1879,8 @@ func (m *model) loadPlaylist(pl config.Playlist, replace bool) {
 // the panel. Used by quick-jump keys and sidebar activation.
 func (m *model) activateView(v view) {
 	m.clearFilter()
+	// Direct navigation (sidebar, 1-6, ?) abandons any contextual return path.
+	m.viewStack = nil
 	m.activeView = v
 	m.navCursor = navIndexOf(v)
 	m.focus = focusPanel

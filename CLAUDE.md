@@ -100,7 +100,8 @@ album, radio, random) runs in `tea.Cmd`s returning typed messages
   are queue-oriented: `p` replaces the queue, `e` appends — labels say so. Default view is **Home** (panel focused, not typing). Home = Listen Again
   (local history, deduped) + Quick Picks (Related to most-recent play, falling back
   to Trending); both are one flat-cursor list. Album and Artist are contextual
-  (opened with `a`/`A`, `esc` returns to `prevView`); they aren't sidebar entries.
+  (opened with `a`/`A`, `esc` pops the `viewStack` return path); they aren't sidebar
+  entries.
   The old browse tabs (Trending/New Releases/Explore) were removed — their feeds
   lacked album/duration and were video-heavy; discovery is via Home, `R` radio,
   `z` random, and `C` auto-continue.

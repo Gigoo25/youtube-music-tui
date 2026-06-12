@@ -263,13 +263,60 @@ func TestGoToArtistRouting(t *testing.T) {
 	if m.artistName != "Foo" {
 		t.Fatalf("artistName = %q, want Foo", m.artistName)
 	}
-	if m.prevView != viewSearch {
-		t.Fatalf("prevView = %v, want viewSearch", m.prevView)
-	}
-
 	press(m, "esc") // contextual back
 	if m.activeView != viewSearch {
 		t.Fatalf("after esc activeView = %v, want viewSearch", m.activeView)
+	}
+}
+
+// TestContextualBackChain: hopping album → artist → album must unwind with esc
+// back to the originating view, not ping-pong between the two contextual views
+// (regression: a single prevView slot got clobbered on the second hop).
+func TestContextualBackChain(t *testing.T) {
+	m := newTestModel()
+	m.activeView = viewSearch
+	m.focus = focusPanel
+	m.searchResults = []api.Track{{ID: "s1", Title: "Song", Artist: "Foo", Album: "Bar"}}
+	m.searchCursor = 0
+
+	press(m, "a") // search → album
+	if m.activeView != viewAlbum {
+		t.Fatalf("activeView = %v, want viewAlbum", m.activeView)
+	}
+	m.albumLoading = false
+	m.albumTracks = []api.Track{{ID: "t1", Title: "Track", Artist: "Foo", Album: "Bar"}}
+
+	press(m, "A") // album → artist
+	if m.activeView != viewArtist {
+		t.Fatalf("activeView = %v, want viewArtist", m.activeView)
+	}
+
+	press(m, "esc") // artist → album
+	if m.activeView != viewAlbum {
+		t.Fatalf("after first esc activeView = %v, want viewAlbum", m.activeView)
+	}
+	press(m, "esc") // album → search (the originating view, not artist again)
+	if m.activeView != viewSearch {
+		t.Fatalf("after second esc activeView = %v, want viewSearch", m.activeView)
+	}
+}
+
+// TestSidebarJumpClearsBackChain: direct navigation abandons the contextual
+// return path, so a later esc doesn't resurrect a stale album/artist view.
+func TestSidebarJumpClearsBackChain(t *testing.T) {
+	m := newTestModel()
+	m.activeView = viewSearch
+	m.focus = focusPanel
+	m.searchResults = []api.Track{{ID: "s1", Title: "Song", Artist: "Foo", Album: "Bar"}}
+	m.searchCursor = 0
+
+	press(m, "a") // search → album (pushes viewSearch)
+	press(m, "3") // jump straight to queue
+	if m.activeView != viewQueue {
+		t.Fatalf("activeView = %v, want viewQueue", m.activeView)
+	}
+	if len(m.viewStack) != 0 {
+		t.Fatalf("viewStack = %v, want empty after direct navigation", m.viewStack)
 	}
 }
 
@@ -687,7 +734,7 @@ func TestContextualBackWithH(t *testing.T) {
 	m := newTestModel()
 	// Album opened from search: h steps back to search, like esc.
 	m.activeView = viewSearch
-	m.prevView = viewSearch
+	m.viewStack = []view{viewSearch}
 	m.activeView = viewAlbum
 	m.focus = focusPanel
 	press(m, "h")
