@@ -512,10 +512,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setError("radio failed: " + msg.err.Error())
 		} else if len(msg.tracks) == 0 {
 			m.setError("no related tracks found")
-		} else if added := m.appendNew(msg.tracks); added > 0 {
-			m.setStatus(fmt.Sprintf("radio: added %d tracks", added))
+		} else if added := m.startRadioQueue(msg.tracks); added > 0 {
+			m.setStatus(fmt.Sprintf("radio: %d tracks", added))
 		} else {
-			m.setStatus("radio: all already in queue")
+			m.setStatus("radio: no new tracks found")
 		}
 		return m, nil
 
@@ -1758,7 +1758,8 @@ func (m *model) playRandomGenre(seed string) tea.Cmd {
 	}
 }
 
-// startRadio enqueues tracks related to the currently playing song.
+// startRadio fetches tracks related to the currently playing song; the result is
+// applied by startRadioQueue, which rebuilds the queue around that song.
 func (m *model) startRadio() tea.Cmd {
 	if !m.hasCurrent {
 		m.setError("nothing playing to start radio from")
@@ -1771,6 +1772,27 @@ func (m *model) startRadio() tea.Cmd {
 		tracks, err := client.Related(id)
 		return radioDoneMsg{tracks: tracks, err: err}
 	}
+}
+
+// startRadioQueue resets the queue to just the now-playing track followed by the
+// radio tracks (deduped), so starting radio clears everything else without
+// interrupting the current song. Returns how many radio tracks were added.
+func (m *model) startRadioQueue(ts []api.Track) int {
+	if m.hasCurrent {
+		m.queue = []api.Track{m.current}
+		m.queuePos = 0
+	} else {
+		m.queue = nil
+		m.queuePos = 0
+	}
+	added := m.appendNew(ts)
+	if !m.hasCurrent && len(m.queue) > 0 {
+		m.playAt(0)
+	} else {
+		m.prefetchNext()
+	}
+	m.queueCursor = m.queuePos
+	return added
 }
 
 func (m *model) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
