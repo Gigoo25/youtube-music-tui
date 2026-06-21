@@ -2240,13 +2240,13 @@ func (m *model) nextTrack() tea.Cmd {
 		}
 	case repeatAll:
 		if m.shuffle {
-			m.playAt(rand.Intn(len(m.queue)))
+			m.playAt(m.nextShuffleIdx())
 		} else {
 			m.playAt((m.queuePos + 1) % len(m.queue))
 		}
 	default:
 		if m.shuffle {
-			m.playAt(rand.Intn(len(m.queue)))
+			m.playAt(m.nextShuffleIdx())
 		} else if m.queuePos+1 < len(m.queue) {
 			m.playAt(m.queuePos + 1)
 		} else if m.cfg.AutoContinue && m.hasCurrent {
@@ -2257,6 +2257,22 @@ func (m *model) nextTrack() tea.Cmd {
 		}
 	}
 	return nil
+}
+
+// nextShuffleIdx picks a random queue index other than the one playing so
+// shuffle never repeats a track back-to-back. Maps [0,n-1) onto the queue minus
+// the current slot (no rejection loop); falls back to a plain random pick when
+// the playing entry isn't in the queue (queuePos out of range).
+func (m *model) nextShuffleIdx() int {
+	n := len(m.queue)
+	if n <= 1 || m.queuePos < 0 || m.queuePos >= n {
+		return rand.Intn(n)
+	}
+	idx := rand.Intn(n - 1)
+	if idx >= m.queuePos {
+		idx++
+	}
+	return idx
 }
 
 // continueRadio fetches tracks related to the just-finished track so playback
