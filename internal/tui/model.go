@@ -1778,20 +1778,13 @@ func (m *model) startRadio() tea.Cmd {
 // radio tracks (deduped), so starting radio clears everything else without
 // interrupting the current song. Returns how many radio tracks were added.
 func (m *model) startRadioQueue(ts []api.Track) int {
-	if m.hasCurrent {
-		m.queue = []api.Track{m.current}
-		m.queuePos = 0
-	} else {
-		m.queue = nil
-		m.queuePos = 0
-	}
+	// startRadio guarantees a current track, so the queue resets to just it and
+	// keeps playing (no reload); the radio tracks queue up behind it.
+	m.queue = []api.Track{m.current}
+	m.queuePos = 0
+	m.queueCursor = 0
 	added := m.appendNew(ts)
-	if !m.hasCurrent && len(m.queue) > 0 {
-		m.playAt(0)
-	} else {
-		m.prefetchNext()
-	}
-	m.queueCursor = m.queuePos
+	m.prefetchNext()
 	return added
 }
 
