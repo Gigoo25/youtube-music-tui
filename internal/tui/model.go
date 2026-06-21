@@ -1980,7 +1980,7 @@ func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !m.filterActive() {
 			m.moveQueueItem(m.queueCursor, m.queueCursor-1)
 		}
-	case "enter", "p":
+	case "enter":
 		if m.queueCursor < len(vis) {
 			m.queuePos = vis[m.queueCursor]
 			m.playAt(m.queuePos)
