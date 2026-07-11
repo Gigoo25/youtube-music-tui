@@ -304,8 +304,10 @@ func (m *model) renderPanelBody(w, h int) string {
 }
 
 // renderPlaylistDetail lists the tracks of one saved playlist (standard track
-// rows). Playing/queueing happens via the queue: p replaces the queue with the
-// playlist, e appends it — the header spells that out.
+// rows). Per-track actions match the other list views: enter queues the
+// selected track, p plays it now, e appends the whole playlist, d removes the
+// selected track from the playlist. (Whole-playlist p=replace / e=append lives
+// on the Playlists list view, not here.)
 func (m *model) renderPlaylistDetail(w, h int) string {
 	pl := m.cfg.PlaylistByName(m.openPlaylist)
 	if pl == nil {
