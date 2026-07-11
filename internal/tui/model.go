@@ -953,6 +953,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "s":
 		m.shuffle = !m.shuffle
+		m.markConfigDirty()
 		if m.shuffle {
 			m.setStatus("shuffle on")
 		} else {
@@ -961,6 +962,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "r":
 		m.repeat = (m.repeat + 1) % 3
+		m.markConfigDirty()
 		m.setStatus([]string{"repeat off", "repeat all", "repeat one"}[m.repeat])
 		return m, nil
 	case "f":

@@ -144,7 +144,9 @@ func TestViewSwitching(t *testing.T) {
 	}
 }
 
-// TestShuffleRepeatToggle: s/r work outside the search input.
+// TestShuffleRepeatToggle: s/r work outside the search input and mark the
+// config dirty so the toggle survives a debounced mid-session save (not just a
+// clean exit) — matching the auto-continue toggle.
 func TestShuffleRepeatToggle(t *testing.T) {
 	m := newTestModel()
 	press(m, "esc") // leave typing
@@ -155,9 +157,16 @@ func TestShuffleRepeatToggle(t *testing.T) {
 	if !m.shuffle {
 		t.Fatal("'s' should toggle shuffle on")
 	}
+	if !m.cfgDirty {
+		t.Fatal("'s' should mark the config dirty so shuffle persists")
+	}
+	m.cfgDirty = false
 	press(m, "r")
 	if m.repeat != repeatAll {
 		t.Fatalf("'r' should advance repeat to repeatAll, got %v", m.repeat)
+	}
+	if !m.cfgDirty {
+		t.Fatal("'r' should mark the config dirty so repeat persists")
 	}
 }
 
