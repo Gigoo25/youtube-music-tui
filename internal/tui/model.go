@@ -430,7 +430,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Apply a deferred resume-seek once the reloaded track is actually up.
 		if m.pendingSeek > 0 && m.hasCurrent && !m.playerState.Loading && m.playerState.Duration > 0 {
 			if m.pendingSeek < m.playerState.Duration-2 {
-				m.player.SeekAbs(m.pendingSeek)
+				m.player.SeekAbs(m.pendingSeek) //nolint:errcheck
 			}
 			m.pendingSeek = 0
 		}
@@ -459,14 +459,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Refresh first: the cached snapshot is up to a tick (2s when idle) old,
 		// and the position reported to D-Bus is pre-seek + offset.
 		m.playerState = m.player.State()
-		m.player.Seek(float64(msg.offsetUS) / 1e6)
+		m.player.Seek(float64(msg.offsetUS) / 1e6) //nolint:errcheck
 		if m.mpris != nil {
 			m.mpris.Seeked(int64(m.playerState.Position*1e6) + msg.offsetUS)
 		}
 		return m, nil
 
 	case mprisSetPosMsg:
-		m.player.SeekAbs(float64(msg.posUS) / 1e6)
+		m.player.SeekAbs(float64(msg.posUS) / 1e6) //nolint:errcheck
 		if m.mpris != nil {
 			m.mpris.Seeked(msg.posUS)
 		}
@@ -474,7 +474,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case mprisSetVolMsg:
 		vol := msg.level * 100
-		m.player.SetVolume(vol)
+		m.player.SetVolume(vol) //nolint:errcheck
 		m.playerState.Volume = vol // don't let the shortcuts bar lag a tick behind
 		return m, nil
 
@@ -962,19 +962,19 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.prevTrack()
 		return m, nil
 	case ">", "shift+right":
-		m.player.Seek(10)
+		m.player.Seek(10) //nolint:errcheck
 		return m, nil
 	case "<", "shift+left":
-		m.player.Seek(-10)
+		m.player.Seek(-10) //nolint:errcheck
 		return m, nil
 	case "+", "=":
-		m.player.VolumeUp()
+		m.player.VolumeUp() //nolint:errcheck
 		return m, nil
 	case "-":
-		m.player.VolumeDown()
+		m.player.VolumeDown() //nolint:errcheck
 		return m, nil
 	case "m":
-		m.player.ToggleMute()
+		m.player.ToggleMute() //nolint:errcheck
 		if m.playerState.Muted {
 			m.setStatus("unmuted")
 		} else {
@@ -2054,7 +2054,7 @@ func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.queue = nil
 			m.queueCursor = 0
 			m.queuePos = 0
-			m.player.Stop()
+			m.player.Stop() //nolint:errcheck
 			m.hasCurrent = false
 			m.markConfigDirty()
 			m.setStatus("queue cleared")
@@ -2229,8 +2229,8 @@ func (m *model) playAt(idx int) {
 	if t.Artist != "" {
 		title += " — " + t.Artist
 	}
-	m.player.SetTitle(title)
-	m.player.Load(t.ID)
+	m.player.SetTitle(title) //nolint:errcheck
+	m.player.Load(t.ID) //nolint:errcheck
 	// No transient "loading" status — the now-playing bar shows load state.
 
 	// Warm the next track's stream URL so auto-advance is instant.
@@ -2429,7 +2429,7 @@ func (m *model) togglePlayback() {
 		m.playAt(idx)
 		return
 	}
-	m.player.PlayPause()
+	m.player.PlayPause() //nolint:errcheck
 }
 
 func (m *model) prevTrack() {
@@ -2438,13 +2438,13 @@ func (m *model) prevTrack() {
 	}
 	// Restart current track if more than 3s in; otherwise go to previous.
 	if m.playerState.Position > 3 {
-		m.player.Seek(-m.playerState.Position)
+		m.player.Seek(-m.playerState.Position) //nolint:errcheck
 		return
 	}
 	if m.queuePos > 0 {
 		m.playAt(m.queuePos - 1)
 	} else {
-		m.player.Seek(-m.playerState.Position)
+		m.player.Seek(-m.playerState.Position) //nolint:errcheck
 	}
 }
 

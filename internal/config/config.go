@@ -112,15 +112,15 @@ func (c *Config) Save() error {
 		return err
 	}
 	tmp := f.Name()
-	defer os.Remove(tmp) // no-op once the rename below succeeds
+	defer os.Remove(tmp) //nolint:errcheck // no-op once the rename below succeeds
 	if _, err := f.Write(data); err != nil {
-		f.Close()
+		f.Close() //nolint:errcheck
 		return err
 	}
 	// Sync before rename: rename is atomic but not durable, so without this a
 	// power loss can surface a truncated config.
 	if err := f.Sync(); err != nil {
-		f.Close()
+		f.Close() //nolint:errcheck
 		return err
 	}
 	if err := f.Close(); err != nil {

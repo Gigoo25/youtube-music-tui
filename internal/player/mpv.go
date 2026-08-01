@@ -149,7 +149,7 @@ func spawnMPV(sockPath string) (*exec.Cmd, error) {
 // New starts mpv and restores the given initial volume (0–150) once connected.
 func New(volume float64) (*Player, error) {
 	sockPath := socketPathFor()
-	os.Remove(sockPath)
+	os.Remove(sockPath) //nolint:errcheck
 
 	cmd, err := spawnMPV(sockPath)
 	if err != nil {
@@ -183,7 +183,7 @@ func New(volume float64) (*Player, error) {
 	p.observeProperties()
 
 	// Restore the saved volume (mpv starts at 100 by default).
-	p.SetVolume(volume)
+	p.SetVolume(volume) //nolint:errcheck
 
 	return p, nil
 }
@@ -191,12 +191,12 @@ func New(volume float64) (*Player, error) {
 // observeProperties (re)subscribes the property observations the state snapshot
 // depends on. Must run after every new IPC connection.
 func (p *Player) observeProperties() {
-	p.send([]any{"observe_property", 1, "time-pos"})
-	p.send([]any{"observe_property", 2, "duration"})
-	p.send([]any{"observe_property", 3, "pause"})
-	p.send([]any{"observe_property", 4, "volume"})
-	p.send([]any{"observe_property", 5, "idle-active"})
-	p.send([]any{"observe_property", 6, "mute"})
+	p.send([]any{"observe_property", 1, "time-pos"}) //nolint:errcheck
+	p.send([]any{"observe_property", 2, "duration"}) //nolint:errcheck
+	p.send([]any{"observe_property", 3, "pause"}) //nolint:errcheck
+	p.send([]any{"observe_property", 4, "volume"}) //nolint:errcheck
+	p.send([]any{"observe_property", 5, "idle-active"}) //nolint:errcheck
+	p.send([]any{"observe_property", 6, "mute"}) //nolint:errcheck
 }
 
 func dialWithRetry(path string, attempts int, delay time.Duration) (net.Conn, error) {
@@ -221,7 +221,7 @@ func reap(c *exec.Cmd) {
 	if c == nil || c.Process == nil {
 		return
 	}
-	c.Process.Kill()
+	c.Process.Kill() //nolint:errcheck
 	c.Wait() //nolint:errcheck
 }
 
@@ -285,7 +285,7 @@ func (p *Player) Load(videoID string) error {
 	// previous track the whole time — a skip must silence it immediately.
 	// (end-file reason "stop" is ignored by scan, so this can't fake a track
 	// ending; the loadfile below restarts playback when the URL arrives.)
-	p.send([]any{"stop"})
+	p.send([]any{"stop"}) //nolint:errcheck
 
 	go func() {
 		// Deliberately not deduped against an in-flight Prefetch of the same id:
@@ -320,7 +320,7 @@ func (p *Player) Load(videoID string) error {
 		p.playingID = videoID
 		p.mu.Unlock()
 
-		p.send([]any{"loadfile", url, "replace"})
+	p.send([]any{"loadfile", url, "replace"}) //nolint:errcheck
 	}()
 	return nil
 }
@@ -792,7 +792,7 @@ func (p *Player) recover() bool {
 		p.mu.Unlock()
 
 		reap(p.cmd)
-		os.Remove(p.sockPath)
+		os.Remove(p.sockPath) //nolint:errcheck
 
 		cmd, err := spawnMPV(p.sockPath)
 		if err == nil {
@@ -819,12 +819,12 @@ func (p *Player) recover() bool {
 // (property observation, volume/mute restore).
 func (p *Player) adoptConn(conn net.Conn) {
 	if p.isClosed() {
-		conn.Close()
+		conn.Close() //nolint:errcheck
 		return
 	}
 	p.mu.Lock()
 	if p.conn != nil {
-		p.conn.Close()
+		p.conn.Close() //nolint:errcheck
 	}
 	p.conn = conn
 	vol := p.state.Volume
@@ -832,8 +832,8 @@ func (p *Player) adoptConn(conn net.Conn) {
 	p.mu.Unlock()
 
 	p.observeProperties()
-	p.SetVolume(vol)
-	p.send([]any{"set_property", "mute", muted})
+	p.SetVolume(vol) //nolint:errcheck
+	p.send([]any{"set_property", "mute", muted}) //nolint:errcheck
 }
 
 // Close shuts the player down. Safe to call more than once.
@@ -848,13 +848,13 @@ func (p *Player) Close() {
 		p.mu.Unlock()
 
 		if conn != nil {
-			conn.Close()
+			conn.Close() //nolint:errcheck
 		}
 		// procMu: if recover() is mid-respawn it finishes first, so the process
 		// killed here is the current one — a freshly respawned mpv can't leak.
 		p.procMu.Lock()
 		reap(p.cmd)
 		p.procMu.Unlock()
-		os.Remove(p.sockPath)
+		os.Remove(p.sockPath) //nolint:errcheck
 	})
 }

@@ -69,7 +69,7 @@ func (c *Client) post(endpoint string, payload map[string]any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 	return io.ReadAll(resp.Body)
 }
 

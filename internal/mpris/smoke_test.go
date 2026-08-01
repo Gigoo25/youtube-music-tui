@@ -16,7 +16,7 @@ func TestSmoke(t *testing.T) {
 	if err != nil {
 		t.Skip("no session bus:", err)
 	}
-	probe.Close()
+	probe.Close() //nolint:errcheck
 
 	var mu sync.Mutex
 	got := map[string]int{}
