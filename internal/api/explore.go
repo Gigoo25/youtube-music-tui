@@ -18,6 +18,27 @@ func rendererVideoType(r map[string]any) string {
 		"musicVideoType"))
 }
 
+// flexRuns returns the text runs of a list row's i-th flex column (nil when the
+// row has no such column).
+func flexRuns(r map[string]any, i int) []any {
+	cols := digSlice(dig(r, "flexColumns"))
+	if i >= len(cols) {
+		return nil
+	}
+	return digSlice(dig(cols[i], "musicResponsiveListItemFlexColumnRenderer", "text", "runs"))
+}
+
+// firstAlbumID returns the album browse id (MPREb…) linked from a byline's runs,
+// or "" when no run links an album page (see Track.AlbumID).
+func firstAlbumID(runs []any) string {
+	for _, run := range runs {
+		if id := str(dig(run, "navigationEndpoint", "browseEndpoint", "browseId")); strings.HasPrefix(id, "MPREb") {
+			return id
+		}
+	}
+	return ""
+}
+
 // extractTwoRowTrack pulls a Track out of a musicTwoRowItemRenderer (carousel
 // card). Only items whose navigation points at a watchEndpoint (i.e. a single
 // song/video) are returned with an ID. Items that identify themselves as
@@ -35,10 +56,11 @@ func extractTwoRowTrack(r map[string]any) Track {
 		t.Title = str(dig(titleRuns[0], "text"))
 	}
 
-	subRuns := digSlice(dig(r, "subtitle", "runs"))
-	texts := extractTexts(subRuns)
-	if len(texts) > 0 {
-		t.Artist = strings.Join(texts, " ")
+	// The byline groups as "Artist • Album • Year" (or "Artist • N views" for a
+	// video card): only the first group is the artist.
+	groups := bylineGroups(digSlice(dig(r, "subtitle", "runs")))
+	if len(groups) > 0 {
+		t.Artist = groups[0]
 	}
 	return t
 }
@@ -52,7 +74,11 @@ func bylineGroups(runs []any) []string {
 	for _, run := range runs {
 		text := str(dig(run, "text"))
 		if strings.TrimSpace(text) == "•" {
-			groups = append(groups, cur)
+			// Empty groups (leading, doubled or trailing separator) are skipped
+			// so group positions stay [artist, album, year].
+			if cur != "" {
+				groups = append(groups, cur)
+			}
 			cur = ""
 			continue
 		}
@@ -79,12 +105,7 @@ func extractPanelTrack(r map[string]any) Track {
 		byline = digSlice(dig(r, "shortBylineText", "runs"))
 	}
 	// The album run links the album page; keep its browse id (see Track.AlbumID).
-	for _, run := range byline {
-		if id := str(dig(run, "navigationEndpoint", "browseEndpoint", "browseId")); strings.HasPrefix(id, "MPREb") {
-			t.AlbumID = id
-			break
-		}
-	}
+	t.AlbumID = firstAlbumID(byline)
 	groups := bylineGroups(byline)
 	if len(groups) > 0 {
 		t.Artist = groups[0]
@@ -220,8 +241,5 @@ func (c *Client) related(videoID string, allowReseed bool) ([]Track, error) {
 		}
 	}
 
-	if len(tracks) > 50 {
-		tracks = tracks[:50]
-	}
-	return CleanTracks(tracks), nil
+	return CleanTracks(dedupeTracks(tracks)), nil
 }

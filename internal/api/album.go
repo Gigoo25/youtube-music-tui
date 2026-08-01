@@ -48,7 +48,9 @@ func AlbumByQuery(c *Client, album, artist string) ([]Track, string, error) {
 	if len(cands) > 0 {
 		return c.albumByID(cands[0].id, artist)
 	}
-	if id := firstBrowseIDWithPrefix(sroot, "MPREb"); id != "" {
+	if id := findBrowseID(sroot, func(be map[string]any) bool {
+		return strings.HasPrefix(str(be["browseId"]), "MPREb")
+	}); id != "" {
 		return c.albumByID(id, artist)
 	}
 	return nil, "", nil
@@ -95,16 +97,7 @@ func (c *Client) albumIDFromDiscography(album, artist string) string {
 	if err != nil {
 		return ""
 	}
-	albums := parseArtistAlbums(broot, 60)
-	if discoID := discographyBrowseID(broot); discoID != "" {
-		dp := c.clientCtx()
-		dp["browseId"] = discoID
-		if dbody, derr := c.post("browse", dp); derr == nil {
-			if droot, perr := parseJSON(dbody); perr == nil {
-				albums = mergeAlbumRefs(albums, parseArtistAlbums(droot, 60))
-			}
-		}
-	}
+	albums := c.withDiscography(parseArtistAlbums(broot, 60), broot)
 	cands := make([]albumCandidate, 0, len(albums))
 	for _, a := range albums {
 		cands = append(cands, albumCandidate{id: a.ID, title: a.Title})
@@ -133,14 +126,17 @@ func (c *Client) albumByID(browseID, fallbackArtist string) ([]Track, string, er
 		return nil, "", err
 	}
 
-	title := sanitizeDisplay(albumTitle(broot))
+	title := sanitizeDisplay(headerTitle(broot, "musicDetailHeaderRenderer", "musicResponsiveHeaderRenderer"))
+	if title == "" {
+		title = "Album"
+	}
 	albumArtist := albumHeaderArtist(broot)
 	if albumArtist == "" {
 		albumArtist = fallbackArtist
 	}
 	tracks, videoRows := parseAlbumTracks(broot, albumArtist)
 	tracks = CleanTracks(tracks)
-	c.remapVideoRows(tracks, videoRows, title)
+	tracks = c.remapVideoRows(tracks, videoRows, title)
 	for i := range tracks {
 		tracks[i].AlbumID = browseID // every row belongs to this album
 	}
@@ -153,9 +149,10 @@ func (c *Client) albumByID(browseID, fallbackArtist string) ([]Track, string, er
 // then shows the song's duration (e.g. 3:12) but plays the longer video. Rows
 // with no findable song version keep the video id (its audio still plays).
 // Lookups run a few at a time; a failed search just leaves that row unchanged.
-func (c *Client) remapVideoRows(tracks []Track, rows []int, albumTitle string) {
+// Returns the rows, with any duplicate id a remap introduced dropped.
+func (c *Client) remapVideoRows(tracks []Track, rows []int, albumTitle string) []Track {
 	if len(rows) == 0 {
-		return
+		return tracks
 	}
 	sem := make(chan struct{}, 4)
 	var wg sync.WaitGroup
@@ -174,8 +171,10 @@ func (c *Client) remapVideoRows(tracks []Track, rows []int, albumTitle string) {
 				if !strings.EqualFold(s.Title, t.Title) {
 					continue
 				}
-				// Same album, or at least the same runtime as the album row.
-				if !strings.EqualFold(s.Album, albumTitle) && s.Duration != t.Duration {
+				// Same album, or at least the same runtime as the album row —
+				// two empty durations match each other but prove nothing.
+				sameRuntime := t.Duration != "" && s.Duration == t.Duration
+				if !strings.EqualFold(s.Album, albumTitle) && !sameRuntime {
 					continue
 				}
 				tracks[i].ID = s.ID
@@ -187,21 +186,28 @@ func (c *Client) remapVideoRows(tracks []Track, rows []int, albumTitle string) {
 		}(idx)
 	}
 	wg.Wait()
+
+	// A remap can land on an id another row already holds (the same song listed
+	// twice on the page); drop the duplicate so the album can't play it twice.
+	out := make([]Track, 0, len(tracks))
+	seen := make(map[string]bool, len(tracks))
+	for _, t := range tracks {
+		addTrack(t, &out, seen)
+	}
+	return out
 }
 
 // listItemVideoType reads the musicVideoType a list row's title links to ("" if
 // the row doesn't carry one).
 func listItemVideoType(r map[string]any) string {
-	cols := digSlice(dig(r, "flexColumns"))
-	if len(cols) == 0 {
-		return ""
-	}
-	runs := digSlice(dig(cols[0], "musicResponsiveListItemFlexColumnRenderer", "text", "runs"))
+	runs := flexRuns(r, 0)
 	if len(runs) == 0 {
 		return ""
 	}
-	return str(dig(runs[0], "navigationEndpoint", "watchEndpoint",
-		"watchEndpointMusicSupportedConfigs", "watchEndpointMusicConfig", "musicVideoType"))
+	if run, ok := runs[0].(map[string]any); ok {
+		return rendererVideoType(run)
+	}
+	return ""
 }
 
 // albumCandidate is an album search hit: browse id + display title.
@@ -219,11 +225,7 @@ func albumSearchCandidates(root any) []albumCandidate {
 			if !strings.HasPrefix(id, "MPREb") {
 				return
 			}
-			cols := digSlice(dig(r, "flexColumns"))
-			if len(cols) == 0 {
-				return
-			}
-			runs := digSlice(dig(cols[0], "musicResponsiveListItemFlexColumnRenderer", "text", "runs"))
+			runs := flexRuns(r, 0)
 			if len(runs) == 0 {
 				return
 			}
@@ -244,9 +246,10 @@ func albumSearchCandidates(root any) []albumCandidate {
 }
 
 // pickAlbumCandidate chooses the candidate whose title matches the wanted album
-// name: exact (case-insensitive), then prefix in either direction (covers
-// "… (Deluxe Edition)" suffixes), then substring. ok is false when nothing
-// matches — the caller decides what to fall back to.
+// name, in tiers: exact (case-insensitive), then candidate-prefix (covers
+// "… (Deluxe Edition)" suffixes), then substring, then — last resort — the
+// wanted name prefixing the candidate. ok is false when nothing matches — the
+// caller decides what to fall back to.
 func pickAlbumCandidate(cands []albumCandidate, want string) (id string, ok bool) {
 	w := strings.ToLower(strings.TrimSpace(want))
 	if w == "" || len(cands) == 0 {
@@ -260,7 +263,13 @@ func pickAlbumCandidate(cands []albumCandidate, want string) (id string, ok bool
 	}
 	// Candidate extends the wanted name ("X (Deluxe Edition)" for "X" is fine).
 	for _, c := range cands {
-		if strings.HasPrefix(norm(c.title), w) || strings.Contains(norm(c.title), w) {
+		if strings.HasPrefix(norm(c.title), w) {
+			return c.id, true
+		}
+	}
+	// Wanted name appears somewhere inside the candidate.
+	for _, c := range cands {
+		if strings.Contains(norm(c.title), w) {
 			return c.id, true
 		}
 	}
@@ -289,8 +298,8 @@ func albumHeaderArtist(root any) string {
 				if t == "Album" || t == "Single" || t == "EP" {
 					continue
 				}
-				if len(t) == 4 && t >= "1900" && t <= "2099" {
-					continue // a year
+				if isYear(t) {
+					continue
 				}
 				return t
 			}
@@ -308,9 +317,6 @@ func parseAlbumTracks(root any, albumArtist string) (out []Track, videoRows []in
 	seen := map[string]bool{}
 	walkRenderers(root, "musicResponsiveListItemRenderer", func(r map[string]any) {
 		t := extractTrack(r)
-		if t.ID == "" || t.Title == "" || seen[t.ID] {
-			return
-		}
 		if t.Duration == "" {
 			fc := digSlice(dig(r, "fixedColumns"))
 			if len(fc) > 0 {
@@ -323,19 +329,23 @@ func parseAlbumTracks(root any, albumArtist string) (out []Track, videoRows []in
 		if t.Artist == "" {
 			t.Artist = albumArtist
 		}
-		if vt := listItemVideoType(r); vt != "" && vt != videoTypeATV {
-			videoRows = append(videoRows, len(out))
+		row := len(out)
+		addTrack(t, &out, seen)
+		if len(out) == row {
+			return // no id/title, or a row already seen
 		}
-		seen[t.ID] = true
-		out = append(out, t)
+		if vt := listItemVideoType(r); vt != "" && vt != videoTypeATV {
+			videoRows = append(videoRows, row)
+		}
 	})
 	return out, videoRows
 }
 
-// albumTitle pulls the album's display name from whichever header renderer the
-// browse response uses (the layout has changed across API versions).
-func albumTitle(root any) string {
-	for _, key := range []string{"musicDetailHeaderRenderer", "musicResponsiveHeaderRenderer"} {
+// headerTitle pulls a page's display name from the title of whichever of the
+// given header renderers the browse response uses (the layout has changed
+// across API versions). "" when none of them carries a title.
+func headerTitle(root any, keys ...string) string {
+	for _, key := range keys {
 		if h := findRenderer(root, key); h != nil {
 			runs := digSlice(dig(h, "title", "runs"))
 			if len(runs) > 0 {
@@ -345,7 +355,7 @@ func albumTitle(root any) string {
 			}
 		}
 	}
-	return "Album"
+	return ""
 }
 
 // findRenderer recursively returns the first object stored under the given key.
@@ -370,25 +380,24 @@ func findRenderer(node any, key string) map[string]any {
 	return nil
 }
 
-// firstBrowseIDWithPrefix recursively finds the first browseEndpoint browseId
-// that starts with the given prefix (e.g. "MPREb" for albums).
-func firstBrowseIDWithPrefix(node any, prefix string) string {
+// findBrowseID recursively returns the browseId of the first browseEndpoint
+// object satisfying want ("" when none does). want must reject an empty
+// browseId, since "" doubles as "not found".
+func findBrowseID(node any, want func(be map[string]any) bool) string {
 	switch v := node.(type) {
 	case map[string]any:
-		if be, ok := v["browseEndpoint"].(map[string]any); ok {
-			if id, ok := be["browseId"].(string); ok && strings.HasPrefix(id, prefix) {
-				return id
-			}
+		if be, ok := v["browseEndpoint"].(map[string]any); ok && want(be) {
+			return str(be["browseId"])
 		}
 		for _, child := range v {
-			if r := firstBrowseIDWithPrefix(child, prefix); r != "" {
-				return r
+			if id := findBrowseID(child, want); id != "" {
+				return id
 			}
 		}
 	case []any:
 		for _, child := range v {
-			if r := firstBrowseIDWithPrefix(child, prefix); r != "" {
-				return r
+			if id := findBrowseID(child, want); id != "" {
+				return id
 			}
 		}
 	}

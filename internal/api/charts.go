@@ -82,11 +82,9 @@ func parseJSON(body []byte) (map[string]any, error) {
 // musicResponsiveListItemRenderer and extracts valid song tracks.
 func collectListItemTracks(node any) []Track {
 	var out []Track
+	seen := map[string]bool{}
 	walkRenderers(node, "musicResponsiveListItemRenderer", func(r map[string]any) {
-		t := extractTrack(r)
-		if t.ID != "" && t.Title != "" {
-			out = append(out, t)
-		}
+		addTrack(extractTrack(r), &out, seen)
 	})
 	return out
 }

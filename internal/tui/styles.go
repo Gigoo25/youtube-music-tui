@@ -7,14 +7,10 @@ import "github.com/charmbracelet/lipgloss"
 const (
 	iconPlay     = "" // nf-fa-play
 	iconPause    = "" // nf-fa-pause
-	iconNext     = "" // nf-fa-step_forward
-	iconPrev     = "" // nf-fa-step_backward
 	iconShuffle  = "" // nf-fa-random
 	iconRepeat   = "" // nf-fa-repeat
 	iconPlaylist = "" // nf-fa-music
 	iconSearch   = "" // nf-fa-search (magnifying glass) — search tab + filter
-	iconDownload = "" // nf-fa-download
-	iconQuit     = "" // nf-fa-times
 	iconVolume   = "" // nf-fa-headphones (app brand)
 	iconHeart    = "" // nf-fa-heart
 	iconAutoplay = "" // nf-fa-forward (auto-continue; U+F534 infinity was dropped in Nerd Fonts v3)
@@ -121,6 +117,9 @@ var (
 	styleSecondaryBold lipgloss.Style
 	styleHeart         lipgloss.Style
 	styleSelected      lipgloss.Style
+	styleConfirm       lipgloss.Style
+	styleErrorBold     lipgloss.Style
+	styleSuccessBold   lipgloss.Style
 	styleShell         lipgloss.Style
 	styleSidebarBox    lipgloss.Style
 	styleSearchBox     lipgloss.Style
@@ -157,6 +156,14 @@ func applyTheme(t theme) {
 		Foreground(colorBackground).
 		Background(colorPrimary).
 		Bold(true)
+	// Confirmation prompt in the status line, same shape on the warning colour.
+	styleConfirm = lipgloss.NewStyle().
+		Foreground(colorBackground).
+		Background(colorWarning).
+		Bold(true)
+	// Bold variants for the now-bar flag glyphs (built once, not per frame).
+	styleErrorBold = lipgloss.NewStyle().Foreground(colorError).Bold(true)
+	styleSuccessBold = lipgloss.NewStyle().Foreground(colorSuccess).Bold(true)
 
 	styleShell = lipgloss.NewStyle().
 		Border(lipgloss.NormalBorder()).

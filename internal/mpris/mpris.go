@@ -9,7 +9,6 @@ package mpris
 import (
 	"fmt"
 	"os"
-	"sync"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/introspect"
@@ -63,11 +62,12 @@ type Server struct {
 	props   *prop.Properties
 	busName string
 
-	mu        sync.Mutex
+	// Change-detection state, written only by Update (see its comment).
 	trackSeq  int
 	lastKey   string // change detection for Metadata
 	lastStat  string
 	lastVol   float64
+	lastPos   int64
 	trackPath dbus.ObjectPath
 }
 
@@ -145,9 +145,14 @@ func New(h Handlers) (*Server, error) {
 
 	s := &Server{conn: conn, lastVol: -1}
 
+	// Runs with prop.Properties.mut held (see prop.Set), while SetVolume forwards
+	// through bubbletea's Program.Send, which blocks on an unbuffered channel. The
+	// Update goroutine holds nothing but wants that same mut in props.SetMust, so
+	// calling SetVolume synchronously here deadlocks the app on any tick that races
+	// a `playerctl volume` set. Hand off to a goroutine: this only forwards a message.
 	volumeCb := func(c *prop.Change) *dbus.Error {
 		if v, ok := c.Value.(float64); ok && h.SetVolume != nil {
-			h.SetVolume(v)
+			go h.SetVolume(v)
 		}
 		return nil
 	}
@@ -246,8 +251,7 @@ func (s *Server) Update(n Now) {
 	if s == nil || s.props == nil {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// ponytail: no lock — Update is called only from the bubbletea Update goroutine.
 
 	// Metadata: rebuild + emit only when the track identity changes.
 	key := n.Title + "\x00" + n.Artist + "\x00" + n.Album + "\x00" + fmt.Sprint(n.LengthUS)
@@ -270,12 +274,15 @@ func (s *Server) Update(n Now) {
 	}
 
 	// Position is read-on-demand by clients; update the stored value without a
-	// PropertiesChanged signal.
-	s.props.SetMust(playerIface, "Position", n.PositionUS)
+	// PropertiesChanged signal. Skip when unchanged so a paused/stopped tick
+	// (twice a second) doesn't take prop.mut to re-store an identical variant.
+	if n.PositionUS != s.lastPos {
+		s.lastPos = n.PositionUS
+		s.props.SetMust(playerIface, "Position", n.PositionUS)
+	}
 }
 
-// metadata builds the xesam/mpris metadata dict for the current track. Must be
-// called with s.mu held.
+// metadata builds the xesam/mpris metadata dict for the current track.
 func (s *Server) metadata(n Now) map[string]dbus.Variant {
 	if !n.HasTrack {
 		s.trackPath = ""
@@ -305,11 +312,11 @@ func (s *Server) Seeked(posUS int64) {
 	s.conn.Emit(objectPath, playerIface+".Seeked", posUS) //nolint:errcheck
 }
 
-// Close releases the bus name and connection.
+// Close releases the bus name. The connection is the shared session bus, which
+// dbus.Conn.Close must not be called on.
 func (s *Server) Close() {
 	if s == nil || s.conn == nil {
 		return
 	}
 	s.conn.ReleaseName(s.busName) //nolint:errcheck
-	s.conn.Close()                //nolint:errcheck
 }

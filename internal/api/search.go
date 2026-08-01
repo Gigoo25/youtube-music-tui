@@ -1,9 +1,6 @@
 package api
 
-import (
-	"encoding/json"
-	"strings"
-)
+import "encoding/json"
 
 // songsFilterParam restricts a YouTube Music search to the "Songs" tab — the
 // official audio tracks (videoType ATV) rather than music videos (OMV), so the
@@ -46,7 +43,9 @@ func (c *Client) SearchSongsPage(query, continuation string) ([]Track, string, e
 
 	var tracks []Track
 	seen := map[string]bool{}
-	collectSongRows(root, &tracks, seen)
+	walkRenderers(root, "musicResponsiveListItemRenderer", func(r map[string]any) {
+		addTrack(extractSongRow(r), &tracks, seen)
+	})
 	return CleanTracks(tracks), findSearchContinuation(root), nil
 }
 
@@ -81,24 +80,6 @@ func findSearchContinuation(node any) string {
 	return ""
 }
 
-// collectSongRows walks the search response for musicResponsiveListItemRenderer
-// rows and parses each as a song.
-func collectSongRows(node any, out *[]Track, seen map[string]bool) {
-	switch v := node.(type) {
-	case map[string]any:
-		if r, ok := v["musicResponsiveListItemRenderer"].(map[string]any); ok {
-			addTrack(extractSongRow(r), out, seen)
-		}
-		for _, child := range v {
-			collectSongRows(child, out, seen)
-		}
-	case []any:
-		for _, child := range v {
-			collectSongRows(child, out, seen)
-		}
-	}
-}
-
 // extractSongRow parses a search "Songs" row. flexColumn[0] is the title (and may
 // carry the watch endpoint); flexColumn[1] is "Artist • Album • Duration" (some
 // rows omit the album). The videoId is most reliably in playlistItemData.
@@ -106,15 +87,9 @@ func extractSongRow(r map[string]any) Track {
 	var t Track
 	t.ID = str(dig(r, "playlistItemData", "videoId"))
 
-	flex := digSlice(dig(r, "flexColumns"))
-	col := func(i int) []any {
-		if i >= len(flex) {
-			return nil
-		}
-		return digSlice(dig(flex[i], "musicResponsiveListItemFlexColumnRenderer", "text", "runs"))
-	}
+	byline := flexRuns(r, 1)
 
-	if titleRuns := col(0); len(titleRuns) > 0 {
+	if titleRuns := flexRuns(r, 0); len(titleRuns) > 0 {
 		t.Title = str(dig(titleRuns[0], "text"))
 		if t.ID == "" {
 			t.ID = str(dig(titleRuns[0], "navigationEndpoint", "watchEndpoint", "videoId"))
@@ -124,26 +99,25 @@ func extractSongRow(r map[string]any) Track {
 	// The album run links the album page — keep its browse id so "open album"
 	// can browse directly instead of relying on search (which can't find some
 	// albums, e.g. deluxe editions, by name).
-	for _, run := range col(1) {
-		if id := str(dig(run, "navigationEndpoint", "browseEndpoint", "browseId")); strings.HasPrefix(id, "MPREb") {
-			t.AlbumID = id
-			break
-		}
-	}
+	t.AlbumID = firstAlbumID(byline)
 
-	// Second column: meaningful runs are Artist [, Album], Duration (the " • "
-	// separator runs are dropped by extractTexts).
-	texts := extractTexts(col(1))
-	switch {
-	case len(texts) >= 3:
+	// Second column: meaningful runs are Artist [, Album][, Duration] (the " • "
+	// separator runs are dropped by extractTexts). The trailing text is the
+	// duration only when it reads as one; otherwise it is the album, so a row
+	// with an album but no duration doesn't print the album name as a runtime.
+	texts := extractTexts(byline)
+	if len(texts) > 0 {
 		t.Artist = texts[0]
-		t.Album = texts[1]
-		t.Duration = texts[len(texts)-1]
-	case len(texts) == 2:
-		t.Artist = texts[0]
-		t.Duration = texts[1]
-	case len(texts) == 1:
-		t.Artist = texts[0]
+	}
+	if len(texts) > 1 {
+		if last := texts[len(texts)-1]; durationRe.MatchString(last) {
+			t.Duration = last
+			if len(texts) > 2 {
+				t.Album = texts[1]
+			}
+		} else {
+			t.Album = texts[1]
+		}
 	}
 
 	if t.ID == "" {

@@ -71,19 +71,18 @@ func run() error {
 		defer srv.Close()
 	}
 
-	finalModel, err := prog.Run()
-	if err != nil {
-		return fmt.Errorf("error: %w", err)
-	}
+	// Run to completion, then always persist: bubbletea converts a panic inside
+	// Update into a returned error, so an abnormal exit must still save.
+	_, runErr := prog.Run()
 
-	cfg.Volume = p.State().Volume
 	// Capture the final queue/playback state for next launch. The model owns the
-	// authoritative queue, so pull it via the interface before saving.
-	if sp, ok := finalModel.(interface{ SnapshotSession() }); ok {
-		sp.SnapshotSession()
-	}
+	// authoritative session state (queue, position, volume).
+	m.SnapshotSession()
 	if err := cfg.Save(); err != nil {
 		fmt.Fprintf(os.Stderr, "save config: %v\n", err)
+	}
+	if runErr != nil {
+		return fmt.Errorf("error: %w", runErr)
 	}
 	return nil
 }

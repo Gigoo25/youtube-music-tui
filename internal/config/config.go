@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -59,7 +60,8 @@ func Load() (*Config, error) {
 	}
 
 	appDir := filepath.Join(dir, "ytmusic")
-	if err := os.MkdirAll(appDir, 0755); err != nil {
+	// 0700 to match the 0600 config inside — this is private listening data.
+	if err := os.MkdirAll(appDir, 0700); err != nil {
 		return nil, err
 	}
 
@@ -76,8 +78,17 @@ func Load() (*Config, error) {
 
 	if err := json.Unmarshal(data, cfg); err != nil {
 		// Don't silently wipe a corrupt config — preserve it for recovery and
-		// start fresh.
-		os.Rename(path, path+".corrupt")
+		// start fresh. Never clobber an earlier .corrupt: it may hold the only
+		// recoverable favorites/history.
+		corrupt := path + ".corrupt"
+		if _, statErr := os.Stat(corrupt); statErr == nil {
+			corrupt += "." + time.Now().Format("20060102-150405")
+		}
+		if renameErr := os.Rename(path, corrupt); renameErr != nil {
+			fmt.Fprintf(os.Stderr, "config: unreadable (%v) and could not be preserved (%v); starting fresh\n", err, renameErr)
+		} else {
+			fmt.Fprintf(os.Stderr, "config: unreadable (%v); moved to %s, starting fresh\n", err, corrupt)
+		}
 		return &Config{path: path, Volume: 100}, nil
 	}
 	cfg.path = path
@@ -92,10 +103,27 @@ func (c *Config) Save() error {
 	if err != nil {
 		return err
 	}
-	tmp := c.path + ".tmp"
-	// 0600: the config carries the user's full listening history/favorites —
-	// no reason for it to be world-readable.
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	// Unique temp name: instances coexist (mpris suffixes its bus name per pid),
+	// and a shared .tmp lets one rename a half-written file over the config.
+	// CreateTemp already creates 0600 — the config carries the user's full
+	// listening history/favorites, no reason for it to be world-readable.
+	f, err := os.CreateTemp(filepath.Dir(c.path), "config-*.json")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp) // no-op once the rename below succeeds
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	// Sync before rename: rename is atomic but not durable, so without this a
+	// power loss can surface a truncated config.
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, c.path)
@@ -195,8 +223,9 @@ func (c *Config) AddHistory(t api.Track) {
 		return
 	}
 	entry := HistoryEntry{Track: t, PlayedAt: time.Now()}
-	// Insert at the front; once History reaches maxHistory this shifts in place
-	// and reuses the backing array instead of allocating a fresh slice each play.
+	// Prepend (newest first). Insert shifts the existing entries right and grows
+	// the slice, so at cap it allocates a fresh backing array — 500 entries once
+	// per play isn't worth restructuring the (newest-first) read sites for.
 	c.History = slices.Insert(c.History, 0, entry)
 	if len(c.History) > maxHistory {
 		c.History = c.History[:maxHistory]

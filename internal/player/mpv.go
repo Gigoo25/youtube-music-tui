@@ -48,12 +48,12 @@ type Player struct {
 	procMu     sync.Mutex // serializes mpv process kill/spawn (recover vs Close)
 	sockPath   string
 	conn       net.Conn
-	mu         sync.Mutex  // protects state, conn, reqID, loadGen, loadCancel, urlCache, inflight
+	mu         sync.Mutex  // protects state, conn, reqID, loadGen, loadCancel, playingID, urlCache, inflight
 	sendCh     chan []byte // serialized writes
 	reqID      int
 	loadGen    int                // epoch token: cancels stale async loads
 	loadCancel context.CancelFunc // cancels the in-flight load's yt-dlp, if any
-	currentID  string             // videoID of the active load (cache invalidation on stream error)
+	playingID  string             // videoID last handed to mpv via loadfile (cache invalidation on stream error)
 	state      State
 	lastErr    string               // most recent load/playback failure, for the UI
 	restarted  bool                 // set after an automatic mpv respawn; polled by the TUI
@@ -64,6 +64,8 @@ type Player struct {
 	done       chan struct{}        // signalled on natural end-of-file
 	closed     chan struct{}        // closed once on shutdown
 	closeOnce  sync.Once
+	baseCtx    context.Context    // parent of every resolve ctx; cancelled by Close
+	baseCancel context.CancelFunc // set in New, then immutable
 }
 
 // cachedURL is a yt-dlp-resolved stream URL with the time it was resolved.
@@ -169,11 +171,11 @@ func New(volume float64) (*Player, error) {
 
 	conn, err := dialWithRetry(sockPath, 30, 100*time.Millisecond)
 	if err != nil {
-		cmd.Process.Kill()
-		cmd.Wait() // reap; don't leave a zombie until the app exits
+		reap(cmd)
 		return nil, fmt.Errorf("connect mpv IPC: %w", err)
 	}
 	p.conn = conn
+	p.baseCtx, p.baseCancel = context.WithCancel(context.Background())
 
 	go p.writeLoop()
 	go p.readLoop()
@@ -212,6 +214,17 @@ func dialWithRetry(path string, attempts int, delay time.Duration) (net.Conn, er
 	return nil, err
 }
 
+// reap kills c and waits for it so a dead mpv never lingers as a zombie. Nil-safe
+// and idempotent: Kill on an already-exited process and a repeated Wait both just
+// return errors we don't care about.
+func reap(c *exec.Cmd) {
+	if c == nil || c.Process == nil {
+		return
+	}
+	c.Process.Kill()
+	c.Wait() //nolint:errcheck
+}
+
 func (p *Player) writeLoop() {
 	for {
 		select {
@@ -239,8 +252,7 @@ func (p *Player) beginLoad(videoID string) (int, context.Context) {
 		p.loadCancel() // kill any in-flight yt-dlp from the superseded load
 	}
 	p.loadGen++
-	p.currentID = videoID
-	ctx, cancel := context.WithTimeout(context.Background(), loadTimeout)
+	ctx, cancel := context.WithTimeout(p.baseCtx, loadTimeout)
 	p.loadCancel = cancel
 	p.state.Position = 0
 	p.state.Duration = 0
@@ -264,6 +276,7 @@ func (p *Player) Load(videoID string) error {
 			p.loadCancel() // no extraction for this load; release its ctx timer
 			p.loadCancel = nil
 		}
+		p.playingID = videoID
 		p.mu.Unlock()
 		return p.send([]any{"loadfile", url, "replace"})
 	}
@@ -290,16 +303,21 @@ func (p *Player) Load(videoID string) error {
 			p.mu.Unlock()
 			return // a newer load superseded this one
 		}
+		if p.loadCancel != nil {
+			p.loadCancel() // extraction is done either way; release its ctx timer
+			p.loadCancel = nil
+		}
 		if err != nil {
 			p.state.Loading = false
 			if errors.Is(err, errNoYtdlp) {
 				p.lastErr = "yt-dlp not found in PATH"
 			} else {
-				p.lastErr = "could not resolve stream (yt-dlp failed)"
+				p.lastErr = "could not resolve stream: " + err.Error()
 			}
 			p.mu.Unlock()
 			return
 		}
+		p.playingID = videoID
 		p.mu.Unlock()
 
 		p.send([]any{"loadfile", url, "replace"})
@@ -321,7 +339,7 @@ func (p *Player) Prefetch(videoID string) {
 		defer p.releaseResolve(videoID)
 		// Own timeout, deliberately not tied to loadCancel: a prefetch warms a
 		// future track and must survive the current load being superseded.
-		ctx, cancel := context.WithTimeout(context.Background(), loadTimeout)
+		ctx, cancel := context.WithTimeout(p.baseCtx, loadTimeout)
 		defer cancel()
 		if url, resolved, _ := extractURL(ctx, videoID); resolved {
 			p.cachePut(videoID, url)
@@ -336,8 +354,8 @@ func (p *Player) Prefetch(videoID string) {
 func (p *Player) claimResolve(videoID string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if c, ok := p.urlCache[videoID]; ok && time.Since(c.at) <= urlTTL {
-		return false
+	if _, ok := p.cachedLocked(videoID); ok {
+		return false // already resolved and still fresh
 	}
 	if _, ok := p.inflight[videoID]; ok {
 		return false
@@ -355,14 +373,17 @@ func (p *Player) releaseResolve(videoID string) {
 	p.mu.Unlock()
 }
 
+// cachedLocked returns videoID's cached URL if present and still inside urlTTL.
+// Caller holds p.mu.
+func (p *Player) cachedLocked(videoID string) (string, bool) {
+	c, ok := p.urlCache[videoID]
+	return c.url, ok && time.Since(c.at) <= urlTTL
+}
+
 func (p *Player) cacheGet(videoID string) (string, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	c, ok := p.urlCache[videoID]
-	if !ok || time.Since(c.at) > urlTTL {
-		return "", false
-	}
-	return c.url, true
+	return p.cachedLocked(videoID)
 }
 
 func (p *Player) cachePut(videoID, url string) {
@@ -381,15 +402,13 @@ func (p *Player) cachePut(videoID, url string) {
 	p.urlCache[videoID] = cachedURL{url: url, at: time.Now()}
 }
 
-// LoadURL sends a pre-resolved URL directly to mpv without yt-dlp extraction.
-func (p *Player) LoadURL(url string) error {
-	p.beginLoad("")
-	return p.send([]any{"loadfile", url, "replace"})
-}
-
 // errNoYtdlp marks a resolve failure caused by yt-dlp being absent from PATH,
 // so the UI can show an actionable message instead of a generic one.
 var errNoYtdlp = errors.New("yt-dlp not found in PATH")
+
+// ytdlpPath resolves yt-dlp's location once: PATH doesn't change under a running
+// process, and LookPath otherwise re-walked it on every Load miss and Prefetch.
+var ytdlpPath = sync.OnceValues(func() (string, error) { return exec.LookPath("yt-dlp") })
 
 // extractURL resolves a direct stream URL for videoID via yt-dlp. There is no
 // watch-page-URL fallback: mpv runs with --ytdl=no, so handing it a watch page
@@ -404,7 +423,7 @@ func extractURL(ctx context.Context, videoID string) (url string, resolved bool,
 	}
 	ytURL := "https://www.youtube.com/watch?v=" + videoID
 
-	ytdlp, lookErr := exec.LookPath("yt-dlp")
+	ytdlp, lookErr := ytdlpPath()
 	if lookErr != nil {
 		return "", false, errNoYtdlp
 	}
@@ -416,6 +435,14 @@ func extractURL(ctx context.Context, videoID string) (url string, resolved bool,
 		"--extractor-args", "youtube:player_client=default,-tv",
 		"-f", "bestaudio", "-g", ytURL).Output()
 	if err != nil {
+		// Output() stashes stderr on ExitError; surface its tail so age-gated,
+		// geo-blocked and bot-check failures stay distinguishable in the UI.
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			if reason := ytdlpReason(ee.Stderr); reason != "" {
+				return "", false, fmt.Errorf("yt-dlp: %s", reason)
+			}
+		}
 		return "", false, err
 	}
 	url = strings.TrimSpace(string(bytes.TrimRight(out, "\n")))
@@ -423,6 +450,17 @@ func extractURL(ctx context.Context, videoID string) (url string, resolved bool,
 		return "", false, fmt.Errorf("yt-dlp returned no URL")
 	}
 	return url, true, nil
+}
+
+// ytdlpReason condenses yt-dlp's stderr to its last non-empty line, capped so a
+// verbose traceback can't flood the one-line UI error slot.
+func ytdlpReason(stderr []byte) string {
+	lines := strings.Split(strings.TrimSpace(string(stderr)), "\n")
+	msg := strings.TrimSpace(lines[len(lines)-1])
+	if len(msg) > 200 {
+		msg = msg[:200]
+	}
+	return msg
 }
 
 // validVideoID reports whether s looks like a YouTube video id (URL-safe base64
@@ -578,13 +616,16 @@ func (p *Player) send(cmd []any) error {
 	b, _ := json.Marshal(msg)
 	b = append(b, '\n')
 
-	// sendCh is never closed; the closed channel guards against enqueueing after
-	// shutdown (and unblocks if writeLoop has already exited with a full buffer).
+	// sendCh is never closed. This was a three-way select including <-p.closed,
+	// but Go picks uniformly among ready cases, so post-Close sends still enqueued
+	// half the time — and the default made the closed case useless as an unblocker.
+	if p.isClosed() {
+		return nil
+	}
 	select {
-	case <-p.closed:
 	case p.sendCh <- b:
 	default:
-		// channel full; drop command
+		// channel full (writeLoop wedged); drop the command rather than block
 	}
 	return nil
 }
@@ -616,7 +657,8 @@ func (p *Player) readLoop() {
 		conn := p.conn
 		p.mu.Unlock()
 		if conn == nil {
-			break
+			// Only Close nils conn — a normal shutdown, not an engine failure.
+			return
 		}
 
 		start := time.Now()
@@ -670,7 +712,7 @@ func (p *Player) scan(conn net.Conn) {
 				p.mu.Lock()
 				p.state.Loading = false
 				p.lastErr = "playback failed (stream error)"
-				delete(p.urlCache, p.currentID)
+				delete(p.urlCache, p.playingID)
 				p.mu.Unlock()
 			}
 			continue
@@ -749,12 +791,7 @@ func (p *Player) recover() bool {
 		p.respawns++
 		p.mu.Unlock()
 
-		// Reap the dead process (Kill is a no-op if it's already gone, and a
-		// repeated Wait just returns an error we don't care about).
-		if p.cmd != nil && p.cmd.Process != nil {
-			p.cmd.Process.Kill()
-			p.cmd.Wait() //nolint:errcheck
-		}
+		reap(p.cmd)
 		os.Remove(p.sockPath)
 
 		cmd, err := spawnMPV(p.sockPath)
@@ -771,8 +808,7 @@ func (p *Player) recover() bool {
 				p.adoptConn(conn)
 				return true
 			}
-			cmd.Process.Kill()
-			cmd.Wait() //nolint:errcheck
+			reap(cmd)
 		}
 		p.procMu.Unlock()
 		time.Sleep(time.Second)
@@ -804,11 +840,9 @@ func (p *Player) adoptConn(conn net.Conn) {
 func (p *Player) Close() {
 	p.closeOnce.Do(func() {
 		close(p.closed) // stops writeLoop and the reconnect loop; gates send()
+		p.baseCancel()  // kills every in-flight yt-dlp: current load and prefetches
 
 		p.mu.Lock()
-		if p.loadCancel != nil {
-			p.loadCancel() // kill any in-flight yt-dlp extraction
-		}
 		conn := p.conn
 		p.conn = nil
 		p.mu.Unlock()
@@ -819,10 +853,7 @@ func (p *Player) Close() {
 		// procMu: if recover() is mid-respawn it finishes first, so the process
 		// killed here is the current one — a freshly respawned mpv can't leak.
 		p.procMu.Lock()
-		if p.cmd != nil && p.cmd.Process != nil {
-			p.cmd.Process.Kill()
-			p.cmd.Wait() //nolint:errcheck
-		}
+		reap(p.cmd)
 		p.procMu.Unlock()
 		os.Remove(p.sockPath)
 	})

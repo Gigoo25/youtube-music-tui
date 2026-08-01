@@ -45,11 +45,40 @@ func fmtDur(secs float64) string {
 	return fmt.Sprintf("%d:%02d", s/60, s%60)
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
+// rowLR lays out a list row as `left` plus a right-aligned `right` column,
+// exactly w display columns wide. The left side is cropped when the two would
+// collide, and the composed row is clamped to w: lipgloss's .Width() sets a
+// minimum, not a maximum, so an overlong row would otherwise wrap onto a second
+// line and push the list past its height budget.
+func rowLR(left, right string, w int) string {
+	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
+	if gap < 1 {
+		left = truncate2(left, w-lipgloss.Width(right)-1)
+		gap = w - lipgloss.Width(left) - lipgloss.Width(right)
+		if gap < 1 {
+			gap = 1
+		}
 	}
-	return b
+	return truncate2(left+strings.Repeat(" ", gap)+right, w)
+}
+
+// listRow renders a simple (non-track) list row: cursor marker, optional "N. "
+// number, label, and a right-aligned column. Shared by the playlist picker, the
+// playlists list and the genre picker so they stay visually identical.
+func listRow(numStr, label, right string, selected, focused bool, w int) string {
+	marker := "  "
+	if selected {
+		marker = "▸ "
+	}
+	if selected && focused {
+		// Whole-row inverse highlight; the caller-visible text is plain here.
+		return styleSelected.Width(w).Render(rowLR(marker+numStr+label, right, w))
+	}
+	markerStr := marker
+	if selected {
+		markerStr = stylePrimary.Render(marker)
+	}
+	return rowLR(markerStr+styleDim.Render(numStr)+styleText.Render(label), styleDim.Render(right), w)
 }
 
 // padRight pads s with spaces (or crops it) so its display width is exactly n.
@@ -152,8 +181,12 @@ func (m *model) View() string {
 	// excess from the bottom.
 	inner = padToHeight(inner, m.height-2)
 
-	// Pin the shell to the full terminal height (border consumes 2 rows).
-	return styleShell.Width(innerW).Height(m.height - 2).Render(inner)
+	// Pin the shell to the full terminal height (border consumes 2 rows) and
+	// hard-clamp both axes: lipgloss Width/Height are minimums, so an over-wide
+	// row inside would wrap and push the frame past the terminal.
+	// ponytail: one guard here beats width math in every renderer.
+	out := styleShell.Width(innerW).MaxWidth(m.width).Render(inner)
+	return padToHeight(out, m.height)
 }
 
 // viewIcon returns the distinct glyph for a view, shown in the sidebar tab and
@@ -359,30 +392,8 @@ func (m *model) renderPlaylistPick(w, h int) string {
 			label = pls[i].Name
 			right = fmt.Sprintf("%d tracks", len(pls[i].Tracks))
 		}
-		selected := i == m.pickCursor
-
-		if selected && focused {
-			plain := "▸ " + label
-			gap := w - lipgloss.Width(plain) - lipgloss.Width(right)
-			if gap < 1 {
-				plain = truncate(plain, w-lipgloss.Width(right)-1)
-				gap = max(1, w-lipgloss.Width(plain)-lipgloss.Width(right))
-			}
-			rows = append(rows, styleSelected.Width(w).Render(plain+strings.Repeat(" ", gap)+right))
-			continue
-		}
-		marker := "  "
-		if selected {
-			marker = stylePrimary.Render("▸ ")
-		}
-		left := marker + styleText.Render(label)
-		rightStr := styleDim.Render(right)
-		gap := w - lipgloss.Width(left) - lipgloss.Width(rightStr)
-		if gap < 1 {
-			left = truncate2(left, w-lipgloss.Width(rightStr)-1)
-			gap = max(1, w-lipgloss.Width(left)-lipgloss.Width(rightStr))
-		}
-		rows = append(rows, left+strings.Repeat(" ", gap)+rightStr)
+		// ponytail: the sentinel row is just a label with no number and no count.
+		rows = append(rows, listRow("", label, right, i == m.pickCursor, focused, w))
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, heading, strings.Join(rows, "\n"))
 }
@@ -405,38 +416,8 @@ func (m *model) renderPlaylists(w, h int) string {
 	var rows []string
 	for i := start; i < end; i++ {
 		pl := pls[i]
-		selected := i == m.playlistCursor
-		count := fmt.Sprintf("%d", len(pl.Tracks))
-
-		if selected && focused {
-			plain := "▸ " + fmt.Sprintf("%d. ", i+1) + pl.Name
-			gap := w - lipgloss.Width(plain) - lipgloss.Width(count)
-			if gap < 1 {
-				plain = truncate(plain, w-lipgloss.Width(count)-1)
-				gap = w - lipgloss.Width(plain) - lipgloss.Width(count)
-				if gap < 1 {
-					gap = 1
-				}
-			}
-			rows = append(rows, styleSelected.Width(w).Render(plain+strings.Repeat(" ", gap)+count))
-			continue
-		}
-
-		marker := "  "
-		if selected {
-			marker = stylePrimary.Render("▸ ")
-		}
-		left := marker + styleDim.Render(fmt.Sprintf("%d. ", i+1)) + styleText.Render(pl.Name)
-		right := styleDim.Render(count + " tracks")
-		gap := w - lipgloss.Width(left) - lipgloss.Width(right)
-		if gap < 1 {
-			left = truncate2(left, w-lipgloss.Width(right)-1)
-			gap = w - lipgloss.Width(left) - lipgloss.Width(right)
-			if gap < 1 {
-				gap = 1
-			}
-		}
-		rows = append(rows, left+strings.Repeat(" ", gap)+right)
+		count := fmt.Sprintf("%d tracks", len(pl.Tracks))
+		rows = append(rows, listRow(fmt.Sprintf("%d. ", i+1), pl.Name, count, i == m.playlistCursor, focused, w))
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, heading, strings.Join(rows, "\n"))
 }
@@ -456,16 +437,7 @@ func (m *model) renderGenres(w, h int) string {
 	start, end := windowBounds(m.genreCursor, len(items), listH)
 	var rows []string
 	for i := start; i < end; i++ {
-		selected := i == m.genreCursor
-		if selected && focused {
-			rows = append(rows, styleSelected.Width(w).Render(truncate("▸ "+items[i], w)))
-			continue
-		}
-		marker := "  "
-		if selected {
-			marker = stylePrimary.Render("▸ ")
-		}
-		rows = append(rows, marker+styleText.Render(items[i]))
+		rows = append(rows, listRow("", items[i], "", i == m.genreCursor, focused, w))
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, heading, strings.Join(rows, "\n"))
 }
@@ -506,42 +478,64 @@ func (m *model) renderAlbum(w, h int) string {
 // history) and a Quick Picks section, as one flat-cursor list that scrolls.
 func (m *model) renderHome(w, h int) string {
 	focused := m.focus == focusPanel
-	var rows []string
-	selRow, flat := 0, 0
-
-	addTrack := func(n int, t api.Track) {
-		sel := flat == m.homeCursor
-		if sel {
-			selRow = len(rows)
-		}
-		rows = append(rows, m.renderResultRow(n, t, sel, focused, w, false))
-		flat++
-	}
-
 	listenAgain, quickPicks := m.homeSections()
 
-	rows = append(rows, styleSecondaryBold.Render(iconListen+" Listen Again"))
+	// Rows are one line each and the layout is known up front, so the visible
+	// window is computed before anything is rendered: on a 100-song page that is
+	// ~20 styled rows per frame instead of all of them.
+	laHead := 0
+	laFirst := laHead + 1
 	if len(listenAgain) == 0 {
+		laFirst++ // placeholder line
+	}
+	qpHead := laFirst + len(listenAgain)
+	qpFirst := qpHead + 1
+	if len(quickPicks) == 0 {
+		qpFirst++
+	}
+	total := qpFirst + len(quickPicks)
+
+	// selRow is the row index of the flat cursor (songs, then picks); it stays 0
+	// when the cursor matches no track, as before.
+	selRow := 0
+	switch {
+	case m.homeCursor < len(listenAgain):
+		selRow = laFirst + m.homeCursor
+	case m.homeCursor-len(listenAgain) < len(quickPicks):
+		selRow = qpFirst + m.homeCursor - len(listenAgain)
+	}
+	start, end := windowBounds(selRow, total, h)
+	vis := func(row int) bool { return row >= start && row < end }
+
+	rows := make([]string, 0, end-start)
+	if vis(laHead) {
+		rows = append(rows, styleSecondaryBold.Render(iconListen+" Listen Again"))
+	}
+	if len(listenAgain) == 0 && vis(laHead+1) {
 		rows = append(rows, styleDim.Render(truncate("  Nothing yet — play a song and it'll show up here.", w)))
 	}
-	for i, t := range listenAgain {
-		addTrack(i+1, t)
+	for i := max(start-laFirst, 0); i < min(end-laFirst, len(listenAgain)); i++ {
+		rows = append(rows, m.renderResultRow(i+1, listenAgain[i], i == m.homeCursor, focused, w, false))
 	}
 
-	rows = append(rows, styleSecondaryBold.Render(iconPicks+" Quick Picks"))
-	switch {
-	case len(quickPicks) == 0 && m.homeQPLoading:
-		rows = append(rows, styleAccent.Render("  Loading…"))
-	case len(quickPicks) == 0 && m.homeQPErr != "":
-		rows = append(rows, styleError.Render(truncate("  "+m.homeQPErr, w)))
-	case len(quickPicks) == 0:
-		rows = append(rows, styleDim.Render("  Nothing here yet."))
+	if vis(qpHead) {
+		rows = append(rows, styleSecondaryBold.Render(iconPicks+" Quick Picks"))
 	}
-	for i, t := range quickPicks {
-		addTrack(i+1, t)
+	if len(quickPicks) == 0 && vis(qpHead+1) {
+		switch {
+		case m.homeQPLoading:
+			rows = append(rows, styleAccent.Render("  Loading…"))
+		case m.homeQPErr != "":
+			rows = append(rows, styleError.Render(truncate("  "+m.homeQPErr, w)))
+		default:
+			rows = append(rows, styleDim.Render("  Nothing here yet."))
+		}
+	}
+	for i := max(start-qpFirst, 0); i < min(end-qpFirst, len(quickPicks)); i++ {
+		rows = append(rows, m.renderResultRow(i+1, quickPicks[i], len(listenAgain)+i == m.homeCursor, focused, w, false))
 	}
 
-	return windowRows(rows, selRow, h)
+	return strings.Join(rows, "\n")
 }
 
 // ─── Artist screen ─────────────────────────────────────────────────────────────
@@ -567,33 +561,44 @@ func (m *model) renderArtist(w, h int) string {
 	focused := m.focus == focusPanel
 	songs := m.filt(m.artistSongs)
 	albums := m.filtAlbums(m.artistAlbums)
-	var rows []string
-	selRow, flat := 0, 0
 
+	// Same up-front windowing as Home: songs then albums, one flat cursor.
+	sFirst := 0
 	if len(songs) > 0 {
-		rows = append(rows, styleSecondaryBold.Render(iconPlay+" Top Songs"))
-		for i, t := range songs {
-			sel := flat == m.artistCursor
-			if sel {
-				selRow = len(rows)
-			}
-			rows = append(rows, m.renderResultRow(i+1, t, sel, focused, w, false))
-			flat++
-		}
+		sFirst = 1 // "Top Songs" header
 	}
+	aHead := sFirst + len(songs)
+	aFirst := aHead
 	if len(albums) > 0 {
+		aFirst = aHead + 1 // "Albums" header
+	}
+	total := aFirst + len(albums)
+
+	selRow := 0
+	switch {
+	case m.artistCursor < len(songs):
+		selRow = sFirst + m.artistCursor
+	case m.artistCursor-len(songs) < len(albums):
+		selRow = aFirst + m.artistCursor - len(songs)
+	}
+	start, end := windowBounds(selRow, total, listH)
+	vis := func(row int) bool { return row >= start && row < end }
+
+	rows := make([]string, 0, end-start)
+	if len(songs) > 0 && vis(0) {
+		rows = append(rows, styleSecondaryBold.Render(iconPlay+" Top Songs"))
+	}
+	for i := max(start-sFirst, 0); i < min(end-sFirst, len(songs)); i++ {
+		rows = append(rows, m.renderResultRow(i+1, songs[i], i == m.artistCursor, focused, w, false))
+	}
+	if len(albums) > 0 && vis(aHead) {
 		rows = append(rows, styleSecondaryBold.Render(iconPlaylist+" Albums"))
-		for i, a := range albums {
-			sel := flat == m.artistCursor
-			if sel {
-				selRow = len(rows)
-			}
-			rows = append(rows, m.renderAlbumRefRow(i+1, a, sel, focused, w))
-			flat++
-		}
+	}
+	for i := max(start-aFirst, 0); i < min(end-aFirst, len(albums)); i++ {
+		rows = append(rows, m.renderAlbumRefRow(i+1, albums[i], len(songs)+i == m.artistCursor, focused, w))
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left, heading, windowRows(rows, selRow, listH))
+	return lipgloss.JoinVertical(lipgloss.Left, heading, strings.Join(rows, "\n"))
 }
 
 // renderAlbumRefRow renders an album card row (title + right-aligned year) with
@@ -611,33 +616,14 @@ func (m *model) renderAlbumRefRow(n int, a api.AlbumRef, selected, focused bool,
 	right := a.Year
 
 	if selected && focused {
-		plain := marker + numStr + a.Title
-		gap := w - lipgloss.Width(plain) - lipgloss.Width(right)
-		if gap < 1 {
-			plain = truncate(plain, w-lipgloss.Width(right)-1)
-			gap = w - lipgloss.Width(plain) - lipgloss.Width(right)
-			if gap < 1 {
-				gap = 1
-			}
-		}
-		return styleSelected.Width(w).Render(plain + strings.Repeat(" ", gap) + right)
+		return styleSelected.Width(w).Render(rowLR(marker+numStr+a.Title, right, w))
 	}
 
 	markerStr := styleDim.Render(marker)
 	if selected {
 		markerStr = stylePrimary.Render(marker)
 	}
-	left := markerStr + styleDim.Render(numStr) + styleText.Render(a.Title)
-	rightStr := styleDim.Render(right)
-	gap := w - lipgloss.Width(left) - lipgloss.Width(rightStr)
-	if gap < 1 {
-		left = truncate2(left, w-lipgloss.Width(rightStr)-1)
-		gap = w - lipgloss.Width(left) - lipgloss.Width(rightStr)
-		if gap < 1 {
-			gap = 1
-		}
-	}
-	return left + strings.Repeat(" ", gap) + rightStr
+	return rowLR(markerStr+styleDim.Render(numStr)+styleText.Render(a.Title), styleDim.Render(right), w)
 }
 
 // windowRows joins a slice of pre-rendered rows, scrolled so the row at `center`
@@ -660,8 +646,7 @@ func windowRows(rows []string, center, h int) string {
 // pending destructive-action confirmation takes priority over status text.
 func (m *model) renderStatusLine(w int) string {
 	if m.confirmPrompt != "" {
-		st := lipgloss.NewStyle().Foreground(colorBackground).Background(colorWarning).Bold(true)
-		return st.Width(w).Render(truncate(" "+m.confirmPrompt+"  [y] yes  [any other key] cancel", w))
+		return styleConfirm.Width(w).Render(truncate(" "+m.confirmPrompt+"  [y] yes  [any other key] cancel", w))
 	}
 	if m.status == "" {
 		return strings.Repeat(" ", w)
@@ -830,6 +815,7 @@ func (m *model) buildShortcutsBar(w int) string {
 		case viewFavorites:
 			segs = append(segs, shortcut{"j/k", "move", false},
 				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
+				shortcut{"d", "remove", false},
 				shortcut{"f", "fav", false}, shortcut{"a", "album", false},
 				shortcut{"A", "artist", false})
 		case viewHistory:
@@ -963,34 +949,26 @@ func (m *model) renderNowBar(w int) string {
 	// so they don't get clipped by the shell.
 	var flags []string
 	if s.Muted {
-		flags = append(flags, styleError.Bold(true).Render(iconMute))
+		flags = append(flags, styleErrorBold.Render(iconMute))
 	}
 	if m.shuffle {
-		flags = append(flags, stylePrimary.Bold(true).Render(iconShuffle))
+		flags = append(flags, stylePrimaryBold.Render(iconShuffle))
 	}
 	if m.repeat != repeatOff {
 		g := iconRepeat
 		if m.repeat == repeatOne {
 			g += " 1" // distinguish repeat-one from repeat-all
 		}
-		flags = append(flags, styleSecondary.Bold(true).Render(g))
+		flags = append(flags, styleSecondaryBold.Render(g))
 	}
 	if m.cfg.AutoContinue {
-		flags = append(flags, styleSuccess.Bold(true).Render(iconAutoplay))
+		flags = append(flags, styleSuccessBold.Render(iconAutoplay))
 	}
 	if len(flags) > 0 {
 		right += "   " + strings.Join(flags, " ") + " "
 	}
 
-	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
-	if gap < 1 {
-		left = truncate2(left, w-lipgloss.Width(right)-1)
-		gap = w - lipgloss.Width(left) - lipgloss.Width(right)
-		if gap < 1 {
-			gap = 1
-		}
-	}
-	info := left + strings.Repeat(" ", gap) + right
+	info := rowLR(left, right, w)
 	return info + "\n" + m.renderProgressBar(w, s)
 }
 
@@ -1040,7 +1018,13 @@ func (m *model) renderSearch(w, h int) string {
 	} else {
 		barContent = stylePrimary.Render("Search: ") + styleDim.Render("press / to edit query")
 	}
-	bar := styleSearchBox.Width(searchInner).Render(barContent)
+	// The box has Padding(0,1), so its usable text width is searchInner-2; a long
+	// query would otherwise wrap the box onto extra lines and eat the list height.
+	barW := searchInner - 2
+	if barW < 1 {
+		barW = 1
+	}
+	bar := styleSearchBox.Width(searchInner).Render(truncate2(barContent, barW))
 	blocks = append(blocks, bar)
 	used += lipgloss.Height(bar)
 
@@ -1137,16 +1121,7 @@ func (m *model) renderTrackRow(n int, t api.Track, selected, focused bool, w int
 
 	// Focused + selected: whole-row inverse highlight (single color).
 	if selected && focused {
-		plain := marker + prefix + numStr + heartGlyph + t.Title + artistPart
-		gap := w - lipgloss.Width(plain) - lipgloss.Width(dur)
-		if gap < 1 {
-			plain = truncate(plain, w-lipgloss.Width(dur)-1)
-			gap = w - lipgloss.Width(plain) - lipgloss.Width(dur)
-			if gap < 1 {
-				gap = 1
-			}
-		}
-		return styleSelected.Width(w).Render(plain + strings.Repeat(" ", gap) + dur)
+		return styleSelected.Width(w).Render(rowLR(marker+prefix+numStr+heartGlyph+t.Title+artistPart, dur, w))
 	}
 
 	// Otherwise a normal coloured row.
@@ -1163,18 +1138,7 @@ func (m *model) renderTrackRow(n int, t api.Track, selected, focused bool, w int
 		prefixStr = prefixStyle.Render(prefix)
 	}
 	left := markerStr + prefixStr + styleDim.Render(numStr) + heart + styleText.Render(t.Title) + styleDim.Render(artistPart)
-	durStr := styleDim.Render(dur)
-
-	gap := w - lipgloss.Width(left) - lipgloss.Width(durStr)
-	if gap < 1 {
-		avail := w - lipgloss.Width(durStr) - 1
-		left = truncate2(left, avail)
-		gap = w - lipgloss.Width(left) - lipgloss.Width(durStr)
-		if gap < 1 {
-			gap = 1
-		}
-	}
-	return left + strings.Repeat(" ", gap) + durStr
+	return rowLR(left, styleDim.Render(dur), w)
 }
 
 // ─── Queue screen ──────────────────────────────────────────────────────────────
@@ -1208,7 +1172,9 @@ func (m *model) renderQueue(w, h int) string {
 		selected := i == m.queueCursor
 
 		nowMark := "  "
-		if m.hasCurrent && orig == m.queuePos {
+		// The ID check keeps the marker off a different song when the playing
+		// entry is deleted and queuePos shifts onto its neighbour.
+		if m.hasCurrent && orig == m.queuePos && t.ID == m.current.ID {
 			nowMark = iconPlay + " "
 		}
 		rows = append(rows, m.renderTrackRow(i+1, t, selected, focused, w, false, nowMark, stylePrimary))
@@ -1345,20 +1311,31 @@ func (m *model) renderHelp(w, h int) string {
 		}},
 	}
 
-	var rows []string
-	rows = append(rows, styleSecondaryBold.Render(iconHelp+" Keyboard Shortcuts"))
-	for _, sec := range sections {
-		rows = append(rows, "", styleSecondaryBold.Render(sec.title))
-		for _, k := range sec.keys {
-			rows = append(rows, stylePrimary.Render(fmt.Sprintf("  %-16s", k.key))+styleText.Render(k.desc))
-		}
-	}
-
 	inner := w - 2
 	if inner < 1 {
 		inner = 1
 	}
-	return styleContentBox.Width(inner).Render(strings.Join(rows, "\n"))
+	// The box has Padding(0,1): rows wider than inner-2 wrap and push the bottom
+	// of the box past h, where View's padToHeight silently clips it.
+	textW := inner - 2
+	if textW < 1 {
+		textW = 1
+	}
+	var rows []string
+	rows = append(rows, styleSecondaryBold.Render(truncate2(iconHelp+" Keyboard Shortcuts", textW)))
+	for _, sec := range sections {
+		rows = append(rows, "", styleSecondaryBold.Render(truncate2(sec.title, textW)))
+		for _, k := range sec.keys {
+			rows = append(rows, truncate2(stylePrimary.Render(fmt.Sprintf("  %-16s", k.key))+styleText.Render(k.desc), textW))
+		}
+	}
+
+	// ponytail: no help cursor exists, so the window is pinned to the top.
+	bodyH := h - 2 // border rows
+	if bodyH < 1 {
+		bodyH = 1
+	}
+	return styleContentBox.Width(inner).Render(windowRows(rows, 0, bodyH))
 }
 
 // ─── Shared list helpers ───────────────────────────────────────────────────────

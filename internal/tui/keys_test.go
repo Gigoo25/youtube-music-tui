@@ -65,21 +65,24 @@ func TestQueueRemovalKeepsPlayingTrack(t *testing.T) {
 	}
 }
 
-// TestQueueRemovePlayingTrackDropsMarker: removing the playing track clears the
-// now-playing marker (audio keeps going, but it's no longer in the queue).
-func TestQueueRemovePlayingTrackDropsMarker(t *testing.T) {
+// TestQueueRemovePlayingTrackKeepsPlaying: removing the playing queue entry does
+// not stop playback — mpv keeps going, so hasCurrent stays true (otherwise Space
+// would start a different track instead of pausing). The now-playing marker is
+// dropped by the row-identity check in renderQueue, not by clearing hasCurrent.
+func TestQueueRemovePlayingTrackKeepsPlaying(t *testing.T) {
 	m := newTestModel()
 	m.activeView = viewQueue
 	m.focus = focusPanel
 	m.queue = []api.Track{{ID: "a", Title: "A"}, {ID: "b", Title: "B"}}
 	m.queuePos = 1
+	m.current = m.queue[1]
 	m.hasCurrent = true
 	m.queueCursor = 1 // cursor on the playing track
 
 	press(m, "d")
 
-	if m.hasCurrent {
-		t.Fatal("removing the playing track should clear hasCurrent")
+	if !m.hasCurrent {
+		t.Fatal("removing the playing track must not stop playback")
 	}
 	if m.queuePos != 0 {
 		t.Fatalf("queuePos = %d after removing the playing last track, want 0 (one before end)", m.queuePos)

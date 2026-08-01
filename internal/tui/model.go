@@ -107,6 +107,7 @@ type model struct {
 	artistCursor  int // spans songs then albums
 	artistLoading bool
 	artistErr     string
+	artistGen     int // bumped per artist load; a slow older response must not clobber a newer one
 
 	// search (global YouTube Music search — its own view)
 	searchInput        textinput.Model
@@ -164,6 +165,7 @@ type model struct {
 	albumTitle   string
 	albumLoading bool
 	albumErr     string
+	albumGen     int    // bumped per album load; a slow older response must not clobber a newer one
 	viewStack    []view // return path for contextual views (album/artist/genres)
 
 	// player snapshot (refreshed each tick)
@@ -237,6 +239,7 @@ type randomDoneMsg struct {
 
 type radioDoneMsg struct {
 	tracks []api.Track
+	seed   string // m.current.ID at dispatch; a changed current track drops the response
 	err    error
 }
 
@@ -250,6 +253,7 @@ type autoContinueMsg struct {
 type albumDoneMsg struct {
 	tracks []api.Track
 	title  string
+	gen    int // albumGen at dispatch; stale responses are dropped
 	err    error
 }
 
@@ -260,6 +264,7 @@ type homeQuickPicksMsg struct {
 
 type artistDoneMsg struct {
 	res api.ArtistResult
+	gen int // artistGen at dispatch; stale responses are dropped
 	err error
 }
 
@@ -337,6 +342,11 @@ func (m *model) SnapshotSession() {
 	m.cfg.QueuePos = m.queuePos
 	m.cfg.Shuffle = m.shuffle
 	m.cfg.Repeat = int(m.repeat)
+	// Volume lives on the player, so this is the single place it reaches the
+	// config (the debounced mid-session save used to persist a stale value).
+	if m.player != nil {
+		m.cfg.Volume = m.player.State().Volume
+	}
 }
 
 // cycleTheme advances to the next color theme, persists it, and invalidates the
@@ -446,9 +456,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleMPRISAction(msg.action)
 
 	case mprisSeekMsg:
+		// Refresh first: the cached snapshot is up to a tick (2s when idle) old,
+		// and the position reported to D-Bus is pre-seek + offset.
+		m.playerState = m.player.State()
 		m.player.Seek(float64(msg.offsetUS) / 1e6)
 		if m.mpris != nil {
-			m.mpris.Seeked(int64((m.playerState.Position)*1e6) + msg.offsetUS)
+			m.mpris.Seeked(int64(m.playerState.Position*1e6) + msg.offsetUS)
 		}
 		return m, nil
 
@@ -460,7 +473,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case mprisSetVolMsg:
-		m.player.SetVolume(msg.level * 100)
+		vol := msg.level * 100
+		m.player.SetVolume(vol)
+		m.playerState.Volume = vol // don't let the shortcuts bar lag a tick behind
 		return m, nil
 
 	case autoContinueMsg:
@@ -492,7 +507,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.playAt(start)
 		m.setStatus(fmt.Sprintf("auto-continue: added %d tracks", added))
-		return m, m.nextTick()
+		// No nextTick here: the tick handler already re-arms the chain, and a
+		// second one would double every wakeup for the rest of the session.
+		return m, nil
 
 	case randomDoneMsg:
 		// Search (the random source) lives in the secret-blocked ytmusic.go, so its
@@ -508,6 +525,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case radioDoneMsg:
+		if msg.seed != m.current.ID {
+			return m, nil // the seed track changed while the request was in flight
+		}
 		if msg.err != nil {
 			m.setError("radio failed: " + msg.err.Error())
 		} else if len(msg.tracks) == 0 {
@@ -520,8 +540,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case albumDoneMsg:
+		if msg.gen != m.albumGen {
+			return m, nil // a newer album load superseded this response
+		}
 		m.albumLoading = false
-		m.albumCursor = 0
 		if msg.err != nil {
 			m.albumErr = msg.err.Error()
 		} else {
@@ -550,6 +572,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case artistDoneMsg:
+		if msg.gen != m.artistGen {
+			return m, nil // a newer artist load superseded this response
+		}
 		m.artistLoading = false
 		if msg.err != nil {
 			m.artistErr = msg.err.Error()
@@ -991,15 +1016,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, textinput.Blink
 		}
 		return m, nil
-	case "tab":
+	case "tab", "shift+tab":
 		// Toggle focus between sidebar and panel.
-		if m.focus == focusSidebar {
-			m.focus = focusPanel
-		} else {
-			m.focus = focusSidebar
-		}
-		return m, nil
-	case "shift+tab":
 		if m.focus == focusSidebar {
 			m.focus = focusPanel
 		} else {
@@ -1262,23 +1280,28 @@ func (m *model) handlePlaylistDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.plDetailCursor = nc
 		return m, nil
 	}
-	if m.plDetailCursor >= len(vis) {
-		return m, nil
-	}
 	switch msg.String() {
 	case "enter":
-		m.enqueue(pl.Tracks[vis[m.plDetailCursor]])
+		if m.plDetailCursor < len(vis) {
+			m.enqueue(pl.Tracks[vis[m.plDetailCursor]])
+		}
 	case "p":
-		m.playNow(pl.Tracks[vis[m.plDetailCursor]])
+		if m.plDetailCursor < len(vis) {
+			m.playNow(pl.Tracks[vis[m.plDetailCursor]])
+		}
 	case "e":
+		// Queues the whole playlist, so it deliberately sits outside the
+		// cursor-range checks — a filter matching nothing must not disable it.
 		m.enqueueAll(pl.Tracks)
 	case "d", "x":
-		orig := vis[m.plDetailCursor]
-		removed := pl.Tracks[orig].Title
-		m.cfg.RemoveFromPlaylist(m.openPlaylist, orig)
-		m.markConfigDirty()
-		m.clampActiveCursor()
-		m.setStatus("removed from playlist: " + removed)
+		if m.plDetailCursor < len(vis) {
+			orig := vis[m.plDetailCursor]
+			removed := pl.Tracks[orig].Title
+			m.cfg.RemoveFromPlaylist(m.openPlaylist, orig)
+			m.markConfigDirty()
+			m.clampActiveCursor()
+			m.setStatus("removed from playlist: " + removed)
+		}
 	}
 	return m, nil
 }
@@ -1331,6 +1354,7 @@ func (m *model) goToAlbum() tea.Cmd {
 	m.albumErr = ""
 	m.albumTracks = nil
 	m.albumCursor = 0
+	m.albumGen++
 	name := t.Album
 	if name == "" {
 		name = t.Title
@@ -1343,17 +1367,18 @@ func (m *model) goToAlbum() tea.Cmd {
 		album = t.Title
 	}
 	client := m.api
+	gen := m.albumGen
 	return func() tea.Msg {
 		// A track that carries the album's browse id skips search entirely —
 		// search can't find some albums by name (deluxe editions especially).
 		if albumID != "" {
 			tracks, title, err := api.AlbumByID(client, albumID)
 			if err == nil && len(tracks) > 0 {
-				return albumDoneMsg{tracks: tracks, title: title, err: nil}
+				return albumDoneMsg{tracks: tracks, title: title, gen: gen, err: nil}
 			}
 		}
 		tracks, title, err := api.AlbumByQuery(client, album, artist)
-		return albumDoneMsg{tracks: tracks, title: title, err: err}
+		return albumDoneMsg{tracks: tracks, title: title, gen: gen, err: err}
 	}
 }
 
@@ -1436,9 +1461,7 @@ func (m *model) handleAlbumKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.albumCursor < len(vis) {
 			start = vis[m.albumCursor]
 		}
-		m.queue = append([]api.Track(nil), tracks...)
-		m.queueCursor = start
-		m.playAt(start)
+		m.replaceQueue(tracks, start)
 		m.setStatus(fmt.Sprintf("queue replaced with album %q", m.albumTitle))
 	case "e":
 		// Append the whole album to the queue without disturbing playback.
@@ -1505,6 +1528,9 @@ func (m *model) appendNew(ts []api.Track) int {
 		seen[t.ID] = true
 		m.queue = append(m.queue, t)
 		added++
+	}
+	if added > 0 {
+		m.markConfigDirty() // the queue is session state the debounced save captures
 	}
 	return added
 }
@@ -1617,6 +1643,7 @@ func (m *model) goToArtist() tea.Cmd {
 	m.activeView = viewArtist
 	m.focus = focusPanel
 	m.artistLoading = true
+	m.artistGen++
 	m.artistErr = ""
 	m.artistSongs = nil
 	m.artistAlbums = nil
@@ -1625,9 +1652,10 @@ func (m *model) goToArtist() tea.Cmd {
 
 	client := m.api
 	name := m.artistName
+	gen := m.artistGen
 	return func() tea.Msg {
 		res, err := api.ArtistByQuery(client, name)
-		return artistDoneMsg{res: res, err: err}
+		return artistDoneMsg{res: res, gen: gen, err: err}
 	}
 }
 
@@ -1693,6 +1721,7 @@ func (m *model) openAlbumByID(a api.AlbumRef) tea.Cmd {
 	m.activeView = viewAlbum
 	m.focus = focusPanel
 	m.albumLoading = true
+	m.albumGen++
 	m.albumErr = ""
 	m.albumTracks = nil
 	m.albumCursor = 0
@@ -1700,9 +1729,10 @@ func (m *model) openAlbumByID(a api.AlbumRef) tea.Cmd {
 
 	client := m.api
 	id := a.ID
+	gen := m.albumGen
 	return func() tea.Msg {
 		tracks, title, err := api.AlbumByID(client, id)
-		return albumDoneMsg{tracks: tracks, title: title, err: err}
+		return albumDoneMsg{tracks: tracks, title: title, gen: gen, err: err}
 	}
 }
 
@@ -1777,7 +1807,7 @@ func (m *model) startRadio() tea.Cmd {
 	client := m.api
 	return func() tea.Msg {
 		tracks, err := client.Related(id)
-		return radioDoneMsg{tracks: tracks, err: err}
+		return radioDoneMsg{tracks: tracks, seed: id, err: err}
 	}
 }
 
@@ -1787,9 +1817,7 @@ func (m *model) startRadio() tea.Cmd {
 func (m *model) startRadioQueue(ts []api.Track) int {
 	// startRadio guarantees a current track, so the queue resets to just it and
 	// keeps playing (no reload); the radio tracks queue up behind it.
-	m.queue = []api.Track{m.current}
-	m.queuePos = 0
-	m.queueCursor = 0
+	m.replaceQueue([]api.Track{m.current}, -1)
 	added := m.appendNew(ts)
 	m.prefetchNext()
 	return added
@@ -1891,9 +1919,7 @@ func (m *model) loadPlaylist(pl config.Playlist, replace bool) {
 		return
 	}
 	if replace {
-		m.queue = append([]api.Track(nil), pl.Tracks...)
-		m.queueCursor = 0
-		m.playAt(0)
+		m.replaceQueue(pl.Tracks, 0)
 		m.setStatus(fmt.Sprintf("queue replaced with playlist %q (%d tracks)", pl.Name, len(pl.Tracks)))
 		return
 	}
@@ -1982,8 +2008,7 @@ func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "enter":
 		if m.queueCursor < len(vis) {
-			m.queuePos = vis[m.queueCursor]
-			m.playAt(m.queuePos)
+			m.playAt(vis[m.queueCursor])
 		}
 	case "d", "x":
 		if m.queueCursor < len(vis) {
@@ -1994,16 +2019,17 @@ func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case removed < m.queuePos:
 				m.queuePos--
 			case removed == m.queuePos:
-				// The currently-playing entry was removed: it keeps playing, but it
-				// is no longer in the queue, so drop the now-playing marker. Step
-				// queuePos back so the next advance plays the track that shifted
-				// into the removed slot instead of skipping it (-1 is fine: playAt
-				// rejects it and nextTrack's queuePos+1 lands on index 0).
-				m.hasCurrent = false
+				// The currently-playing entry was removed: mpv keeps playing it, so
+				// hasCurrent stays true (Space must still pause, not start some
+				// other track), but it is no longer in the queue. Step queuePos back
+				// so the next advance plays the track that shifted into the removed
+				// slot instead of skipping it (-1 is fine: playAt rejects it and
+				// nextTrack's queuePos+1 lands on index 0).
 				m.queuePos--
 			}
 			m.clampActiveCursor() // keep cursor in range of the (refiltered) list
 			m.prefetchNext()      // the upcoming tracks may have shifted — re-warm them
+			m.markConfigDirty()
 			m.setStatus("removed from queue")
 		}
 	case ".":
@@ -2017,12 +2043,22 @@ func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "c":
-		m.queue = nil
-		m.queueCursor = 0
-		m.queuePos = 0
-		m.player.Stop()
-		m.hasCurrent = false
-		m.setStatus("queue cleared")
+		if len(m.queue) == 0 {
+			m.setStatus("queue is already empty")
+			return m, nil
+		}
+		// Clearing stops playback and discards the session queue — confirm, like
+		// clearing history or deleting a playlist.
+		m.confirmPrompt = fmt.Sprintf("clear all %d queued tracks?", len(m.queue))
+		m.confirmFn = func() {
+			m.queue = nil
+			m.queueCursor = 0
+			m.queuePos = 0
+			m.player.Stop()
+			m.hasCurrent = false
+			m.markConfigDirty()
+			m.setStatus("queue cleared")
+		}
 	}
 	return m, nil
 }
@@ -2044,6 +2080,7 @@ func (m *model) moveQueueItem(from, to int) {
 	m.queueCursor = to
 	// Reordering changes what plays next — warm the new upcoming tracks.
 	m.prefetchNext()
+	m.markConfigDirty()
 }
 
 func (m *model) handleFavKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -2134,6 +2171,7 @@ func (m *model) enqueue(t api.Track) {
 		return
 	}
 	m.queue = append(m.queue, t)
+	m.markConfigDirty()
 	m.setStatus("queued: " + t.Title)
 	if !m.hasCurrent {
 		m.playAt(len(m.queue) - 1)
@@ -2156,6 +2194,19 @@ func (m *model) playNow(t api.Track) {
 		m.queueCursor++
 	}
 	m.playAt(0)
+}
+
+// replaceQueue swaps the queue for a copy of ts and starts playing at start.
+// A negative start keeps whatever is already playing (no reload) and points
+// queuePos at the head — that's how radio rebuilds around its seed track.
+func (m *model) replaceQueue(ts []api.Track, start int) {
+	m.queue = append([]api.Track(nil), ts...)
+	if start < 0 {
+		m.queuePos, m.queueCursor = 0, 0
+		return
+	}
+	m.queueCursor = start
+	m.playAt(start)
 }
 
 func (m *model) playAt(idx int) {

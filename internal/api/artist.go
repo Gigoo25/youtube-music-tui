@@ -44,7 +44,8 @@ func ArtistByQuery(c *Client, name string) (ArtistResult, error) {
 		return res, err
 	}
 
-	res.Name = sanitizeDisplay(artistName(broot))
+	res.Name = sanitizeDisplay(headerTitle(broot, "musicImmersiveHeaderRenderer",
+		"musicResponsiveHeaderRenderer", "musicVisualHeaderRenderer", "musicDetailHeaderRenderer"))
 	if res.Name == "" {
 		res.Name = name
 	}
@@ -57,44 +58,23 @@ func ArtistByQuery(c *Client, name string) (ArtistResult, error) {
 	// order first, so the curated albums stay on top). Note: YouTube Music's
 	// artist catalog itself omits some editions (deluxe/reissues are often
 	// search-only), so this is best-effort completeness, not a guarantee.
-	if discoID := discographyBrowseID(broot); discoID != "" {
-		dp := c.clientCtx()
-		dp["browseId"] = discoID
-		if dbody, derr := c.post("browse", dp); derr == nil {
-			if droot, perr := parseJSON(dbody); perr == nil {
-				res.Albums = mergeAlbumRefs(res.Albums, parseArtistAlbums(droot, 60))
-			}
-		}
-	}
+	res.Albums = c.withDiscography(res.Albums, broot)
 	return res, nil
 }
 
 // discographyBrowseID finds the artist's full-discography browse id (MPAD…)
 // from the albums shelf's "More" endpoint, or "" when the page has none.
 func discographyBrowseID(node any) string {
-	switch v := node.(type) {
-	case map[string]any:
-		if be, ok := v["browseEndpoint"].(map[string]any); ok {
-			pageType := str(dig(be, "browseEndpointContextSupportedConfigs",
-				"browseEndpointContextMusicConfig", "pageType"))
-			if id := str(be["browseId"]); pageType == "MUSIC_PAGE_TYPE_ARTIST_DISCOGRAPHY" &&
-				strings.HasPrefix(id, "MPAD") {
-				return id
-			}
-		}
-		for _, child := range v {
-			if id := discographyBrowseID(child); id != "" {
-				return id
-			}
-		}
-	case []any:
-		for _, child := range v {
-			if id := discographyBrowseID(child); id != "" {
-				return id
-			}
-		}
-	}
-	return ""
+	return findBrowseID(node, func(be map[string]any) bool {
+		return browsePageType(be) == "MUSIC_PAGE_TYPE_ARTIST_DISCOGRAPHY" &&
+			strings.HasPrefix(str(be["browseId"]), "MPAD")
+	})
+}
+
+// browsePageType reads the music page type a browseEndpoint points at.
+func browsePageType(be map[string]any) string {
+	return str(dig(be, "browseEndpointContextSupportedConfigs",
+		"browseEndpointContextMusicConfig", "pageType"))
 }
 
 // mergeAlbumRefs appends extra albums not already present in base (by id).
@@ -112,49 +92,33 @@ func mergeAlbumRefs(base, extra []AlbumRef) []AlbumRef {
 	return base
 }
 
+// withDiscography merges the artist's full discography (the releases behind the
+// albums shelf's "More" button) into base, keeping base's order first.
+// Best-effort: a failed browse leaves base unchanged.
+func (c *Client) withDiscography(base []AlbumRef, root any) []AlbumRef {
+	discoID := discographyBrowseID(root)
+	if discoID == "" {
+		return base
+	}
+	dp := c.clientCtx()
+	dp["browseId"] = discoID
+	dbody, err := c.post("browse", dp)
+	if err != nil {
+		return base
+	}
+	droot, err := parseJSON(dbody)
+	if err != nil {
+		return base
+	}
+	return mergeAlbumRefs(base, parseArtistAlbums(droot, 60))
+}
+
 // firstArtistBrowseID finds the first browseEndpoint whose page type marks it as
 // an artist channel.
 func firstArtistBrowseID(node any) string {
-	switch v := node.(type) {
-	case map[string]any:
-		if be, ok := v["browseEndpoint"].(map[string]any); ok {
-			pageType := str(dig(be, "browseEndpointContextSupportedConfigs",
-				"browseEndpointContextMusicConfig", "pageType"))
-			if pageType == "MUSIC_PAGE_TYPE_ARTIST" {
-				if id := str(be["browseId"]); id != "" {
-					return id
-				}
-			}
-		}
-		for _, child := range v {
-			if id := firstArtistBrowseID(child); id != "" {
-				return id
-			}
-		}
-	case []any:
-		for _, child := range v {
-			if id := firstArtistBrowseID(child); id != "" {
-				return id
-			}
-		}
-	}
-	return ""
-}
-
-// artistName reads the artist's display name from whichever header renderer the
-// browse response uses.
-func artistName(root any) string {
-	for _, key := range []string{"musicImmersiveHeaderRenderer", "musicResponsiveHeaderRenderer", "musicVisualHeaderRenderer", "musicDetailHeaderRenderer"} {
-		if h := findRenderer(root, key); h != nil {
-			runs := digSlice(dig(h, "title", "runs"))
-			if len(runs) > 0 {
-				if t := str(dig(runs[0], "text")); t != "" {
-					return t
-				}
-			}
-		}
-	}
-	return ""
+	return findBrowseID(node, func(be map[string]any) bool {
+		return browsePageType(be) == "MUSIC_PAGE_TYPE_ARTIST" && str(be["browseId"]) != ""
+	})
 }
 
 // parseArtistSongs extracts the artist's top song rows (cap 20), deduped by id.
@@ -166,12 +130,7 @@ func parseArtistSongs(root any) []Track {
 		if len(out) >= limit {
 			return
 		}
-		t := extractTrack(r)
-		if t.ID == "" || t.Title == "" || seen[t.ID] {
-			return
-		}
-		seen[t.ID] = true
-		out = append(out, t)
+		addTrack(extractTrack(r), &out, seen)
 	})
 	return out
 }
@@ -263,10 +222,19 @@ func parseArtistAlbums(root any, limit int) []AlbumRef {
 		if a.Title == "" {
 			return
 		}
-		// Subtitle looks like "Album • 2021" or "Single • 2019"; pull the year.
-		for _, t := range extractTexts(digSlice(dig(r, "subtitle", "runs"))) {
-			if len(t) == 4 && t >= "1900" && t <= "2099" {
-				a.Year = t
+		// Subtitle is "Album • 2021" / "Single • 2019", or "Artist • 2021" on
+		// discography pages: pull the year, plus the artist when the leading
+		// group is neither a year nor the release-type word.
+		groups := bylineGroups(digSlice(dig(r, "subtitle", "runs")))
+		for _, g := range groups {
+			if isYear(g) {
+				a.Year = g
+			}
+		}
+		if len(groups) > 0 {
+			g := groups[0]
+			if !isYear(g) && g != "Album" && g != "Single" && g != "EP" {
+				a.Artist = sanitizeDisplay(g)
 			}
 		}
 		seen[id] = true
