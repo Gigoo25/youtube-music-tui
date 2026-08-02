@@ -98,7 +98,7 @@ type model struct {
 	homeCursor      int
 	homeQPLoading   bool
 	homeQPErr       string
-	homeLoaded      bool
+	helpCursor      int // help screen scroll offset (the only scroll with no visible cursor)
 
 	// artist view (top songs + albums for an artist) — contextual like album view
 	artistName    string
@@ -247,6 +247,7 @@ type radioDoneMsg struct {
 // queue ran out (auto-continue). Unlike radioDoneMsg it resumes playback.
 type autoContinueMsg struct {
 	tracks []api.Track
+	seed   string // current.ID at dispatch; stale responses are dropped
 	err    error
 }
 
@@ -365,7 +366,6 @@ func (m *model) Init() tea.Cmd {
 	// Drop into Home: Listen Again is built synchronously from history; Quick
 	// Picks loads asynchronously.
 	m.refreshListenAgain()
-	m.homeLoaded = true
 	if len(m.queue) > 0 {
 		m.setStatus(fmt.Sprintf("restored %d queued tracks — press space to resume", len(m.queue)))
 	}
@@ -479,6 +479,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case autoContinueMsg:
+		if !m.hasCurrent || m.current.ID != msg.seed {
+			return m, nil // the user started something else while the request was in flight
+		}
 		if msg.err != nil {
 			m.setError("auto-continue failed: " + msg.err.Error())
 			return m, nil
@@ -486,12 +489,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Related lives in explore.go (not the secret-blocked ytmusic.go), so its
 		// tracks are already clean. Drop the seed itself to avoid an instant repeat.
 		var tracks []api.Track
-		seed := ""
-		if m.hasCurrent {
-			seed = m.current.ID
-		}
 		for _, t := range msg.tracks {
-			if t.ID != "" && t.ID != seed {
+			if t.ID != "" && t.ID != msg.seed {
 				tracks = append(tracks, t)
 			}
 		}
@@ -525,7 +524,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case radioDoneMsg:
-		if msg.seed != m.current.ID {
+		if !m.hasCurrent || msg.seed != m.current.ID {
 			return m, nil // the seed track changed while the request was in flight
 		}
 		if msg.err != nil {
@@ -776,7 +775,7 @@ func (m *model) activeCursorPtr() *int {
 func (m *model) activeFilteredLen() int {
 	switch m.activeView {
 	case viewHome:
-		return len(m.filt(m.homeListenAgain)) + len(m.filt(m.homeQuickPicks))
+		return m.homeLen()
 	case viewQueue:
 		return len(m.filt(m.queue))
 	case viewFavorites:
@@ -1159,6 +1158,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case viewPlaylistPick:
 		return m.handlePlaylistPickKey(msg)
 	case viewHelp:
+		m.helpCursor, _ = m.vimMove(msg.String(), m.helpCursor, helpRowCount())
 		return m, nil
 	}
 	return m, nil
@@ -1264,6 +1264,7 @@ func (m *model) openPlaylistPicker(t api.Track) {
 	if m.activeView != viewPlaylistPick {
 		m.pickPrev = m.activeView
 	}
+	m.clearFilter()
 	m.activeView = viewPlaylistPick
 	m.focus = focusPanel
 }
@@ -1387,6 +1388,9 @@ func (m *model) goToAlbum() tea.Cmd {
 // half/full-page scrolling. Falls back to a sane minimum before the first render.
 func (m *model) pageSize() int {
 	n := m.viewportH - 1 // minus the list header row
+	if m.naming || m.filtering || m.filter != "" {
+		n-- // renderPanel gives a row to the naming/filter line
+	}
 	if n < 1 {
 		n = 10
 	}
@@ -2317,7 +2321,10 @@ func (m *model) nextTrack() tea.Cmd {
 // the playing entry isn't in the queue (queuePos out of range).
 func (m *model) nextShuffleIdx() int {
 	n := len(m.queue)
-	if n <= 1 || m.queuePos < 0 || m.queuePos >= n {
+	if n <= 1 {
+		return 0
+	}
+	if m.queuePos < 0 || m.queuePos >= n {
 		return rand.Intn(n)
 	}
 	idx := rand.Intn(n - 1)
@@ -2336,7 +2343,7 @@ func (m *model) continueRadio() tea.Cmd {
 	client := m.api
 	return func() tea.Msg {
 		tracks, err := client.Related(seed)
-		return autoContinueMsg{tracks: tracks, err: err}
+		return autoContinueMsg{tracks: tracks, seed: seed, err: err}
 	}
 }
 

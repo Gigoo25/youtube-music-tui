@@ -1250,67 +1250,81 @@ func (m *model) renderHistory(w, h int) string {
 
 // ─── Help screen ───────────────────────────────────────────────────────────────
 
-func (m *model) renderHelp(w, h int) string {
-	type binding struct{ key, desc string }
-	sections := []struct {
-		title string
-		keys  []binding
-	}{
-		{"Playback", []binding{
-			{"Space", "play / pause"},
-			{"n / b", "next / previous track"},
-			{"< / >", "seek backward / forward"},
-			{"+ / -", "volume up / down"},
-			{"m", "mute / unmute"},
-			{"s", "toggle shuffle"},
-			{"r", "cycle repeat mode"},
-			{"R", "start radio from current track"},
-			{"C", "auto-continue radio when the queue ends"},
-		}},
-		{"Queue & track", []binding{
-			{"enter", "queue / play selected"},
-			{"p", "play now (album view: play album, replaces queue)"},
-			{"e", "queue all (album / artist / search / playlist)"},
-			{"f", "toggle favorite"},
-			{"d / x", "remove (queue / favorites / history / playlist)"},
-			{"J / K", "move track down / up in queue"},
-			{".", "jump to now-playing (queue)"},
-			{"c", "clear queue / clear history (asks to confirm)"},
-		}},
-		{"Playlists", []binding{
-			{"6", "open Playlists"},
-			{"S", "save the queue as a playlist"},
-			{"P", "add the selected song to a playlist"},
-			{"enter / l", "view a playlist's tracks"},
-			{"p", "play a playlist (replaces the queue)"},
-			{"e", "append a playlist to the queue"},
-			{"d", "delete a playlist / remove a song (in playlist view)"},
-		}},
-		{"Lists & navigation", []binding{
-			{"j / k", "navigate list"},
-			{"l / right", "open selected (sidebar / playlist / artist album)"},
-			{"gg / G", "jump to top / bottom"},
-			{"ctrl+d / ctrl+u", "scroll half page down / up"},
-			{"ctrl+f / ctrl+b", "scroll full page down / up"},
-			{"tab", "toggle sidebar / panel focus"},
-			{"h / esc", "step back (contextual view) / back to menu"},
-		}},
-		{"Views & discovery", []binding{
-			{"1-6", "jump to view (Home…Playlists)"},
-			{"2", "global YouTube Music search"},
-			{"ctrl+u / ctrl+w", "clear query / delete word back (while typing)"},
-			{"/", "filter the current pane (esc clears)"},
-			{"a", "open the track's album (Enter to play it)"},
-			{"A", "open the track's artist (top songs + albums)"},
-			{"z", "random song (pick a genre)"},
-		}},
-		{"App", []binding{
-			{"T", "cycle color theme"},
-			{"?", "this help"},
-			{"q", "quit"},
-		}},
-	}
+type helpBinding struct{ key, desc string }
 
+// helpSections is static: hoisted out of renderHelp so the model can size the
+// scroll window (helpRowCount) without rendering.
+var helpSections = []struct {
+	title string
+	keys  []helpBinding
+}{
+	{"Playback", []helpBinding{
+		{"Space", "play / pause"},
+		{"n / b", "next / previous track"},
+		{"< / >", "seek backward / forward"},
+		{"+ / -", "volume up / down"},
+		{"m", "mute / unmute"},
+		{"s", "toggle shuffle"},
+		{"r", "cycle repeat mode"},
+		{"R", "start radio from current track"},
+		{"C", "auto-continue radio when the queue ends"},
+	}},
+	{"Queue & track", []helpBinding{
+		{"enter", "queue / play selected"},
+		{"p", "play now (album view: play album, replaces queue)"},
+		{"e", "queue all (album / artist / search / playlist)"},
+		{"f", "toggle favorite"},
+		{"d / x", "remove (queue / favorites / history / playlist)"},
+		{"J / K", "move track down / up in queue"},
+		{".", "jump to now-playing (queue)"},
+		{"c", "clear queue / clear history (asks to confirm)"},
+	}},
+	{"Playlists", []helpBinding{
+		{"6", "open Playlists"},
+		{"S", "save the queue as a playlist"},
+		{"P", "add the selected song to a playlist"},
+		{"enter / l", "view a playlist's tracks"},
+		{"p", "play a playlist (replaces the queue)"},
+		{"e", "append a playlist to the queue"},
+		{"d", "delete a playlist / remove a song (in playlist view)"},
+	}},
+	{"Lists & navigation", []helpBinding{
+		{"j / k", "navigate list"},
+		{"l / right", "open selected (sidebar / playlist / artist album)"},
+		{"gg / G", "jump to top / bottom"},
+		{"ctrl+d / ctrl+u", "scroll half page down / up"},
+		{"ctrl+f / ctrl+b", "scroll full page down / up"},
+		{"tab", "toggle sidebar / panel focus"},
+		{"h / esc", "step back (contextual view) / back to menu"},
+	}},
+	{"Views & discovery", []helpBinding{
+		{"1-6", "jump to view (Home…Playlists)"},
+		{"2", "global YouTube Music search"},
+		{"ctrl+u / ctrl+w", "clear query / delete word back (while typing)"},
+		{"/", "filter the current pane (esc clears)"},
+		{"a", "open the track's album (Enter to play it)"},
+		{"A", "open the track's artist (top songs + albums)"},
+		{"z", "random song (pick a genre)"},
+	}},
+	{"App", []helpBinding{
+		{"T", "cycle color theme"},
+		{"?", "this help"},
+		{"q", "quit"},
+	}},
+}
+
+// helpRowCount mirrors the row layout in renderHelp (one title, then per
+// section a blank, a heading and one row per binding) so vimMove can clamp the
+// help cursor. TestHelpRowCount keeps the two in step.
+func helpRowCount() int {
+	n := 1
+	for _, sec := range helpSections {
+		n += 2 + len(sec.keys)
+	}
+	return n
+}
+
+func (m *model) renderHelp(w, h int) string {
 	inner := w - 2
 	if inner < 1 {
 		inner = 1
@@ -1323,19 +1337,18 @@ func (m *model) renderHelp(w, h int) string {
 	}
 	var rows []string
 	rows = append(rows, styleSecondaryBold.Render(truncate2(iconHelp+" Keyboard Shortcuts", textW)))
-	for _, sec := range sections {
+	for _, sec := range helpSections {
 		rows = append(rows, "", styleSecondaryBold.Render(truncate2(sec.title, textW)))
 		for _, k := range sec.keys {
 			rows = append(rows, truncate2(stylePrimary.Render(fmt.Sprintf("  %-16s", k.key))+styleText.Render(k.desc), textW))
 		}
 	}
 
-	// ponytail: no help cursor exists, so the window is pinned to the top.
 	bodyH := h - 2 // border rows
 	if bodyH < 1 {
 		bodyH = 1
 	}
-	return styleContentBox.Width(inner).Render(windowRows(rows, 0, bodyH))
+	return styleContentBox.Width(inner).Render(windowRows(rows, m.helpCursor, bodyH))
 }
 
 // ─── Shared list helpers ───────────────────────────────────────────────────────
