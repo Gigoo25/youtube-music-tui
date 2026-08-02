@@ -9,6 +9,7 @@ package mpris
 import (
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/introspect"
@@ -149,12 +150,42 @@ func New(h Handlers) (*Server, error) {
 	// through bubbletea's Program.Send, which blocks on an unbuffered channel. The
 	// Update goroutine holds nothing but wants that same mut in props.SetMust, so
 	// calling SetVolume synchronously here deadlocks the app on any tick that races
-	// a `playerctl volume` set. Hand off to a goroutine: this only forwards a message.
-	volumeCb := func(c *prop.Change) *dbus.Error {
-		if v, ok := c.Value.(float64); ok && h.SetVolume != nil {
-			go h.SetVolume(v)
+	// a `playerctl volume` set. So the callback must hand off and return.
+	//
+	// One worker, not a goroutine per change: goroutines race each other into
+	// Send, so dragging a volume slider (which emits a burst of sets) could apply
+	// them out of order and leave mpv disagreeing with the level D-Bus reports.
+	// Volume is an absolute level, so the worker coalesces — it always applies the
+	// newest pending value and drops the ones overtaken while it was busy.
+	volumeCb := func(*prop.Change) *dbus.Error { return nil }
+	if h.SetVolume != nil {
+		var (
+			volMu   sync.Mutex
+			pending float64
+		)
+		wake := make(chan struct{}, 1)
+		go func() {
+			for range wake {
+				volMu.Lock()
+				v := pending
+				volMu.Unlock()
+				h.SetVolume(v)
+			}
+		}()
+		volumeCb = func(c *prop.Change) *dbus.Error {
+			v, ok := c.Value.(float64)
+			if !ok {
+				return nil
+			}
+			volMu.Lock()
+			pending = v
+			volMu.Unlock()
+			select {
+			case wake <- struct{}{}:
+			default: // already signalled; the worker will read the value above
+			}
+			return nil
 		}
-		return nil
 	}
 
 	propsSpec := map[string]map[string]*prop.Prop{
