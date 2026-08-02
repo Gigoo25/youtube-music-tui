@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -44,28 +45,28 @@ type State struct {
 }
 
 type Player struct {
-	cmd        *exec.Cmd
-	procMu     sync.Mutex // serializes mpv process kill/spawn (recover vs Close)
-	sockPath   string
-	conn       net.Conn
-	mu         sync.Mutex  // protects state, conn, reqID, loadGen, loadCancel, playingID, urlCache, inflight
-	sendCh     chan []byte // serialized writes
-	reqID      int
-	loadGen    int                // epoch token: cancels stale async loads
-	loadCancel context.CancelFunc // cancels the in-flight load's yt-dlp, if any
-	playingID  string             // videoID last handed to mpv via loadfile (cache invalidation on stream error)
-	state      State
-	lastErr    string               // most recent load/playback failure, for the UI
-	restarted  bool                 // set after an automatic mpv respawn; polled by the TUI
-	alive      bool                 // readLoop running; false once recovery has given up
-	respawns   int                  // consecutive respawn attempts (reset after a stable session)
-	urlCache   map[string]cachedURL // videoID -> resolved stream URL (prefetch)
-	inflight   map[string]struct{}  // videoIDs with a resolve in progress (prefetch dedup)
-	done       chan struct{}        // signalled on natural end-of-file
-	closed     chan struct{}        // closed once on shutdown
-	closeOnce  sync.Once
-	baseCtx    context.Context    // parent of every resolve ctx; cancelled by Close
-	baseCancel context.CancelFunc // set in New, then immutable
+	cmd          *exec.Cmd
+	procMu       sync.Mutex // serializes mpv process kill/spawn (recover vs Close)
+	sockPath     string
+	conn         net.Conn
+	mu           sync.Mutex         // protects state, conn, loadGen, loadCancel, playingID, urlCache, inflight
+	sendCh       chan []byte        // serialized writes
+	loadGen      int                // epoch token: cancels stale async loads
+	loadCancel   context.CancelFunc // cancels the in-flight load's yt-dlp, if any
+	playingID    string             // videoID last handed to mpv via loadfile (cache invalidation on stream error)
+	state        State
+	lastErr      string                        // most recent load/playback failure, for the UI
+	restarted    bool                          // set after an automatic mpv respawn; polled by the TUI
+	alive        bool                          // readLoop running; false once recovery has given up
+	respawns     int                           // consecutive respawn attempts (reset after a stable session)
+	urlCache     map[string]cachedURL          // videoID -> resolved stream URL (prefetch)
+	inflight     map[string]context.CancelFunc // videoID -> cancel for an in-progress resolve
+	inflightFIFO []string                      // claim order, oldest first (eviction queue)
+	done         chan struct{}                 // signalled on natural end-of-file
+	closed       chan struct{}                 // closed once on shutdown
+	closeOnce    sync.Once
+	baseCtx      context.Context    // parent of every resolve ctx; cancelled by Close
+	baseCancel   context.CancelFunc // set in New, then immutable
 }
 
 // cachedURL is a yt-dlp-resolved stream URL with the time it was resolved.
@@ -79,18 +80,16 @@ type cachedURL struct {
 const urlTTL = 30 * time.Minute
 
 type ipcCmd struct {
-	Command   []any `json:"command"`
-	RequestID int   `json:"request_id"`
+	Command []any `json:"command"`
 }
 
+// ipcResp is the subset of mpv's IPC reply/event schema this client reads;
+// command acknowledgements are ignored, so error/request_id are not decoded.
 type ipcResp struct {
-	Error     string `json:"error"`
-	Data      any    `json:"data"`
-	RequestID int    `json:"request_id"`
-	Event     string `json:"event"`
-	ID        int    `json:"id"`
-	Name      string `json:"name"`
-	Reason    string `json:"reason"`
+	Data   any    `json:"data"`
+	Event  string `json:"event"`
+	ID     int    `json:"id"`
+	Reason string `json:"reason"`
 }
 
 // spawnMPV starts a fresh mpv subprocess serving IPC on sockPath. Shared by the
@@ -169,7 +168,7 @@ func New(volume float64) (*Player, error) {
 		},
 	}
 
-	conn, err := dialWithRetry(sockPath, 30, 100*time.Millisecond)
+	conn, err := dialWithRetry(sockPath, 30, 100*time.Millisecond, p.closed)
 	if err != nil {
 		reap(cmd)
 		return nil, fmt.Errorf("connect mpv IPC: %w", err)
@@ -183,7 +182,7 @@ func New(volume float64) (*Player, error) {
 	p.observeProperties()
 
 	// Restore the saved volume (mpv starts at 100 by default).
-	p.SetVolume(volume) //nolint:errcheck
+	p.SetVolume(volume)
 
 	return p, nil
 }
@@ -191,25 +190,32 @@ func New(volume float64) (*Player, error) {
 // observeProperties (re)subscribes the property observations the state snapshot
 // depends on. Must run after every new IPC connection.
 func (p *Player) observeProperties() {
-	p.send([]any{"observe_property", 1, "time-pos"}) //nolint:errcheck
-	p.send([]any{"observe_property", 2, "duration"}) //nolint:errcheck
-	p.send([]any{"observe_property", 3, "pause"}) //nolint:errcheck
-	p.send([]any{"observe_property", 4, "volume"}) //nolint:errcheck
-	p.send([]any{"observe_property", 5, "idle-active"}) //nolint:errcheck
-	p.send([]any{"observe_property", 6, "mute"}) //nolint:errcheck
+	p.send([]any{"observe_property", 1, "time-pos"})
+	p.send([]any{"observe_property", 2, "duration"})
+	p.send([]any{"observe_property", 3, "pause"})
+	p.send([]any{"observe_property", 4, "volume"})
+	p.send([]any{"observe_property", 5, "idle-active"})
+	p.send([]any{"observe_property", 6, "mute"})
 }
 
-func dialWithRetry(path string, attempts int, delay time.Duration) (net.Conn, error) {
+// dialWithRetry connects to the mpv IPC socket, retrying until attempts run out.
+// abort short-circuits the wait so Close() isn't stuck behind a full retry budget
+// (recover holds procMu across this call, and Close blocks on procMu).
+func dialWithRetry(path string, attempts int, delay time.Duration, abort <-chan struct{}) (net.Conn, error) {
 	var (
 		conn net.Conn
 		err  error
 	)
-	for i := 0; i < attempts; i++ {
+	for range attempts {
 		conn, err = net.Dial("unix", path)
 		if err == nil {
 			return conn, nil
 		}
-		time.Sleep(delay)
+		select {
+		case <-abort:
+			return nil, errors.New("player closed")
+		case <-time.After(delay):
+		}
 	}
 	return nil, err
 }
@@ -222,7 +228,7 @@ func reap(c *exec.Cmd) {
 		return
 	}
 	c.Process.Kill() //nolint:errcheck
-	c.Wait() //nolint:errcheck
+	c.Wait()         //nolint:errcheck
 }
 
 func (p *Player) writeLoop() {
@@ -265,27 +271,28 @@ func (p *Player) beginLoad(videoID string) (int, context.Context) {
 	return p.loadGen, ctx
 }
 
-func (p *Player) Load(videoID string) error {
+func (p *Player) Load(videoID string) {
 	gen, ctx := p.beginLoad(videoID)
 
 	// Cache hit (prefetched while the previous track played): skip yt-dlp and
 	// hand the URL straight to mpv — the common auto-advance path is instant.
 	if url, ok := p.cacheGet(videoID); ok {
 		p.mu.Lock()
+		defer p.mu.Unlock()
 		if p.loadCancel != nil {
 			p.loadCancel() // no extraction for this load; release its ctx timer
 			p.loadCancel = nil
 		}
 		p.playingID = videoID
-		p.mu.Unlock()
-		return p.send([]any{"loadfile", url, "replace"})
+		p.send([]any{"loadfile", url, "replace"})
+		return
 	}
 
 	// Cache miss: the resolve takes seconds, and mpv would keep playing the
 	// previous track the whole time — a skip must silence it immediately.
 	// (end-file reason "stop" is ignored by scan, so this can't fake a track
 	// ending; the loadfile below restarts playback when the URL arrives.)
-	p.send([]any{"stop"}) //nolint:errcheck
+	p.send([]any{"stop"})
 
 	go func() {
 		// Deliberately not deduped against an in-flight Prefetch of the same id:
@@ -297,10 +304,11 @@ func (p *Player) Load(videoID string) error {
 			p.cachePut(videoID, url)
 		}
 
+		// The epoch check and the loadfile must be one critical section: a Stop()
+		// or newer Load() slipping between them would be undone by this send.
 		p.mu.Lock()
-		stale := gen != p.loadGen
-		if stale {
-			p.mu.Unlock()
+		defer p.mu.Unlock()
+		if gen != p.loadGen {
 			return // a newer load superseded this one
 		}
 		if p.loadCancel != nil {
@@ -314,15 +322,11 @@ func (p *Player) Load(videoID string) error {
 			} else {
 				p.lastErr = "could not resolve stream: " + err.Error()
 			}
-			p.mu.Unlock()
 			return
 		}
 		p.playingID = videoID
-		p.mu.Unlock()
-
-	p.send([]any{"loadfile", url, "replace"}) //nolint:errcheck
+		p.send([]any{"loadfile", url, "replace"})
 	}()
-	return nil
 }
 
 // Prefetch resolves a stream URL in the background and caches it so a later
@@ -330,47 +334,72 @@ func (p *Player) Load(videoID string) error {
 // no-op on a cache hit or when a resolve for the same id is already running, so
 // rapid re-triggers (e.g. queue reordering) never spawn duplicate yt-dlp
 // processes for the same video — which would otherwise multiply requests to
-// YouTube and risk rate limiting.
+// YouTube and risk rate limiting. Concurrency is capped at maxInflightResolves.
 func (p *Player) Prefetch(videoID string) {
-	if videoID == "" || !p.claimResolve(videoID) {
+	if videoID == "" {
+		return
+	}
+	// Own timeout, deliberately not tied to loadCancel: a prefetch warms a future
+	// track and must survive the current load being superseded.
+	ctx, ok := p.claimResolve(videoID)
+	if !ok {
 		return
 	}
 	go func() {
 		defer p.releaseResolve(videoID)
-		// Own timeout, deliberately not tied to loadCancel: a prefetch warms a
-		// future track and must survive the current load being superseded.
-		ctx, cancel := context.WithTimeout(p.baseCtx, loadTimeout)
-		defer cancel()
 		if url, resolved, _ := extractURL(ctx, videoID); resolved {
 			p.cachePut(videoID, url)
 		}
 	}()
 }
 
-// claimResolve reports whether videoID needs a fresh resolve, marking it
-// in-flight if so. It returns false when the URL is already cached or another
-// resolve for the same id is already running, so each video is resolved at most
-// once at a time.
-func (p *Player) claimResolve(videoID string) bool {
+// maxInflightResolves caps concurrent background yt-dlp processes. Each costs
+// ~50MB of RSS and a YouTube round trip, and every track change asks for a fresh
+// prefetchAhead batch — so skipping quickly through a queue would otherwise leave
+// dozens running for the full loadTimeout. When the cap is reached the oldest
+// resolve is cancelled rather than the new one refused: the newest request
+// reflects where the user actually is, and a superseded warm-up is wasted work.
+const maxInflightResolves = 3
+
+// claimResolve reserves a resolve slot for videoID, returning the context the
+// resolve must run under. It returns false when the URL is already cached or
+// another resolve for the same id is already running, so each video is resolved
+// at most once at a time.
+func (p *Player) claimResolve(videoID string) (context.Context, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, ok := p.cachedLocked(videoID); ok {
-		return false // already resolved and still fresh
+		return nil, false // already resolved and still fresh
 	}
 	if _, ok := p.inflight[videoID]; ok {
-		return false
+		return nil, false
 	}
 	if p.inflight == nil {
-		p.inflight = make(map[string]struct{})
+		p.inflight = make(map[string]context.CancelFunc)
 	}
-	p.inflight[videoID] = struct{}{}
-	return true
+	for len(p.inflightFIFO) >= maxInflightResolves {
+		p.dropResolveLocked(p.inflightFIFO[0])
+	}
+	ctx, cancel := context.WithTimeout(p.baseCtx, loadTimeout)
+	p.inflight[videoID] = cancel
+	p.inflightFIFO = append(p.inflightFIFO, videoID)
+	return ctx, true
 }
 
 func (p *Player) releaseResolve(videoID string) {
 	p.mu.Lock()
-	delete(p.inflight, videoID)
+	p.dropResolveLocked(videoID)
 	p.mu.Unlock()
+}
+
+// dropResolveLocked cancels and forgets a resolve. Cancelling one that already
+// finished is a no-op, so this doubles as both eviction and cleanup.
+func (p *Player) dropResolveLocked(videoID string) {
+	if cancel, ok := p.inflight[videoID]; ok {
+		cancel()
+		delete(p.inflight, videoID)
+	}
+	p.inflightFIFO = slices.DeleteFunc(p.inflightFIFO, func(id string) bool { return id == videoID })
 }
 
 // cachedLocked returns videoID's cached URL if present and still inside urlTTL.
@@ -481,82 +510,81 @@ func validVideoID(s string) bool {
 	return true
 }
 
-func (p *Player) PlayPause() error {
-	return p.send([]any{"cycle", "pause"})
+func (p *Player) PlayPause() {
+	p.send([]any{"cycle", "pause"})
 }
 
 // Play resumes playback (MPRIS Play — explicit, unlike the PlayPause toggle).
-func (p *Player) Play() error {
-	return p.send([]any{"set_property", "pause", false})
+func (p *Player) Play() {
+	p.send([]any{"set_property", "pause", false})
 }
 
 // Pause pauses playback (MPRIS Pause — explicit, unlike the PlayPause toggle).
-func (p *Player) Pause() error {
-	return p.send([]any{"set_property", "pause", true})
+func (p *Player) Pause() {
+	p.send([]any{"set_property", "pause", true})
 }
 
 // ToggleMute flips mpv's mute flag. mpv keeps mute independent of volume, so the
 // stored volume level (and its display) is unaffected.
-func (p *Player) ToggleMute() error {
-	return p.send([]any{"cycle", "mute"})
+func (p *Player) ToggleMute() {
+	p.send([]any{"cycle", "mute"})
 }
 
-func (p *Player) Seek(seconds float64) error {
-	return p.send([]any{"seek", seconds, "relative"})
+func (p *Player) Seek(seconds float64) {
+	p.send([]any{"seek", seconds, "relative"})
 }
 
 // SeekAbs seeks to an absolute position in seconds (MPRIS SetPosition).
-func (p *Player) SeekAbs(seconds float64) error {
-	return p.send([]any{"seek", seconds, "absolute"})
+func (p *Player) SeekAbs(seconds float64) {
+	p.send([]any{"seek", seconds, "absolute"})
 }
 
-func (p *Player) SetVolume(vol float64) error {
-	if vol > 150 {
-		vol = 150
-	}
-	if vol < 0 {
-		vol = 0
-	}
-	return p.send([]any{"set_property", "volume", vol})
+func (p *Player) SetVolume(vol float64) {
+	p.send([]any{"set_property", "volume", clampVolume(vol)})
 }
 
-func (p *Player) VolumeUp() error {
+func clampVolume(vol float64) float64 {
+	return min(max(vol, 0), 150)
+}
+
+// VolumeUp/VolumeDown nudge the level by 5 and return the new (clamped) value so
+// callers can update their display without waiting for the property observer.
+func (p *Player) VolumeUp() float64 { return p.nudgeVolume(5) }
+
+func (p *Player) VolumeDown() float64 { return p.nudgeVolume(-5) }
+
+func (p *Player) nudgeVolume(delta float64) float64 {
 	p.mu.Lock()
-	vol := p.state.Volume + 5
+	vol := clampVolume(p.state.Volume + delta)
 	p.mu.Unlock()
-	return p.SetVolume(vol)
+	p.send([]any{"set_property", "volume", vol})
+	return vol
 }
 
-func (p *Player) VolumeDown() error {
-	p.mu.Lock()
-	vol := p.state.Volume - 5
-	p.mu.Unlock()
-	return p.SetVolume(vol)
-}
-
-func (p *Player) Stop() error {
+func (p *Player) Stop() {
 	// Cancel any in-flight load and bump the epoch so a pending yt-dlp extraction
 	// can't fire loadfile after the stop and resurrect playback (e.g. clearing the
-	// queue while a track was still resolving).
+	// queue while a track was still resolving). The send stays under p.mu so a
+	// resolver that already passed its epoch check can't slip loadfile in behind.
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.loadCancel != nil {
 		p.loadCancel()
 		p.loadCancel = nil
 	}
 	p.loadGen++
 	p.state.Loading = false
-	p.mu.Unlock()
-	return p.send([]any{"stop"})
+	p.send([]any{"stop"})
 }
 
 // SetTitle sets mpv's force-media-title so the stream shows a clean track name
 // (e.g. in mpv logs) instead of the raw URL. Now-playing metadata for MPRIS
 // shells is published separately by internal/mpris.
-func (p *Player) SetTitle(title string) error {
+func (p *Player) SetTitle(title string) {
 	if title == "" {
-		return nil
+		return
 	}
-	return p.send([]any{"set_property", "force-media-title", title})
+	p.send([]any{"set_property", "force-media-title", title})
 }
 
 func (p *Player) State() State {
@@ -606,28 +634,26 @@ func (p *Player) TrackEnded() bool {
 	}
 }
 
-func (p *Player) send(cmd []any) error {
-	p.mu.Lock()
-	p.reqID++
-	id := p.reqID
-	p.mu.Unlock()
-
-	msg := ipcCmd{Command: cmd, RequestID: id}
-	b, _ := json.Marshal(msg)
+// send queues an mpv IPC command. Fire-and-forget by design: mpv answers
+// commands on the same socket the event stream uses, and nothing correlates
+// replies, so there is no error to report — failures surface as missing state
+// updates and are handled by readLoop/recover. Takes no lock, so callers may
+// hold p.mu (Load and Stop rely on that to make check-then-send atomic).
+func (p *Player) send(cmd []any) {
+	b, _ := json.Marshal(ipcCmd{Command: cmd})
 	b = append(b, '\n')
 
 	// sendCh is never closed. This was a three-way select including <-p.closed,
 	// but Go picks uniformly among ready cases, so post-Close sends still enqueued
 	// half the time — and the default made the closed case useless as an unblocker.
 	if p.isClosed() {
-		return nil
+		return
 	}
 	select {
 	case p.sendCh <- b:
 	default:
 		// channel full (writeLoop wedged); drop the command rather than block
 	}
-	return nil
 }
 
 // maxRespawns caps consecutive mpv respawn attempts so a crash-looping mpv
@@ -677,6 +703,9 @@ func (p *Player) readLoop() {
 		}
 	}
 
+	if p.isClosed() {
+		return // recover() bailed because we're shutting down, not because mpv died
+	}
 	p.mu.Lock()
 	p.alive = false
 	p.state.Idle = true
@@ -764,7 +793,7 @@ func (p *Player) scan(conn net.Conn) {
 // false on shutdown or once the respawn budget is spent.
 func (p *Player) recover() bool {
 	// The connection may have dropped while mpv itself is fine — try redialing.
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		if p.isClosed() {
 			return false
 		}
@@ -796,7 +825,7 @@ func (p *Player) recover() bool {
 
 		cmd, err := spawnMPV(p.sockPath)
 		if err == nil {
-			conn, derr := dialWithRetry(p.sockPath, 30, 100*time.Millisecond)
+			conn, derr := dialWithRetry(p.sockPath, 30, 100*time.Millisecond, p.closed)
 			if derr == nil {
 				p.cmd = cmd
 				p.mu.Lock()
@@ -832,8 +861,8 @@ func (p *Player) adoptConn(conn net.Conn) {
 	p.mu.Unlock()
 
 	p.observeProperties()
-	p.SetVolume(vol) //nolint:errcheck
-	p.send([]any{"set_property", "mute", muted}) //nolint:errcheck
+	p.SetVolume(vol)
+	p.send([]any{"set_property", "mute", muted})
 }
 
 // Close shuts the player down. Safe to call more than once.

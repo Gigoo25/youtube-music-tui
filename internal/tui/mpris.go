@@ -91,14 +91,14 @@ func (m *model) handleMPRISAction(a mprisAction) (tea.Model, tea.Cmd) {
 		if !m.hasCurrent && len(m.queue) > 0 {
 			m.togglePlayback()
 		} else {
-			m.player.Play() //nolint:errcheck
+			m.player.Play()
 		}
 	case mprisPause:
-		m.player.Pause() //nolint:errcheck
+		m.player.Pause()
 	case mprisPlayPause:
 		m.togglePlayback()
 	case mprisStop:
-		m.player.Stop() //nolint:errcheck
+		m.player.Stop()
 		m.hasCurrent = false
 	case mprisQuit:
 		return m, tea.Quit
