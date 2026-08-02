@@ -358,48 +358,30 @@ func headerTitle(root any, keys ...string) string {
 	return ""
 }
 
-// findRenderer recursively returns the first object stored under the given key.
+// findRenderer returns the first object stored under the given key.
 func findRenderer(node any, key string) map[string]any {
-	switch v := node.(type) {
-	case map[string]any:
-		if r, ok := v[key].(map[string]any); ok {
-			return r
+	var out map[string]any
+	walkFirst(node, func(m map[string]any) bool {
+		r, ok := m[key].(map[string]any)
+		if ok {
+			out = r
 		}
-		for _, child := range v {
-			if r := findRenderer(child, key); r != nil {
-				return r
-			}
-		}
-	case []any:
-		for _, child := range v {
-			if r := findRenderer(child, key); r != nil {
-				return r
-			}
-		}
-	}
-	return nil
+		return ok
+	})
+	return out
 }
 
-// findBrowseID recursively returns the browseId of the first browseEndpoint
-// object satisfying want ("" when none does). want must reject an empty
-// browseId, since "" doubles as "not found".
+// findBrowseID returns the browseId of the first browseEndpoint object
+// satisfying want ("" when none does).
 func findBrowseID(node any, want func(be map[string]any) bool) string {
-	switch v := node.(type) {
-	case map[string]any:
-		if be, ok := v["browseEndpoint"].(map[string]any); ok && want(be) {
-			return str(be["browseId"])
+	var id string
+	walkFirst(node, func(m map[string]any) bool {
+		be, ok := m["browseEndpoint"].(map[string]any)
+		if !ok || !want(be) {
+			return false
 		}
-		for _, child := range v {
-			if id := findBrowseID(child, want); id != "" {
-				return id
-			}
-		}
-	case []any:
-		for _, child := range v {
-			if id := findBrowseID(child, want); id != "" {
-				return id
-			}
-		}
-	}
-	return ""
+		id = str(be["browseId"])
+		return id != ""
+	})
+	return id
 }

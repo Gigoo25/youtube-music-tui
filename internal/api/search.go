@@ -53,31 +53,19 @@ func (c *Client) SearchSongsPage(query, continuation string) ([]Track, string, e
 // Innertube responses carry it in a continuationCommand; older shelf layouts use
 // nextContinuationData. Returns "" when there is no further page.
 func findSearchContinuation(node any) string {
-	switch v := node.(type) {
-	case map[string]any:
-		if cc, ok := v["continuationCommand"].(map[string]any); ok {
-			if tok := str(cc["token"]); tok != "" {
-				return tok
+	var tok string
+	walkFirst(node, func(m map[string]any) bool {
+		if cc, ok := m["continuationCommand"].(map[string]any); ok {
+			tok = str(cc["token"])
+		}
+		if tok == "" {
+			if nc, ok := m["nextContinuationData"].(map[string]any); ok {
+				tok = str(nc["continuation"])
 			}
 		}
-		if nc, ok := v["nextContinuationData"].(map[string]any); ok {
-			if tok := str(nc["continuation"]); tok != "" {
-				return tok
-			}
-		}
-		for _, child := range v {
-			if r := findSearchContinuation(child); r != "" {
-				return r
-			}
-		}
-	case []any:
-		for _, child := range v {
-			if r := findSearchContinuation(child); r != "" {
-				return r
-			}
-		}
-	}
-	return ""
+		return tok != ""
+	})
+	return tok
 }
 
 // extractSongRow parses a search "Songs" row. flexColumn[0] is the title (and may

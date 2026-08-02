@@ -2,6 +2,8 @@ package api
 
 import (
 	"encoding/json"
+	"maps"
+	"slices"
 	"strings"
 )
 
@@ -126,21 +128,7 @@ func considerChartPlaylist(r map[string]any, picked, fallback *string) {
 // walkRenderers recursively descends the decoded JSON and invokes fn for every
 // object found under the given renderer key.
 func walkRenderers(node any, key string, fn func(map[string]any)) {
-	switch v := node.(type) {
-	case map[string]any:
-		for k, child := range v {
-			if k == key {
-				if m, ok := child.(map[string]any); ok {
-					fn(m)
-				}
-			}
-			walkRenderers(child, key, fn)
-		}
-	case []any:
-		for _, child := range v {
-			walkRenderers(child, key, fn)
-		}
-	}
+	walkRenderersMulti(node, map[string]func(map[string]any){key: fn})
 }
 
 // walkRenderersMulti is walkRenderers for several renderer keys at once: it
@@ -149,7 +137,8 @@ func walkRenderers(node any, key string, fn func(map[string]any)) {
 func walkRenderersMulti(node any, handlers map[string]func(map[string]any)) {
 	switch v := node.(type) {
 	case map[string]any:
-		for k, child := range v {
+		for _, k := range sortedKeys(v) {
+			child := v[k]
 			if fn, ok := handlers[k]; ok {
 				if m, ok := child.(map[string]any); ok {
 					fn(m)
@@ -162,6 +151,38 @@ func walkRenderersMulti(node any, handlers map[string]func(map[string]any)) {
 			walkRenderersMulti(child, handlers)
 		}
 	}
+}
+
+// walkFirst descends node depth-first and stops at the first object for which
+// hit returns true. Together with sortedKeys this makes "first match" stable:
+// Go randomizes map iteration, so an unsorted descent picks a different album,
+// header or continuation token from the same payload on different runs.
+func walkFirst(node any, hit func(map[string]any) bool) bool {
+	switch v := node.(type) {
+	case map[string]any:
+		if hit(v) {
+			return true
+		}
+		for _, k := range sortedKeys(v) {
+			if walkFirst(v[k], hit) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if walkFirst(child, hit) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sortedKeys orders a JSON object's keys so traversal is reproducible. Innertube
+// objects hold a handful of keys each, so this costs far less than the network
+// round trip that produced the payload.
+func sortedKeys(m map[string]any) []string {
+	return slices.Sorted(maps.Keys(m))
 }
 
 // dedupeTracks removes duplicate tracks by ID, keeps only valid ones, and caps
