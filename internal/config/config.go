@@ -117,8 +117,9 @@ func (c *Config) Save() error {
 		f.Close() //nolint:errcheck
 		return err
 	}
-	// Sync before rename: rename is atomic but not durable, so without this a
-	// power loss can surface a truncated config.
+	// Sync before rename so the rename can never publish a half-written file.
+	// The rename itself is not fsynced (no directory Sync), so a power cut right
+	// after it can still leave the previous config — never a corrupt one.
 	if err := f.Sync(); err != nil {
 		f.Close() //nolint:errcheck
 		return err

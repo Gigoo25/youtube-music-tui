@@ -16,12 +16,13 @@ now-playing bar, and a context-aware shortcuts bar. Navigation is focus-based
 ```bash
 go build ./...                 # build everything
 go run ./cmd/ytmusic           # run the app
-go test ./...                  # run tests (TUI has the only test file)
+go test ./...                  # run tests (api, config, mpris, player, tui)
 go vet ./...                   # vet
 go build -o ytmusic ./cmd/ytmusic   # produce a binary
 
 make build                     # dev binary (= go build -o ytmusic ./cmd/ytmusic)
 make release                   # stripped binary, ~34% smaller (-trimpath -ldflags='-s -w')
+make lint                      # gofmt check + golangci-lint (gofmt is NOT in the default linter set)
 ```
 
 **Runtime requirements (external binaries, not Go deps):**

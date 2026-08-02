@@ -4,7 +4,7 @@ PKG     := ./cmd/ytmusic
 # from git tags/commit; falls back to "dev" outside a git checkout.
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
-.PHONY: build release run test vet clean
+.PHONY: build release run test vet lint clean
 
 # Development build.
 build:
@@ -26,6 +26,12 @@ test:
 
 vet:
 	go vet ./...
+
+# gofmt is not part of golangci-lint's default set, and an unformatted file still
+# builds, vets and lints clean — so check it explicitly or it ships.
+lint:
+	@bad=$$(gofmt -l cmd internal); [ -z "$$bad" ] || { echo "gofmt needed:"; echo "$$bad"; exit 1; }
+	golangci-lint run ./...
 
 clean:
 	rm -f $(BINARY)

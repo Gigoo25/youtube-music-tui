@@ -976,9 +976,9 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.player.ToggleMute()
 		m.playerState.Muted = !m.playerState.Muted
 		if m.playerState.Muted {
+			m.setStatus("muted")
 		} else {
 			m.setStatus("unmuted")
-			m.setStatus("muted")
 		}
 		return m, nil
 	case "s":
