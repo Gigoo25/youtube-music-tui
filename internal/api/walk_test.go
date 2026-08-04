@@ -55,3 +55,67 @@ func TestFindBrowseIDRejectsEmpty(t *testing.T) {
 		t.Fatalf("findBrowseID = %q, want MPREb1", got)
 	}
 }
+
+// TestFindSearchContinuationPrefersContinuationCommand: modern Innertube
+// responses carry the next-page token in continuationCommand.token. When both
+// that and nextContinuationData.continuation are present, the former must win.
+// Without this preference, a legacy response field would override the modern
+// one and paging would break on responses that include both.
+func TestFindSearchContinuationPrefersContinuationCommand(t *testing.T) {
+	payload := map[string]any{
+		"contents": []any{
+			map[string]any{
+				"continuationCommand":  map[string]any{"token": "TOKEN_MODERN"},
+				"nextContinuationData": map[string]any{"continuation": "TOKEN_LEGACY"},
+			},
+		},
+	}
+
+	if got := findSearchContinuation(payload); got != "TOKEN_MODERN" {
+		t.Fatalf("findSearchContinuation = %q, want TOKEN_MODERN (continuationCommand preferred)", got)
+	}
+}
+
+// TestFindSearchContinuationFallsBackToLegacy: older API versions omit
+// continuationCommand and use nextContinuationData.continuation instead.
+// Without this fallback, paging would stop on legacy responses.
+func TestFindSearchContinuationFallsBackToLegacy(t *testing.T) {
+	payload := map[string]any{
+		"contents": []any{
+			map[string]any{
+				"nextContinuationData": map[string]any{"continuation": "TOKEN_LEGACY"},
+			},
+		},
+	}
+
+	if got := findSearchContinuation(payload); got != "TOKEN_LEGACY" {
+		t.Fatalf("findSearchContinuation = %q, want TOKEN_LEGACY", got)
+	}
+}
+
+// TestFindSearchContinuationEmptyWhenMissing: when neither continuation field
+// is present, findSearchContinuation must return "". This is how paging knows
+// to stop — a wrong non-empty return would make search loop forever, hanging
+// the TUI on a single page of results.
+func TestFindSearchContinuationEmptyWhenMissing(t *testing.T) {
+	payload := map[string]any{
+		"contents": []any{
+			map[string]any{
+				"someOtherField": "value",
+			},
+		},
+	}
+
+	if got := findSearchContinuation(payload); got != "" {
+		t.Fatalf("findSearchContinuation = %q, want empty (no continuation data)", got)
+	}
+}
+
+// TestFindSearchContinuationEmptyPayload: a nil or empty payload must return
+// "", not panic. Some callers pass a partially-built response that may lack
+// the contents array entirely.
+func TestFindSearchContinuationEmptyPayload(t *testing.T) {
+	if got := findSearchContinuation(map[string]any{}); got != "" {
+		t.Fatalf("findSearchContinuation = %q, want empty", got)
+	}
+}
