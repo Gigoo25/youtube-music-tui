@@ -103,6 +103,12 @@ func (c *Config) Save() error {
 	if err != nil {
 		return err
 	}
+	// Ensure the parent directory exists — a direct Save() on an arbitrary
+	// path (e.g. from tests or a custom config path) must not fail with
+	// "no such file or directory" if the directory hasn't been created yet.
+	if err := os.MkdirAll(filepath.Dir(c.path), 0700); err != nil {
+		return err
+	}
 	// Unique temp name: instances coexist (mpris suffixes its bus name per pid),
 	// and a shared .tmp lets one rename a half-written file over the config.
 	// CreateTemp already creates 0600 — the config carries the user's full
