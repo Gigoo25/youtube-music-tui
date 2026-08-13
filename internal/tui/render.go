@@ -269,7 +269,10 @@ func (m *model) buildSidebar(w, h int) string {
 		}
 	}
 
-	body := padToHeight(strings.Join(rows, "\n"), h-2)
+	// Window on the cursor like every panel list: padToHeight alone truncates
+	// from the bottom, so on a short terminal the selection scrolls out of view.
+	// +2 skips the title and "Quick Links" heading rows.
+	body := padToHeight(windowRows(rows, m.navCursor+2, h-2), h-2)
 	return styleSidebarBox.Width(inner).Height(h - 2).Render(body)
 }
 
@@ -1348,7 +1351,20 @@ func (m *model) renderHelp(w, h int) string {
 	if bodyH < 1 {
 		bodyH = 1
 	}
-	return styleContentBox.Width(inner).Render(windowRows(rows, m.helpCursor, bodyH))
+	// helpCursor is a scroll offset, not a cursor: windowRows would centre it and
+	// swallow the first half-screen of j presses.
+	start := m.helpCursor
+	if maxStart := len(rows) - bodyH; start > maxStart {
+		start = maxStart
+	}
+	if start < 0 {
+		start = 0
+	}
+	end := start + bodyH
+	if end > len(rows) {
+		end = len(rows)
+	}
+	return styleContentBox.Width(inner).Render(strings.Join(rows[start:end], "\n"))
 }
 
 // ─── Shared list helpers ───────────────────────────────────────────────────────
