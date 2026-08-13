@@ -114,6 +114,7 @@ type model struct {
 	searchTyping       bool // true = editing query; false = browsing results
 	searching          bool
 	searchGen          int    // bumped per search; a slow older response must not clobber a newer one
+	randomGen          int    // epoch for random-genre searches; a stale result must not hijack playback
 	searchContinuation string // token for the next page of results ("" = none / exhausted)
 	searchMoreLoading  bool   // a load-more page request is in flight
 	searchResults      []api.Track
@@ -234,6 +235,7 @@ type tickMsg time.Time
 
 type randomDoneMsg struct {
 	tracks []api.Track
+	gen    int
 	err    error
 }
 
@@ -516,6 +518,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case randomDoneMsg:
+		if msg.gen != m.randomGen {
+			return m, nil // the user asked for something else while this was in flight
+		}
 		// Search (the random source) lives in the secret-blocked ytmusic.go, so its
 		// results are cleaned here rather than at the API boundary.
 		tracks := api.CleanTracks(msg.tracks)
@@ -1135,8 +1140,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		// In search results, esc clears results first; a second esc returns focus.
 		if m.activeView == viewSearch && len(m.searchResults) > 0 {
-			m.searchResults = nil
-			m.searchCursor = 0
+		m.searchResults = nil
+		m.searchCursor = 0
+		// Invalidate requests already on the wire: dropping the continuation
+		// token alone doesn't stop a page that was fetched before this esc.
+		m.searchGen++
 			// Drop pagination state with the results — a leftover continuation
 			// token would let j/k on the now-empty list fetch a page of the old
 			// query as orphan results.
@@ -1810,10 +1818,12 @@ func (m *model) playRandom() tea.Cmd {
 // playRandomGenre searches the given genre and plays a random result.
 func (m *model) playRandomGenre(seed string) tea.Cmd {
 	m.setStatus("finding a random " + seed + " song...")
+	m.randomGen++
+	gen := m.randomGen
 	client := m.api
 	return func() tea.Msg {
 		tracks, err := client.SearchSongs(seed)
-		return randomDoneMsg{tracks: tracks, err: err}
+		return randomDoneMsg{tracks: tracks, gen: gen, err: err}
 	}
 }
 
@@ -2230,11 +2240,15 @@ func (m *model) replaceQueue(ts []api.Track, start int) {
 	m.queueCursor = start
 	m.playAt(start)
 }
-
 func (m *model) playAt(idx int) {
 	if idx < 0 || idx >= len(m.queue) {
 		return
 	}
+	// A reload of the track already playing (retry, mpv respawn) is not a new
+	// play. Must be computed before m.current is reassigned below.
+	// ponytail: this also means repeat-one records one entry per track, not per
+	// replay — give the reload paths their own entry point if that matters.
+	reload := m.hasCurrent && m.current.ID == m.queue[idx].ID
 	m.queuePos = idx
 	t := m.queue[idx]
 	m.current = t
@@ -2259,9 +2273,11 @@ func (m *model) playAt(idx int) {
 	m.prefetchNext()
 
 	// Record the play in history (newest first); persistence is debounced.
-	m.cfg.AddHistory(t)
-	m.markConfigDirty()
-	m.historyCursor = 0
+	if !reload {
+		m.cfg.AddHistory(t)
+		m.markConfigDirty()
+		m.historyCursor = 0
+	}
 
 	// Publish the new track to MPRIS immediately (don't wait for the next tick).
 	m.pushMPRIS()
