@@ -98,6 +98,7 @@ type model struct {
 	homeCursor      int
 	homeQPLoading   bool
 	homeQPErr       string
+	homeQPAt        time.Time // last Quick Picks fetch, for the retry cooldown
 	helpCursor      int // help screen scroll offset (the only scroll with no visible cursor)
 
 	// artist view (top songs + albums for an artist) — contextual like album view
@@ -337,12 +338,30 @@ func (m *model) restoreSession() {
 	}
 }
 
+
+// maxSaveQueue caps the persisted queue the way maxHistory caps history: an
+// auto-continue session grows the live queue without bound, and the whole thing
+// is re-marshalled on every debounced save.
+const maxSaveQueue = 500
+
 // SnapshotSession copies the live session state into the config so the next
 // launch can restore it. Exported so main.go can call it on the final model
 // before the exit Save (the model holds the only authoritative queue).
 func (m *model) SnapshotSession() {
-	m.cfg.Queue = m.queue
-	m.cfg.QueuePos = m.queuePos
+	q, pos := m.queue, m.queuePos
+	if len(q) > maxSaveQueue {
+		// Keep a window around the playing track so resume lands on the same song.
+		start := pos - maxSaveQueue/2
+		if start < 0 {
+			start = 0
+		}
+		if start+maxSaveQueue > len(q) {
+			start = len(q) - maxSaveQueue
+		}
+		q, pos = q[start:start+maxSaveQueue], pos-start
+	}
+	m.cfg.Queue = q
+	m.cfg.QueuePos = pos
 	m.cfg.Shuffle = m.shuffle
 	m.cfg.Repeat = int(m.repeat)
 	// Volume lives on the player, so this is the single place it reaches the
@@ -449,6 +468,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.setError("config save failed: " + err.Error())
 			}
 			m.cfgDirty = false
+		}
+		// Quick Picks is otherwise fetched once at startup: retry slowly while the
+		// user is looking at Home so a launch without network isn't broken for the
+		// whole session.
+		if m.activeView == viewHome && !m.homeQPLoading && m.homeQPErr != "" &&
+			time.Since(m.homeQPAt) >= 30*time.Second {
+			cmds = append(cmds, m.loadHomeQuickPicks())
 		}
 		m.pushMPRIS()
 		cmds = append(cmds, m.nextTick())
@@ -575,7 +601,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.homeQPErr = ""
 			m.homeQuickPicks = msg.tracks
 		}
-		if m.homeCursor >= m.homeLen() {
+		// homeLen() is filter-relative to whatever view is active, which may not be
+		// Home right now; activateView re-clamps on the way back in.
+		if m.activeView == viewHome && m.homeCursor >= m.homeLen() {
 			m.homeCursor = max(0, m.homeLen()-1)
 		}
 		return m, nil
@@ -855,13 +883,14 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "enter":
 			name := strings.TrimSpace(m.playlistInput.Value())
-			m.naming = false
-			m.playlistInput.Blur()
 			if name == "" {
-				m.nameTrack = nil
+				// Stay in the overlay so the user can just type a name — tearing it
+				// down here would also discard the track being added.
 				m.setError("playlist name cannot be empty")
 				return m, nil
 			}
+			m.naming = false
+			m.playlistInput.Blur()
 			if t := m.nameTrack; t != nil {
 				m.nameTrack = nil
 				if m.cfg.AddToPlaylist(name, *t) {
@@ -1028,6 +1057,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Local filter of the current pane. In the global Search view, "/" instead
 		// re-focuses the query box (global search lives on the sidebar / key 2).
 		if m.filterableView() {
+			// The filter box lives in the panel — move focus with the keyboard.
+			m.focus = focusPanel
 			m.filtering = true
 			m.filterInput.Focus()
 			return m, textinput.Blink
@@ -1071,6 +1102,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.naming = true
+		m.focus = focusPanel // the naming overlay renders in the panel
 		m.playlistInput.SetValue("")
 		m.playlistInput.Focus()
 		return m, textinput.Blink
@@ -1102,10 +1134,17 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cycleTheme()
 		return m, nil
 	case "?":
+		// Contextual, like album/artist: help returns to wherever it was opened
+		// from instead of dumping the user on Home with the back stack gone.
 		if m.activeView == viewHelp {
-			m.activateView(viewHome)
+			m.activeView = m.popView()
+			m.navCursor = navIndexOf(m.activeView)
 		} else {
-			m.activateView(viewHelp)
+			m.pushView()
+			m.clearFilter()
+			m.activeView = viewHelp
+			m.focus = focusPanel
+			m.helpCursor = 0
 		}
 		return m, nil
 	}
