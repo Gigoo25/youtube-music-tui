@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,10 @@ import (
 	"regexp"
 	"strings"
 )
+
+// maxResponseBytes caps a single Innertube response. Real ones are a few hundred
+// KiB; without a cap a broken or hostile reply is read straight into memory.
+const maxResponseBytes = 32 << 20
 
 const (
 	baseURL       = "https://music.youtube.com/youtubei/v1"
@@ -40,23 +45,27 @@ func (c *Client) clientCtx() map[string]any {
 	}
 }
 
-func (c *Client) Search(query string) ([]Track, error) {
+func (c *Client) Search(ctx context.Context, query string) ([]Track, error) {
 	payload := c.clientCtx()
 	payload["query"] = query
 	payload["params"] = "EgWKAQIIAWoKEAoQAxAEEAkQBQ==" // songs filter
 
-	body, err := c.post("search", payload)
+	body, err := c.post(ctx, "search", payload)
 	if err != nil {
 		return nil, err
 	}
 	return parseSearchResponse(body)
 }
 
-func (c *Client) post(endpoint string, payload map[string]any) ([]byte, error) {
-	b, _ := json.Marshal(payload)
+func (c *Client) post(ctx context.Context, endpoint string, payload map[string]any) ([]byte, error) {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		// Dropping this posted an empty body and got back an opaque parse failure.
+		return nil, fmt.Errorf("innertube %s: encode payload: %w", endpoint, err)
+	}
 	url := fmt.Sprintf("%s/%s?key=%s&prettyPrint=false", baseURL, endpoint, apiKey)
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(b))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(b))
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +79,12 @@ func (c *Client) post(endpoint string, payload map[string]any) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close() //nolint:errcheck
-	return io.ReadAll(resp.Body)
+	// Without this a 403/429/5xx parsed as empty JSON and rendered as a blank
+	// view with no error at all.
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("innertube %s: %s", endpoint, resp.Status)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 }
 
 func parseSearchResponse(data []byte) ([]Track, error) {

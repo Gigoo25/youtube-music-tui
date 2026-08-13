@@ -1,11 +1,33 @@
 package tui
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/Gigoo25/youtube-music-tui/internal/api"
 )
+
+// TestReqCtxCancelsSupersededRequest: dropping a stale response is not enough —
+// the superseded request keeps its socket for the full RequestTimeout unless the
+// new request in the same lane cancels it. Other lanes must survive untouched.
+func TestReqCtxCancelsSupersededRequest(t *testing.T) {
+	m := newTestModel()
+
+	first := m.reqCtx("search")
+	other := m.reqCtx("album")
+	second := m.reqCtx("search")
+
+	if err := first.Err(); err != context.Canceled {
+		t.Fatalf("superseded search ctx Err = %v, want context.Canceled", err)
+	}
+	if err := other.Err(); err != nil {
+		t.Fatalf("album ctx cancelled by a search request: %v", err)
+	}
+	if err := second.Err(); err != nil {
+		t.Fatalf("current search ctx already done: %v", err)
+	}
+}
 
 // TestAutoContinueDropsStaleResponse: the queue-ran-out radio fetch takes
 // seconds. If the user starts a different track meanwhile, the late response

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"sync"
@@ -17,54 +18,54 @@ const albumsFilterParam = "EgWKAQIYAWoMEAMQBBAJEAUQChAV"
 // requiring a *title match* against the requested album: (1) general search,
 // (2) Albums-filtered search, (3) the artist's full discography. Only when no
 // title matches anywhere does it fall back to search's first album hit.
-func AlbumByQuery(c *Client, album, artist string) ([]Track, string, error) {
+func AlbumByQuery(ctx context.Context, c *Client, album, artist string) ([]Track, string, error) {
 	query := strings.TrimSpace(album + " " + artist)
 	if query == "" {
 		return nil, "", nil
 	}
 
-	sroot, err := c.searchRaw(query, "")
+	sroot, err := c.searchRaw(ctx, query, "")
 	if err != nil {
 		return nil, "", err
 	}
 	cands := albumSearchCandidates(sroot)
 	if id, ok := pickAlbumCandidate(cands, album); ok {
-		return c.albumByID(id, artist)
+		return c.albumByID(ctx, id, artist)
 	}
 
-	if froot, ferr := c.searchRaw(query, albumsFilterParam); ferr == nil {
+	if froot, ferr := c.searchRaw(ctx, query, albumsFilterParam); ferr == nil {
 		if id, ok := pickAlbumCandidate(albumSearchCandidates(froot), album); ok {
-			return c.albumByID(id, artist)
+			return c.albumByID(ctx, id, artist)
 		}
 	}
 
 	if artist != "" {
-		if id := c.albumIDFromDiscography(album, artist); id != "" {
-			return c.albumByID(id, artist)
+		if id := c.albumIDFromDiscography(ctx, album, artist); id != "" {
+			return c.albumByID(ctx, id, artist)
 		}
 	}
 
 	// No title match anywhere: take search's best guess (old behaviour).
 	if len(cands) > 0 {
-		return c.albumByID(cands[0].id, artist)
+		return c.albumByID(ctx, cands[0].id, artist)
 	}
 	if id := findBrowseID(sroot, func(be map[string]any) bool {
 		return strings.HasPrefix(str(be["browseId"]), "MPREb")
 	}); id != "" {
-		return c.albumByID(id, artist)
+		return c.albumByID(ctx, id, artist)
 	}
 	return nil, "", nil
 }
 
 // searchRaw runs a search (optionally filtered via params) and returns the
 // decoded response.
-func (c *Client) searchRaw(query, params string) (map[string]any, error) {
+func (c *Client) searchRaw(ctx context.Context, query, params string) (map[string]any, error) {
 	sp := c.clientCtx()
 	sp["query"] = query
 	if params != "" {
 		sp["params"] = params
 	}
-	body, err := c.post("search", sp)
+	body, err := c.post(ctx, "search", sp)
 	if err != nil {
 		return nil, err
 	}
@@ -78,8 +79,8 @@ func (c *Client) searchRaw(query, params string) (map[string]any, error) {
 // albumIDFromDiscography resolves an album browse id by title-matching against
 // the artist's full discography — the reliable path when search won't surface
 // the album (it happens) but the artist page lists it.
-func (c *Client) albumIDFromDiscography(album, artist string) string {
-	sroot, err := c.searchRaw(artist, "")
+func (c *Client) albumIDFromDiscography(ctx context.Context, album, artist string) string {
+	sroot, err := c.searchRaw(ctx, artist, "")
 	if err != nil {
 		return ""
 	}
@@ -89,7 +90,7 @@ func (c *Client) albumIDFromDiscography(album, artist string) string {
 	}
 	bp := c.clientCtx()
 	bp["browseId"] = artistID
-	bbody, err := c.post("browse", bp)
+	bbody, err := c.post(ctx, "browse", bp)
 	if err != nil {
 		return ""
 	}
@@ -97,7 +98,7 @@ func (c *Client) albumIDFromDiscography(album, artist string) string {
 	if err != nil {
 		return ""
 	}
-	albums := c.withDiscography(parseArtistAlbums(broot, 60), broot)
+	albums := c.withDiscography(ctx, parseArtistAlbums(broot, 60), broot)
 	cands := make([]albumCandidate, 0, len(albums))
 	for _, a := range albums {
 		cands = append(cands, albumCandidate{id: a.ID, title: a.Title})
@@ -110,14 +111,14 @@ func (c *Client) albumIDFromDiscography(album, artist string) string {
 
 // AlbumByID browses an album directly by its browse id (MPREb…) — used when the
 // id is already known (e.g. an album card on the artist page).
-func AlbumByID(c *Client, browseID string) ([]Track, string, error) {
-	return c.albumByID(browseID, "")
+func AlbumByID(ctx context.Context, c *Client, browseID string) ([]Track, string, error) {
+	return c.albumByID(ctx, browseID, "")
 }
 
-func (c *Client) albumByID(browseID, fallbackArtist string) ([]Track, string, error) {
+func (c *Client) albumByID(ctx context.Context, browseID, fallbackArtist string) ([]Track, string, error) {
 	bp := c.clientCtx()
 	bp["browseId"] = browseID
-	bbody, err := c.post("browse", bp)
+	bbody, err := c.post(ctx, "browse", bp)
 	if err != nil {
 		return nil, "", err
 	}
@@ -136,7 +137,7 @@ func (c *Client) albumByID(browseID, fallbackArtist string) ([]Track, string, er
 	}
 	tracks, videoRows := parseAlbumTracks(broot, albumArtist)
 	tracks = CleanTracks(tracks)
-	tracks = c.remapVideoRows(tracks, videoRows, title)
+	tracks = c.remapVideoRows(ctx, tracks, videoRows, title)
 	for i := range tracks {
 		tracks[i].AlbumID = browseID // every row belongs to this album
 	}
@@ -150,7 +151,7 @@ func (c *Client) albumByID(browseID, fallbackArtist string) ([]Track, string, er
 // with no findable song version keep the video id (its audio still plays).
 // Lookups run a few at a time; a failed search just leaves that row unchanged.
 // Returns the rows, with any duplicate id a remap introduced dropped.
-func (c *Client) remapVideoRows(tracks []Track, rows []int, albumTitle string) []Track {
+func (c *Client) remapVideoRows(ctx context.Context, tracks []Track, rows []int, albumTitle string) []Track {
 	if len(rows) == 0 {
 		return tracks
 	}
@@ -163,7 +164,7 @@ func (c *Client) remapVideoRows(tracks []Track, rows []int, albumTitle string) [
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			t := tracks[i]
-			songs, err := c.SearchSongs(t.Title + " " + t.Artist)
+			songs, err := c.SearchSongs(ctx, t.Title+" "+t.Artist)
 			if err != nil {
 				return
 			}
@@ -277,6 +278,11 @@ func pickAlbumCandidate(cands []albumCandidate, want string) (id string, ok bool
 	// field that has the artist glued on, but would otherwise wrongly map
 	// "X (Deluxe Edition)" onto plain "X".
 	for _, c := range cands {
+		// A blank candidate title is a prefix of every query, so without this the
+		// last-resort tier matches the first untitled result and wins outright.
+		if norm(c.title) == "" {
+			continue
+		}
 		if strings.HasPrefix(w, norm(c.title)) {
 			return c.id, true
 		}

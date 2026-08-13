@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 )
@@ -10,7 +11,7 @@ import (
 // AlbumByQuery it works in two steps — (1) search to discover the artist's
 // browse id (a channel "UC…" id whose page type is ARTIST), then (2) browse
 // that page and parse its shelves.
-func ArtistByQuery(c *Client, name string) (ArtistResult, error) {
+func ArtistByQuery(ctx context.Context, c *Client, name string) (ArtistResult, error) {
 	var res ArtistResult
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -19,7 +20,7 @@ func ArtistByQuery(c *Client, name string) (ArtistResult, error) {
 
 	sp := c.clientCtx()
 	sp["query"] = name
-	sbody, err := c.post("search", sp)
+	sbody, err := c.post(ctx, "search", sp)
 	if err != nil {
 		return res, err
 	}
@@ -35,7 +36,7 @@ func ArtistByQuery(c *Client, name string) (ArtistResult, error) {
 
 	bp := c.clientCtx()
 	bp["browseId"] = browseID
-	bbody, err := c.post("browse", bp)
+	bbody, err := c.post(ctx, "browse", bp)
 	if err != nil {
 		return res, err
 	}
@@ -58,7 +59,7 @@ func ArtistByQuery(c *Client, name string) (ArtistResult, error) {
 	// order first, so the curated albums stay on top). Note: YouTube Music's
 	// artist catalog itself omits some editions (deluxe/reissues are often
 	// search-only), so this is best-effort completeness, not a guarantee.
-	res.Albums = c.withDiscography(res.Albums, broot)
+	res.Albums = c.withDiscography(ctx, res.Albums, broot)
 	return res, nil
 }
 
@@ -95,14 +96,14 @@ func mergeAlbumRefs(base, extra []AlbumRef) []AlbumRef {
 // withDiscography merges the artist's full discography (the releases behind the
 // albums shelf's "More" button) into base, keeping base's order first.
 // Best-effort: a failed browse leaves base unchanged.
-func (c *Client) withDiscography(base []AlbumRef, root any) []AlbumRef {
+func (c *Client) withDiscography(ctx context.Context, base []AlbumRef, root any) []AlbumRef {
 	discoID := discographyBrowseID(root)
 	if discoID == "" {
 		return base
 	}
 	dp := c.clientCtx()
 	dp["browseId"] = discoID
-	dbody, err := c.post("browse", dp)
+	dbody, err := c.post(ctx, "browse", dp)
 	if err != nil {
 		return base
 	}
@@ -168,7 +169,9 @@ func sanitizeDisplay(s string) string {
 			continue
 		case r >= 0x80 && r <= 0x9f: // C1 controls
 			continue
-		case r >= 0x200b && r <= 0x200f: // zero-width + LRM/RLM
+		// 0x200d (ZWJ) is deliberately excluded: stripping it splits emoji, which
+		// this function's contract says it must not do.
+		case r >= 0x200b && r <= 0x200f && r != 0x200d: // zero-width + LRM/RLM
 			continue
 		case r >= 0x202a && r <= 0x202e: // bidi embeddings/overrides
 			continue

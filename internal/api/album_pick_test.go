@@ -100,6 +100,24 @@ func TestPickAlbumCandidateNothingMatches(t *testing.T) {
 	}
 }
 
+// TestPickAlbumCandidateIgnoresBlankTitles guards A5: a blank title is a prefix
+// of every query, so the last-resort tier used to match an untitled candidate
+// and return it ahead of the real album further down the list.
+func TestPickAlbumCandidateIgnoresBlankTitles(t *testing.T) {
+	cands := []albumCandidate{
+		{id: "untitled", title: ""},
+		{id: "real", title: "Abbey Road"},
+	}
+	got, ok := pickAlbumCandidate(cands, "Abbey Road")
+	if !ok || got != "real" {
+		t.Fatalf("pickAlbumCandidate = %q, %v; want \"real\", true", got, ok)
+	}
+	// A blank candidate must not match on its own either.
+	if _, ok := pickAlbumCandidate([]albumCandidate{{id: "untitled", title: ""}}, "Abbey Road"); ok {
+		t.Fatal("a blank-titled candidate must never match")
+	}
+}
+
 // TestPickAlbumCandidateEarlierEntryWins: when two candidates land in the same
 // tier, the earlier slice entry must win. This is the end-to-end guarantee
 // walkFirst's sorted descent exists to provide — without it, the album picker

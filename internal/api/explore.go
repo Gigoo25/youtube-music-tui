@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 )
@@ -101,7 +102,9 @@ func extractPanelTrack(r map[string]any) Track {
 	}
 
 	byline := digSlice(dig(r, "longBylineText", "runs"))
-	if byline == nil {
+	// json.Unmarshal turns "runs": [] into a non-nil empty slice, so a nil check
+	// left the shortBylineText fallback dead.
+	if len(byline) == 0 {
 		byline = digSlice(dig(r, "shortBylineText", "runs"))
 	}
 	// The album run links the album page; keep its browse id (see Track.AlbumID).
@@ -161,11 +164,11 @@ func addTrack(t Track, out *[]Track, seen map[string]bool) {
 // from older app versions, charts fallback items), the seed is remapped to its
 // song version via a Songs-tab search and the radio re-fetched, so one video
 // in the queue can't poison every radio chain after it.
-func (c *Client) Related(videoID string) ([]Track, error) {
-	return c.related(videoID, true)
+func (c *Client) Related(ctx context.Context, videoID string) ([]Track, error) {
+	return c.related(ctx, videoID, true)
 }
 
-func (c *Client) related(videoID string, allowReseed bool) ([]Track, error) {
+func (c *Client) related(ctx context.Context, videoID string, allowReseed bool) ([]Track, error) {
 	if videoID == "" {
 		return nil, nil
 	}
@@ -176,7 +179,7 @@ func (c *Client) related(videoID string, allowReseed bool) ([]Track, error) {
 	payload["isAudioOnly"] = true
 	payload["params"] = "wAEB"
 
-	body, err := c.post("next", payload)
+	body, err := c.post(ctx, "next", payload)
 	if err != nil {
 		return nil, err
 	}
@@ -236,8 +239,8 @@ func (c *Client) related(videoID string, allowReseed bool) ([]Track, error) {
 		if seedArtist != "" {
 			q += " " + seedArtist
 		}
-		if songs, serr := c.SearchSongs(q); serr == nil && len(songs) > 0 && songs[0].ID != videoID {
-			return c.related(songs[0].ID, false)
+		if songs, serr := c.SearchSongs(ctx, q); serr == nil && len(songs) > 0 && songs[0].ID != videoID {
+			return c.related(ctx, songs[0].ID, false)
 		}
 	}
 

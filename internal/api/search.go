@@ -1,6 +1,9 @@
 package api
 
-import "encoding/json"
+import (
+	"context"
+	"encoding/json"
+)
 
 // songsFilterParam restricts a YouTube Music search to the "Songs" tab — the
 // official audio tracks (videoType ATV) rather than music videos (OMV), so the
@@ -11,8 +14,8 @@ const songsFilterParam = "EgWKAQIIAWoMEAMQBBAJEAUQChAV"
 // SearchSongs is like Search but filters to the Songs tab, avoiding music-video
 // results. Song rows are parsed here (rather than via extractTrack) because the
 // Songs-tab flexColumn layout puts artist/album/duration in the second column.
-func (c *Client) SearchSongs(query string) ([]Track, error) {
-	tracks, _, err := c.SearchSongsPage(query, "")
+func (c *Client) SearchSongs(ctx context.Context, query string) ([]Track, error) {
+	tracks, _, err := c.SearchSongsPage(ctx, query, "")
 	return tracks, err
 }
 
@@ -20,7 +23,7 @@ func (c *Client) SearchSongs(query string) ([]Track, error) {
 // next page of an earlier one (continuation != "", the token from a prior call).
 // It returns the page's tracks plus the token for the following page ("" when
 // the results are exhausted), so callers can lazily load more.
-func (c *Client) SearchSongsPage(query, continuation string) ([]Track, string, error) {
+func (c *Client) SearchSongsPage(ctx context.Context, query, continuation string) ([]Track, string, error) {
 	payload := c.clientCtx()
 	if continuation != "" {
 		// The token already encodes the filtered search context, so query/params
@@ -31,7 +34,7 @@ func (c *Client) SearchSongsPage(query, continuation string) ([]Track, string, e
 		payload["params"] = songsFilterParam
 	}
 
-	body, err := c.post("search", payload)
+	body, err := c.post(ctx, "search", payload)
 	if err != nil {
 		return nil, "", err
 	}

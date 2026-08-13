@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"maps"
 	"slices"
@@ -13,11 +14,11 @@ import (
 // The charts page itself surfaces artist and playlist charts rather than a flat
 // song list, so we (a) collect any song rows that appear directly and (b) drill
 // into the first "trending"/"top songs" chart playlist and parse its tracks.
-func (c *Client) Trending() ([]Track, error) {
+func (c *Client) Trending(ctx context.Context) ([]Track, error) {
 	p := c.clientCtx()
 	p["browseId"] = "FEmusic_charts"
 
-	body, err := c.post("browse", p)
+	body, err := c.post(ctx, "browse", p)
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +59,7 @@ func (c *Client) Trending() ([]Track, error) {
 	if pid != "" {
 		pp := c.clientCtx()
 		pp["browseId"] = pid
-		if pbody, perr := c.post("browse", pp); perr == nil {
+		if pbody, perr := c.post(ctx, "browse", pp); perr == nil {
 			if proot, perr := parseJSON(pbody); perr == nil {
 				tracks = append(tracks, collectListItemTracks(proot)...)
 			}

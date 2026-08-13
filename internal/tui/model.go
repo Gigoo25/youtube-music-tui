@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -79,6 +80,10 @@ type model struct {
 	cfg    *config.Config
 	api    *api.Client
 	mpris  *mprisServer // in-process MPRIS server; nil if the session bus is unavailable
+
+	// apiCancel holds the cancel func of the request in flight in each API lane
+	// (see reqCtx), so a superseded one can be dropped.
+	apiCancel map[string]context.CancelFunc
 
 	activeView  view
 	focus       focusArea
@@ -306,6 +311,7 @@ func New(p *player.Player, cfg *config.Config) *model {
 		player:        p,
 		cfg:           cfg,
 		api:           client,
+		apiCancel:     map[string]context.CancelFunc{},
 		activeView:    viewHome,
 		focus:         focusPanel,
 		navCursor:     navIndexOf(viewHome),
@@ -318,6 +324,19 @@ func New(p *player.Player, cfg *config.Config) *model {
 	}
 	m.restoreSession()
 	return m
+}
+
+// reqCtx returns the context for an API request in the given lane, cancelling
+// whatever request was already running in that lane. Superseding a search or an
+// album load otherwise leaves the old request holding its socket for the whole
+// RequestTimeout.
+func (m *model) reqCtx(lane string) context.Context {
+	if cancel := m.apiCancel[lane]; cancel != nil {
+		cancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.apiCancel[lane] = cancel
+	return ctx
 }
 
 // restoreSession reloads the queue and playback toggles saved on last exit. The
@@ -1438,16 +1457,17 @@ func (m *model) goToAlbum() tea.Cmd {
 	}
 	client := m.api
 	gen := m.albumGen
+	ctx := m.reqCtx("album")
 	return func() tea.Msg {
 		// A track that carries the album's browse id skips search entirely —
 		// search can't find some albums by name (deluxe editions especially).
 		if albumID != "" {
-			tracks, title, err := api.AlbumByID(client, albumID)
+			tracks, title, err := api.AlbumByID(ctx, client, albumID)
 			if err == nil && len(tracks) > 0 {
 				return albumDoneMsg{tracks: tracks, title: title, gen: gen, err: nil}
 			}
 		}
-		tracks, title, err := api.AlbumByQuery(client, album, artist)
+		tracks, title, err := api.AlbumByQuery(ctx, client, album, artist)
 		return albumDoneMsg{tracks: tracks, title: title, gen: gen, err: err}
 	}
 }
@@ -1669,14 +1689,15 @@ func (m *model) loadHomeQuickPicks() tea.Cmd {
 		seed = m.cfg.History[0].Track.ID
 	}
 	client := m.api
+	ctx := m.reqCtx("home")
 	return func() tea.Msg {
 		var tracks []api.Track
 		var err error
 		if seed != "" {
-			tracks, err = client.Related(seed)
+			tracks, err = client.Related(ctx, seed)
 		}
 		if err == nil && len(tracks) == 0 {
-			tracks, err = client.Trending()
+			tracks, err = client.Trending(ctx)
 		}
 		return homeQuickPicksMsg{tracks: tracks, err: err}
 	}
@@ -1726,8 +1747,9 @@ func (m *model) goToArtist() tea.Cmd {
 	client := m.api
 	name := m.artistName
 	gen := m.artistGen
+	ctx := m.reqCtx("artist")
 	return func() tea.Msg {
-		res, err := api.ArtistByQuery(client, name)
+		res, err := api.ArtistByQuery(ctx, client, name)
 		return artistDoneMsg{res: res, gen: gen, err: err}
 	}
 }
@@ -1817,8 +1839,9 @@ func (m *model) openAlbumByID(a api.AlbumRef) tea.Cmd {
 	client := m.api
 	id := a.ID
 	gen := m.albumGen
+	ctx := m.reqCtx("album")
 	return func() tea.Msg {
-		tracks, title, err := api.AlbumByID(client, id)
+		tracks, title, err := api.AlbumByID(ctx, client, id)
 		return albumDoneMsg{tracks: tracks, title: title, gen: gen, err: err}
 	}
 }
@@ -1878,8 +1901,9 @@ func (m *model) playRandomGenre(seed string) tea.Cmd {
 	m.randomGen++
 	gen := m.randomGen
 	client := m.api
+	ctx := m.reqCtx("random")
 	return func() tea.Msg {
-		tracks, err := client.SearchSongs(seed)
+		tracks, err := client.SearchSongs(ctx, seed)
 		return randomDoneMsg{tracks: tracks, gen: gen, err: err}
 	}
 }
@@ -1894,8 +1918,9 @@ func (m *model) startRadio() tea.Cmd {
 	id := m.current.ID
 	m.setStatus("starting radio...")
 	client := m.api
+	ctx := m.reqCtx("radio")
 	return func() tea.Msg {
-		tracks, err := client.Related(id)
+		tracks, err := client.Related(ctx, id)
 		return radioDoneMsg{tracks: tracks, seed: id, err: err}
 	}
 }
@@ -2446,8 +2471,9 @@ func (m *model) continueRadio() tea.Cmd {
 	seed := m.current.ID
 	m.setStatus("auto-continue: finding more…")
 	client := m.api
+	ctx := m.reqCtx("autocontinue")
 	return func() tea.Msg {
-		tracks, err := client.Related(seed)
+		tracks, err := client.Related(ctx, seed)
 		return autoContinueMsg{tracks: tracks, seed: seed, err: err}
 	}
 }
@@ -2588,11 +2614,12 @@ func (m *model) doSearch(query string) tea.Cmd {
 	m.searchMoreLoading = false
 	gen := m.searchGen
 	client := m.api
+	ctx := m.reqCtx("search")
 	return func() tea.Msg {
 		// SearchSongsPage filters to the Songs tab so results are the official
 		// audio (ATV) versions with proper title/artist/album, not music videos,
 		// and returns a continuation token for lazily loading further pages.
-		tracks, next, err := client.SearchSongsPage(query, "")
+		tracks, next, err := client.SearchSongsPage(ctx, query, "")
 		return searchDoneMsg{tracks: tracks, next: next, gen: gen, err: err}
 	}
 }
@@ -2608,8 +2635,9 @@ func (m *model) loadMoreSearch() tea.Cmd {
 	m.searchMoreLoading = true
 	gen := m.searchGen
 	client := m.api
+	ctx := m.reqCtx("search")
 	return func() tea.Msg {
-		tracks, next, err := client.SearchSongsPage("", token)
+		tracks, next, err := client.SearchSongsPage(ctx, "", token)
 		return searchMoreMsg{tracks: tracks, next: next, token: token, gen: gen, err: err}
 	}
 }
