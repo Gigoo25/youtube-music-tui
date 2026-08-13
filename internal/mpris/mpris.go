@@ -65,7 +65,8 @@ type Server struct {
 
 	// Change-detection state, written only by Update (see its comment).
 	trackSeq  int
-	lastKey   string // change detection for Metadata
+	lastKey   string // track identity (title/artist/album) for Metadata change detection
+	lastLen   int64  // last published mpris:length; arrives a beat after the track
 	lastStat  string
 	lastVol   float64
 	lastPos   int64
@@ -289,13 +290,17 @@ func (s *Server) Update(n Now) {
 	// ponytail: no lock — Update is called only from the bubbletea Update goroutine.
 
 	// Metadata: rebuild + emit only when the track identity changes.
-	key := n.Title + "\x00" + n.Artist + "\x00" + n.Album + "\x00" + fmt.Sprint(n.LengthUS)
+	key := n.Title + "\x00" + n.Artist + "\x00" + n.Album
 	if !n.HasTrack {
 		key = ""
 	}
-	if key != s.lastKey {
-		s.lastKey = key
-		s.props.SetMust(playerIface, "Metadata", s.metadata(n))
+	// The duration lands a beat after the track does. Publishing it must update
+	// the existing trackid, not mint a new one — a new trackid reads as a new
+	// song and makes every track notify twice.
+	if key != s.lastKey || n.LengthUS != s.lastLen {
+		newTrack := key != s.lastKey
+		s.lastKey, s.lastLen = key, n.LengthUS
+		s.props.SetMust(playerIface, "Metadata", s.metadata(n, newTrack))
 	}
 
 	if n.Status != s.lastStat {
@@ -318,13 +323,15 @@ func (s *Server) Update(n Now) {
 }
 
 // metadata builds the xesam/mpris metadata dict for the current track.
-func (s *Server) metadata(n Now) map[string]dbus.Variant {
+func (s *Server) metadata(n Now, newTrack bool) map[string]dbus.Variant {
 	if !n.HasTrack {
 		s.trackPath = ""
 		return map[string]dbus.Variant{}
 	}
-	s.trackSeq++
-	s.trackPath = dbus.ObjectPath(fmt.Sprintf("/org/ytmusic/track/%d", s.trackSeq))
+	if newTrack || s.trackPath == "" {
+		s.trackSeq++
+		s.trackPath = dbus.ObjectPath(fmt.Sprintf("/org/ytmusic/track/%d", s.trackSeq))
+	}
 	m := map[string]dbus.Variant{
 		"mpris:trackid": dbus.MakeVariant(s.trackPath),
 		"mpris:length":  dbus.MakeVariant(n.LengthUS),

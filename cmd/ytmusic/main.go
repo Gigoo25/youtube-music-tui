@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -81,7 +82,8 @@ func run() error {
 	if err := cfg.Save(); err != nil {
 		fmt.Fprintf(os.Stderr, "save config: %v\n", err)
 	}
-	if runErr != nil {
+	// SIGINT is how a user quits a TUI — not a failure to report or exit 1 on.
+	if runErr != nil && !errors.Is(runErr, tea.ErrInterrupted) {
 		return fmt.Errorf("error: %w", runErr)
 	}
 	return nil
