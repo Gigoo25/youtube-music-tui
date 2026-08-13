@@ -483,6 +483,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil // the user started something else while the request was in flight
 		}
 		if msg.err != nil {
+			// Nothing is playing any more; hasCurrent was only held true so the
+			// seed survived the fetch.
+			m.hasCurrent = false
 			m.setError("auto-continue failed: " + msg.err.Error())
 			return m, nil
 		}
@@ -495,12 +498,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if len(tracks) == 0 {
+			m.hasCurrent = false
 			m.setError("auto-continue: nothing found")
 			return m, nil
 		}
 		start := len(m.queue)
 		added := m.appendNew(tracks)
 		if added == 0 {
+			m.hasCurrent = false
 			m.setError("auto-continue: nothing new found")
 			return m, nil
 		}
@@ -2307,16 +2312,25 @@ func (m *model) nextTrack() tea.Cmd {
 			m.playAt(m.queuePos + 1)
 		}
 	case repeatAll:
+		next := (m.queuePos + 1) % len(m.queue)
 		if m.shuffle {
-			m.playAt(m.nextShuffleIdx())
-		} else {
-			m.playAt((m.queuePos + 1) % len(m.queue))
+			// -1 means "nothing else to pick": repeat-all on one track replays it.
+			if i := m.nextShuffleIdx(); i >= 0 {
+				next = i
+			} else {
+				next = m.queuePos
+			}
 		}
+		m.playAt(next)
 	default:
+		next := -1
 		if m.shuffle {
-			m.playAt(m.nextShuffleIdx())
+			next = m.nextShuffleIdx()
 		} else if m.queuePos+1 < len(m.queue) {
-			m.playAt(m.queuePos + 1)
+			next = m.queuePos + 1
+		}
+		if next >= 0 {
+			m.playAt(next)
 		} else if m.cfg.AutoContinue && m.hasCurrent {
 			return m.continueRadio()
 		} else {
@@ -2330,11 +2344,12 @@ func (m *model) nextTrack() tea.Cmd {
 // nextShuffleIdx picks a random queue index other than the one playing so
 // shuffle never repeats a track back-to-back. Maps [0,n-1) onto the queue minus
 // the current slot (no rejection loop); falls back to a plain random pick when
-// the playing entry isn't in the queue (queuePos out of range).
+// the playing entry isn't in the queue (queuePos out of range). Returns -1 when
+// the queue holds no other track; the caller decides what that means.
 func (m *model) nextShuffleIdx() int {
 	n := len(m.queue)
 	if n <= 1 {
-		return 0
+		return -1 // no other track to pick — the caller decides what that means
 	}
 	if m.queuePos < 0 || m.queuePos >= n {
 		return rand.Intn(n)
@@ -2367,9 +2382,18 @@ const maxTrackRetries = 1
 // track once with a fresh URL, then give up and advance the queue. Worst case
 // is a skipped track — never silently stopped playback.
 func (m *model) handlePlaybackFailure(errMsg string) tea.Cmd {
-	if !m.hasCurrent || m.queuePos < 0 || m.queuePos >= len(m.queue) {
+	if !m.hasCurrent {
 		m.setError(errMsg)
 		return nil
+	}
+	if m.queuePos < 0 || m.queuePos >= len(m.queue) {
+		// The playing entry was deleted from the queue (queuePos == -1 is normal
+		// here). Recover by advancing into the queue rather than stopping dead.
+		m.setError(errMsg)
+		if len(m.queue) == 0 {
+			return nil
+		}
+		return m.nextTrack()
 	}
 	if !m.player.Alive() {
 		m.setError(errMsg + " — audio engine down, restart the app")
@@ -2390,7 +2414,19 @@ func (m *model) handlePlaybackFailure(errMsg string) tea.Cmd {
 		return nil
 	}
 	m.setError(errMsg + " — skipping track")
-	return m.nextTrack()
+	from := m.queuePos
+	cmd := m.nextTrack()
+	if m.hasCurrent && m.queuePos == from {
+		// nextTrack looped straight back onto the track that just failed
+		// (repeat-one, or a one-track queue). Stop instead of reloading it forever.
+		// ponytail: only breaks a self-loop. A repeat-all queue where *every*
+		// track fails still cycles — add a consecutive-skip counter if that shows up.
+		m.hasCurrent = false
+		m.player.Stop()
+		m.setError(errMsg + " — no playable track")
+		return nil
+	}
+	return cmd
 }
 
 // resumeAfterRestart reloads the current track after the player auto-respawned
