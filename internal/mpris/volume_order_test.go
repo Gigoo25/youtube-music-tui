@@ -1,6 +1,7 @@
 package mpris
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -63,7 +64,9 @@ func TestVolumeSetsApplyInOrder(t *testing.T) {
 			}
 		case <-deadline:
 			mu.Lock()
-			t.Fatalf("final volume 1.0 never applied; applied %v", got)
+			applied := fmt.Sprint(got)
+			mu.Unlock()
+			t.Fatalf("final volume 1.0 never applied; applied %v", applied)
 		}
 		break
 	}
@@ -71,7 +74,9 @@ func TestVolumeSetsApplyInOrder(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	for i := 1; i < len(got); i++ {
-		if got[i] <= got[i-1] {
+		// A repeated value is the coalescer applying the newest pending level
+		// twice, not a reorder — only a decrease means out of order.
+		if got[i] < got[i-1] {
 			t.Fatalf("volume applied out of order: %v", got)
 		}
 	}

@@ -1404,6 +1404,11 @@ func (m *model) handlePlaylistPickKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // goToAlbum opens the album the selected/playing track belongs to and loads it.
 func (m *model) goToAlbum() tea.Cmd {
+	// On an artist page the cursor may sit on an album row: open that album,
+	// matching what enter/l/right already do on the same row.
+	if ref, ok := m.selectedArtistAlbum(); ok {
+		return m.openAlbumByID(ref)
+	}
 	t := m.contextTrack()
 	if t == nil {
 		m.setError("no track selected")
@@ -1768,6 +1773,20 @@ func (m *model) artistSongAt(idx int) api.Track {
 		t.Artist = m.artistName
 	}
 	return t
+}
+
+// selectedArtistAlbum returns the album under the artist view's cursor when the
+// cursor sits on an album row rather than a song row. Album rows are a real
+// selection that simply isn't a track.
+func (m *model) selectedArtistAlbum() (api.AlbumRef, bool) {
+	if m.activeView != viewArtist {
+		return api.AlbumRef{}, false
+	}
+	albums := m.filtAlbums(m.artistAlbums)
+	if ai := m.artistCursor - len(m.trackVisibleIndices(m.artistSongs)); ai >= 0 && ai < len(albums) {
+		return albums[ai], true
+	}
+	return api.AlbumRef{}, false
 }
 
 // withArtist returns a copy of ts with the (implied) artist name filled in.
@@ -2208,6 +2227,11 @@ func (m *model) contextTrack() *api.Track {
 	// names and the playlist-detail view.
 	if t, ok := m.selectedTrack(); ok {
 		return &t
+	}
+	// An album row is a deliberate selection that isn't a song — don't silently
+	// retarget the playing track.
+	if _, ok := m.selectedArtistAlbum(); ok {
+		return nil
 	}
 	// Fall back to the currently playing track (Help and empty lists).
 	if m.hasCurrent {

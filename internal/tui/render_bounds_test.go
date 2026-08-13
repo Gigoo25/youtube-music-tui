@@ -99,3 +99,28 @@ func TestRenderFlatWindowKeepsSelection(t *testing.T) {
 	}
 
 }
+
+// TestHelpScrollsFromFirstPress guards F27: helpCursor is a scroll offset, not a
+// centred cursor. Passing it to a centring window swallowed every press until it
+// passed half a screen, so the first few j presses looked dead.
+func TestHelpScrollsFromFirstPress(t *testing.T) {
+	m := newTestModel()
+	h := helpRowCount() / 2 // guarantee the body is taller than the window
+	// Line 0 is the box border; line 1 is the first content row.
+	firstRow := func(s string) string {
+		rows := strings.Split(s, "\n")
+		if len(rows) < 2 {
+			t.Fatalf("renderHelp emitted %d rows, want a bordered body", len(rows))
+		}
+		return rows[1]
+	}
+
+	m.helpCursor = 0
+	first := firstRow(m.renderHelp(80, h))
+	m.helpCursor = 1
+	second := firstRow(m.renderHelp(80, h))
+
+	if first == second {
+		t.Fatalf("helpCursor 0 and 1 render the same first row (%q): help does not scroll on the first press", first)
+	}
+}
