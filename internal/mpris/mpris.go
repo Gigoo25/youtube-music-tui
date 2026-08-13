@@ -282,6 +282,10 @@ func (s *Server) Update(n Now) {
 	if s == nil || s.props == nil {
 		return
 	}
+	// SetMust panics when the property emit fails — most plausibly because the
+	// session bus went away mid-session. A dead bus must not take the player
+	// down with it; the next Update just retries.
+	defer func() { _ = recover() }()
 	// ponytail: no lock — Update is called only from the bubbletea Update goroutine.
 
 	// Metadata: rebuild + emit only when the track identity changes.

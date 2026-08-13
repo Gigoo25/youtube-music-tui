@@ -862,6 +862,18 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.markConfigDirty()
 				return m, nil
 			}
+			// Saving over an existing playlist destroys it — confirm first, the
+			// same way deleting one does.
+			if m.cfg.PlaylistByName(name) != nil {
+				n, q := name, m.queue
+				m.confirmPrompt = fmt.Sprintf("replace playlist %q with the queue (%d tracks)?", n, len(q))
+				m.confirmFn = func() {
+					m.cfg.SavePlaylist(n, q)
+					m.markConfigDirty()
+					m.setStatus(fmt.Sprintf("saved playlist %q (%d tracks)", n, len(q)))
+				}
+				return m, nil
+			}
 			m.cfg.SavePlaylist(name, m.queue)
 			m.markConfigDirty()
 			m.setStatus(fmt.Sprintf("saved playlist %q (%d tracks)", name, len(m.queue)))

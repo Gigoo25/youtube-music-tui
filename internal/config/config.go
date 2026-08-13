@@ -81,8 +81,8 @@ func Load() (*Config, error) {
 		// start fresh. Never clobber an earlier .corrupt: it may hold the only
 		// recoverable favorites/history.
 		corrupt := path + ".corrupt"
-		if _, statErr := os.Stat(corrupt); statErr == nil {
-			corrupt += "." + time.Now().Format("20060102-150405")
+		if _, statErr := os.Stat(corrupt); statErr == nil || !os.IsNotExist(statErr) {
+			corrupt += "." + time.Now().Format("20060102-150405.000000000")
 		}
 		if renameErr := os.Rename(path, corrupt); renameErr != nil {
 			fmt.Fprintf(os.Stderr, "config: unreadable (%v) and could not be preserved (%v); starting fresh\n", err, renameErr)
