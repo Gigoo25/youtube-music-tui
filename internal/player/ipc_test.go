@@ -37,7 +37,7 @@ func feedLines(p *Player, lines []string) (closePipe func(), waitReady func()) {
 	}()
 	return func() {
 			_ = a.Close()
-			b.Close()
+			_ = b.Close()
 		}, func() {
 			// scan reads newline-delimited; give it a tick to process the last line.
 			time.Sleep(50 * time.Millisecond)

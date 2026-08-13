@@ -99,7 +99,7 @@ type model struct {
 	homeQPLoading   bool
 	homeQPErr       string
 	homeQPAt        time.Time // last Quick Picks fetch, for the retry cooldown
-	helpCursor      int // help screen scroll offset (the only scroll with no visible cursor)
+	helpCursor      int       // help screen scroll offset (the only scroll with no visible cursor)
 
 	// artist view (top songs + albums for an artist) — contextual like album view
 	artistName    string
@@ -337,7 +337,6 @@ func (m *model) restoreSession() {
 		m.repeat = repeatMode(m.cfg.Repeat)
 	}
 }
-
 
 // maxSaveQueue caps the persisted queue the way maxHistory caps history: an
 // auto-continue session grows the live queue without bound, and the whole thing
@@ -1179,11 +1178,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		// In search results, esc clears results first; a second esc returns focus.
 		if m.activeView == viewSearch && len(m.searchResults) > 0 {
-		m.searchResults = nil
-		m.searchCursor = 0
-		// Invalidate requests already on the wire: dropping the continuation
-		// token alone doesn't stop a page that was fetched before this esc.
-		m.searchGen++
+			m.searchResults = nil
+			m.searchCursor = 0
+			// Invalidate requests already on the wire: dropping the continuation
+			// token alone doesn't stop a page that was fetched before this esc.
+			m.searchGen++
 			// Drop pagination state with the results — a leftover continuation
 			// token would let j/k on the now-empty list fetch a page of the old
 			// query as orphan results.

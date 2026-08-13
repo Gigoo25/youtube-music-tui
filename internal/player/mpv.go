@@ -56,17 +56,17 @@ type Player struct {
 	playingID    string             // videoID mpv actually has open (cache invalidation on stream error)
 	pendingID    string             // videoID of the most recent loadfile, promoted on start-file
 	state        State
-	lastErr      string                        // most recent load/playback failure, for the UI
-	restarted    bool                          // set after an automatic mpv respawn; polled by the TUI
-	alive        bool                          // readLoop running; false once recovery has given up
-	respawns     int                           // consecutive respawn attempts (reset after a stable session)
-	spawnedAt    time.Time                     // when the current mpv process started (not the current connection)
+	lastErr      string                     // most recent load/playback failure, for the UI
+	restarted    bool                       // set after an automatic mpv respawn; polled by the TUI
+	alive        bool                       // readLoop running; false once recovery has given up
+	respawns     int                        // consecutive respawn attempts (reset after a stable session)
+	spawnedAt    time.Time                  // when the current mpv process started (not the current connection)
 	resolveSeq   int                        // monotonic claim id, so a late release can't cancel a newer claim
-	urlCache     map[string]cachedURL          // videoID -> resolved stream URL (prefetch)
+	urlCache     map[string]cachedURL       // videoID -> resolved stream URL (prefetch)
 	inflight     map[string]inflightResolve // videoID -> cancel + claim generation
-	inflightFIFO []string                      // claim order, oldest first (eviction queue)
-	done         chan struct{}                 // signalled on natural end-of-file
-	closed       chan struct{}                 // closed once on shutdown
+	inflightFIFO []string                   // claim order, oldest first (eviction queue)
+	done         chan struct{}              // signalled on natural end-of-file
+	closed       chan struct{}              // closed once on shutdown
 	closeOnce    sync.Once
 	baseCtx      context.Context    // parent of every resolve ctx; cancelled by Close
 	baseCancel   context.CancelFunc // set in New, then immutable
@@ -167,13 +167,13 @@ func New(volume float64) (*Player, error) {
 	}
 
 	p := &Player{
-		cmd:        cmd,
-		sockPath:   sockPath,
-		sendCh:     make(chan []byte, 64),
-		done:       make(chan struct{}, 1),
-		closed:     make(chan struct{}),
-		alive:      true,
-		spawnedAt:  time.Now(),
+		cmd:       cmd,
+		sockPath:  sockPath,
+		sendCh:    make(chan []byte, 64),
+		done:      make(chan struct{}, 1),
+		closed:    make(chan struct{}),
+		alive:     true,
+		spawnedAt: time.Now(),
 		state: State{
 			Volume: volume,
 			Idle:   true,
@@ -863,13 +863,13 @@ func (p *Player) recover() bool {
 		if err == nil {
 			conn, derr := dialWithRetry(p.sockPath, 30, 100*time.Millisecond, p.closed)
 			if derr == nil {
-			p.cmd = cmd
-			p.mu.Lock()
-			// Playback state died with the old process; keep user settings.
-			p.state = State{Volume: p.state.Volume, Muted: p.state.Muted, Idle: true}
-			p.restarted = true
-			p.spawnedAt = time.Now()
-			p.mu.Unlock()
+				p.cmd = cmd
+				p.mu.Lock()
+				// Playback state died with the old process; keep user settings.
+				p.state = State{Volume: p.state.Volume, Muted: p.state.Muted, Idle: true}
+				p.restarted = true
+				p.spawnedAt = time.Now()
+				p.mu.Unlock()
 				p.procMu.Unlock()
 				p.adoptConn(conn)
 				return true
