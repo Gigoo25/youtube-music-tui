@@ -269,11 +269,18 @@ func (m *model) buildSidebar(w, h int) string {
 		}
 	}
 
-	// Window on the cursor like every panel list: padToHeight alone truncates
-	// from the bottom, so on a short terminal the selection scrolls out of view.
-	// +2 skips the title and "Quick Links" heading rows.
-	body := padToHeight(windowRows(rows, m.navCursor+2, h-2), h-2)
-	return styleSidebarBox.Width(inner).Height(h - 2).Render(body)
+	// Window on the cursor like every panel list. Skip if height leaves no room.
+	// +2 skips title/heading; clamp to len(rows).
+	if h > 2 {
+		cursorIdx := m.navCursor + 2
+		if cursorIdx >= len(rows) {
+			cursorIdx = len(rows) - 1
+		}
+		body := padToHeight(windowRows(rows, cursorIdx, h-2), h-2)
+		return styleSidebarBox.Width(inner).Height(h - 2).Render(body)
+	}
+	// No room: render empty box to keep layout stable.
+	return styleSidebarBox.Width(inner).Height(h - 2).Render("")
 }
 
 // renderPanel renders the active view's content, with a naming prompt or
