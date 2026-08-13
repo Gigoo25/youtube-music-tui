@@ -19,17 +19,19 @@ func TestClaimResolveDedup(t *testing.T) {
 	p := testPlayer()
 	defer p.baseCancel()
 
-	if _, ok := p.claimResolve("vid"); !ok {
+	_, gen1, ok := p.claimResolve("vid")
+	if !ok {
 		t.Fatal("first claim should succeed")
 	}
-	if _, ok := p.claimResolve("vid"); ok {
+	if _, _, ok := p.claimResolve("vid"); ok {
 		t.Fatal("second claim while in-flight should be denied (dedup)")
 	}
-	if _, ok := p.claimResolve("other"); !ok {
+	_, _, ok = p.claimResolve("other")
+	if !ok {
 		t.Fatal("a different id should claim independently")
 	}
-	p.releaseResolve("vid")
-	if _, ok := p.claimResolve("vid"); !ok {
+	p.releaseResolve("vid", gen1)
+	if _, _, ok := p.claimResolve("vid"); !ok {
 		t.Fatal("after release the id should be claimable again")
 	}
 }
@@ -40,7 +42,7 @@ func TestClaimResolveSkipsCached(t *testing.T) {
 	defer p.baseCancel()
 
 	p.cachePut("vid", "http://stream")
-	if _, ok := p.claimResolve("vid"); ok {
+	if _, _, ok := p.claimResolve("vid"); ok {
 		t.Fatal("a cached id should not be claimed for resolving")
 	}
 }
@@ -54,7 +56,7 @@ func TestClaimResolveCapsConcurrency(t *testing.T) {
 
 	ctxs := make([]context.Context, 0, maxInflightResolves)
 	for i := range maxInflightResolves {
-		ctx, ok := p.claimResolve(string(rune('a' + i)))
+		ctx, _, ok := p.claimResolve(string(rune('a' + i)))
 		if !ok {
 			t.Fatalf("claim %d should succeed below the cap", i)
 		}
@@ -65,7 +67,7 @@ func TestClaimResolveCapsConcurrency(t *testing.T) {
 	}
 
 	// One past the cap: accepted, and the oldest ("a") is evicted.
-	if _, ok := p.claimResolve("z"); !ok {
+	if _, _, ok := p.claimResolve("z"); !ok {
 		t.Fatal("a claim at the cap should evict, not be refused")
 	}
 	if len(p.inflight) != maxInflightResolves {
@@ -82,7 +84,7 @@ func TestClaimResolveCapsConcurrency(t *testing.T) {
 	}
 
 	// The evicted id is claimable again — a later prefetch pass can re-warm it.
-	if _, ok := p.claimResolve("a"); !ok {
+	if _, _, ok := p.claimResolve("a"); !ok {
 		t.Fatal("an evicted id should be claimable again")
 	}
 }
@@ -93,8 +95,8 @@ func TestReleaseResolveCancels(t *testing.T) {
 	p := testPlayer()
 	defer p.baseCancel()
 
-	ctx, _ := p.claimResolve("vid")
-	p.releaseResolve("vid")
+	ctx, gen, _ := p.claimResolve("vid")
+	p.releaseResolve("vid", gen)
 	if ctx.Err() == nil {
 		t.Fatal("released resolve's context should be cancelled")
 	}

@@ -53,20 +53,30 @@ type Player struct {
 	sendCh       chan []byte        // serialized writes
 	loadGen      int                // epoch token: cancels stale async loads
 	loadCancel   context.CancelFunc // cancels the in-flight load's yt-dlp, if any
-	playingID    string             // videoID last handed to mpv via loadfile (cache invalidation on stream error)
+	playingID    string             // videoID mpv actually has open (cache invalidation on stream error)
+	pendingID    string             // videoID of the most recent loadfile, promoted on start-file
 	state        State
 	lastErr      string                        // most recent load/playback failure, for the UI
 	restarted    bool                          // set after an automatic mpv respawn; polled by the TUI
 	alive        bool                          // readLoop running; false once recovery has given up
 	respawns     int                           // consecutive respawn attempts (reset after a stable session)
+	resolveSeq   int                        // monotonic claim id, so a late release can't cancel a newer claim
 	urlCache     map[string]cachedURL          // videoID -> resolved stream URL (prefetch)
-	inflight     map[string]context.CancelFunc // videoID -> cancel for an in-progress resolve
+	inflight     map[string]inflightResolve // videoID -> cancel + claim generation
 	inflightFIFO []string                      // claim order, oldest first (eviction queue)
 	done         chan struct{}                 // signalled on natural end-of-file
 	closed       chan struct{}                 // closed once on shutdown
 	closeOnce    sync.Once
 	baseCtx      context.Context    // parent of every resolve ctx; cancelled by Close
 	baseCancel   context.CancelFunc // set in New, then immutable
+}
+
+// inflightResolve is one claimed resolve slot. gen distinguishes successive
+// claims of the same videoID so a goroutine whose claim was already evicted
+// can't cancel its replacement on the way out.
+type inflightResolve struct {
+	cancel context.CancelFunc
+	gen    int
 }
 
 // cachedURL is a yt-dlp-resolved stream URL with the time it was resolved.
@@ -283,7 +293,7 @@ func (p *Player) Load(videoID string) {
 			p.loadCancel() // no extraction for this load; release its ctx timer
 			p.loadCancel = nil
 		}
-		p.playingID = videoID
+		p.pendingID = videoID
 		p.send([]any{"loadfile", url, "replace"})
 		return
 	}
@@ -324,7 +334,7 @@ func (p *Player) Load(videoID string) {
 			}
 			return
 		}
-		p.playingID = videoID
+		p.pendingID = videoID
 		p.send([]any{"loadfile", url, "replace"})
 	}()
 }
@@ -341,12 +351,12 @@ func (p *Player) Prefetch(videoID string) {
 	}
 	// Own timeout, deliberately not tied to loadCancel: a prefetch warms a future
 	// track and must survive the current load being superseded.
-	ctx, ok := p.claimResolve(videoID)
+	ctx, gen, ok := p.claimResolve(videoID)
 	if !ok {
 		return
 	}
 	go func() {
-		defer p.releaseResolve(videoID)
+		defer p.releaseResolve(videoID, gen)
 		if url, resolved, _ := extractURL(ctx, videoID); resolved {
 			p.cachePut(videoID, url)
 		}
@@ -365,38 +375,43 @@ const maxInflightResolves = 3
 // resolve must run under. It returns false when the URL is already cached or
 // another resolve for the same id is already running, so each video is resolved
 // at most once at a time.
-func (p *Player) claimResolve(videoID string) (context.Context, bool) {
+func (p *Player) claimResolve(videoID string) (context.Context, int, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, ok := p.cachedLocked(videoID); ok {
-		return nil, false // already resolved and still fresh
+		return nil, 0, false // already resolved and still fresh
 	}
 	if _, ok := p.inflight[videoID]; ok {
-		return nil, false
+		return nil, 0, false
 	}
 	if p.inflight == nil {
-		p.inflight = make(map[string]context.CancelFunc)
+		p.inflight = make(map[string]inflightResolve)
 	}
 	for len(p.inflightFIFO) >= maxInflightResolves {
 		p.dropResolveLocked(p.inflightFIFO[0])
 	}
 	ctx, cancel := context.WithTimeout(p.baseCtx, loadTimeout)
-	p.inflight[videoID] = cancel
+	p.resolveSeq++
+	p.inflight[videoID] = inflightResolve{cancel: cancel, gen: p.resolveSeq}
 	p.inflightFIFO = append(p.inflightFIFO, videoID)
-	return ctx, true
+	return ctx, p.resolveSeq, true
 }
 
-func (p *Player) releaseResolve(videoID string) {
+// releaseResolve drops videoID's claim only when it is still the claim gen
+// identifies. An evicted resolve must not cancel the claim that replaced it.
+func (p *Player) releaseResolve(videoID string, gen int) {
 	p.mu.Lock()
-	p.dropResolveLocked(videoID)
+	if cur, ok := p.inflight[videoID]; ok && cur.gen == gen {
+		p.dropResolveLocked(videoID)
+	}
 	p.mu.Unlock()
 }
 
 // dropResolveLocked cancels and forgets a resolve. Cancelling one that already
 // finished is a no-op, so this doubles as both eviction and cleanup.
 func (p *Player) dropResolveLocked(videoID string) {
-	if cancel, ok := p.inflight[videoID]; ok {
-		cancel()
+	if cur, ok := p.inflight[videoID]; ok {
+		cur.cancel()
 		delete(p.inflight, videoID)
 	}
 	p.inflightFIFO = slices.DeleteFunc(p.inflightFIFO, func(id string) bool { return id == videoID })
@@ -749,6 +764,11 @@ func (p *Player) scan(conn net.Conn) {
 		case "start-file":
 			p.mu.Lock()
 			p.state.Loading = false
+			// mpv has the new file open: only now does an end-file error belong
+			// to it rather than to the track it replaced.
+			if p.pendingID != "" {
+				p.playingID = p.pendingID
+			}
 			p.mu.Unlock()
 			continue
 
