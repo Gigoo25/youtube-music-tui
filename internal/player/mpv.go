@@ -60,6 +60,7 @@ type Player struct {
 	restarted    bool                          // set after an automatic mpv respawn; polled by the TUI
 	alive        bool                          // readLoop running; false once recovery has given up
 	respawns     int                           // consecutive respawn attempts (reset after a stable session)
+	spawnedAt    time.Time                     // when the current mpv process started (not the current connection)
 	resolveSeq   int                        // monotonic claim id, so a late release can't cancel a newer claim
 	urlCache     map[string]cachedURL          // videoID -> resolved stream URL (prefetch)
 	inflight     map[string]inflightResolve // videoID -> cancel + claim generation
@@ -166,12 +167,13 @@ func New(volume float64) (*Player, error) {
 	}
 
 	p := &Player{
-		cmd:      cmd,
-		sockPath: sockPath,
-		sendCh:   make(chan []byte, 64),
-		done:     make(chan struct{}, 1),
-		closed:   make(chan struct{}),
-		alive:    true,
+		cmd:        cmd,
+		sockPath:   sockPath,
+		sendCh:     make(chan []byte, 64),
+		done:       make(chan struct{}, 1),
+		closed:     make(chan struct{}),
+		alive:      true,
+		spawnedAt:  time.Now(),
 		state: State{
 			Volume: volume,
 			Idle:   true,
@@ -289,6 +291,9 @@ func (p *Player) Load(videoID string) {
 	if url, ok := p.cacheGet(videoID); ok {
 		p.mu.Lock()
 		defer p.mu.Unlock()
+		if gen != p.loadGen {
+			return // a newer Load or a Stop superseded this one while we read the cache
+		}
 		if p.loadCancel != nil {
 			p.loadCancel() // no extraction for this load; release its ctx timer
 			p.loadCancel = nil
@@ -702,17 +707,18 @@ func (p *Player) readLoop() {
 			return
 		}
 
-		start := time.Now()
 		p.scan(conn)
 
 		if p.isClosed() {
 			return
 		}
-		if time.Since(start) >= stableSession {
-			p.mu.Lock()
+		// Uptime of the mpv *process*, not of this connection: a redial after a
+		// dropped socket must not restart the clock on a healthy mpv.
+		p.mu.Lock()
+		if !p.spawnedAt.IsZero() && time.Since(p.spawnedAt) >= stableSession {
 			p.respawns = 0 // mpv was stable for a while; forgive past crashes
-			p.mu.Unlock()
 		}
+		p.mu.Unlock()
 		if !p.recover() {
 			break
 		}
@@ -732,6 +738,9 @@ func (p *Player) readLoop() {
 // scan consumes IPC events from one connection until it drops.
 func (p *Player) scan(conn net.Conn) {
 	scanner := bufio.NewScanner(conn)
+	// mpv can emit large property payloads; the default 64KiB token cap would
+	// end the scan mid-session and look exactly like a clean disconnect.
+	scanner.Buffer(make([]byte, 0, 64<<10), 1<<20)
 	for scanner.Scan() {
 		var resp ipcResp
 		if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
@@ -812,10 +821,16 @@ func (p *Player) scan(conn net.Conn) {
 // connection dropped), then by respawning the mpv process (it died). Returns
 // false on shutdown or once the respawn budget is spent.
 func (p *Player) recover() bool {
+	start := time.Now()
 	// The connection may have dropped while mpv itself is fine — try redialing.
 	for range 5 {
 		if p.isClosed() {
 			return false
+		}
+		// A connection that died immediately must not spin: recover() redials
+		// with no delay of its own.
+		if time.Since(start) < time.Second {
+			time.Sleep(time.Second)
 		}
 		if conn, err := net.Dial("unix", p.sockPath); err == nil {
 			p.adoptConn(conn)
@@ -834,6 +849,7 @@ func (p *Player) recover() bool {
 		p.mu.Lock()
 		if p.respawns >= maxRespawns {
 			p.mu.Unlock()
+			reap(p.cmd) // still under procMu: the dead process needs waiting on
 			p.procMu.Unlock()
 			return false
 		}
@@ -847,12 +863,13 @@ func (p *Player) recover() bool {
 		if err == nil {
 			conn, derr := dialWithRetry(p.sockPath, 30, 100*time.Millisecond, p.closed)
 			if derr == nil {
-				p.cmd = cmd
-				p.mu.Lock()
-				// Playback state died with the old process; keep user settings.
-				p.state = State{Volume: p.state.Volume, Muted: p.state.Muted, Idle: true}
-				p.restarted = true
-				p.mu.Unlock()
+			p.cmd = cmd
+			p.mu.Lock()
+			// Playback state died with the old process; keep user settings.
+			p.state = State{Volume: p.state.Volume, Muted: p.state.Muted, Idle: true}
+			p.restarted = true
+			p.spawnedAt = time.Now()
+			p.mu.Unlock()
 				p.procMu.Unlock()
 				p.adoptConn(conn)
 				return true
@@ -867,11 +884,14 @@ func (p *Player) recover() bool {
 // adoptConn swaps in a new IPC connection and replays per-connection setup
 // (property observation, volume/mute restore).
 func (p *Player) adoptConn(conn net.Conn) {
+	p.mu.Lock()
+	// The closed check must be inside the lock: Close() nils p.conn under the
+	// same mutex, and a check outside it would let this resurrect the field.
 	if p.isClosed() {
+		p.mu.Unlock()
 		conn.Close() //nolint:errcheck
 		return
 	}
-	p.mu.Lock()
 	if p.conn != nil {
 		p.conn.Close() //nolint:errcheck
 	}
