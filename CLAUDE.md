@@ -44,6 +44,16 @@ Keep dependencies minimal — this is a goal of the project. Current Go deps:
 dependency without a strong reason; prefer stdlib + the external `mpv`/`yt-dlp`
 binaries.
 
+**`vendor/` carries one local patch.** `godbus/dbus/v5`'s `storeMapIntoMap` merged
+each store into the map it already held, and `prop.Properties` hands that same map
+to the encoder — both in `PropertiesChanged` and in every `Get`/`GetAll` reply. So a
+shell polling MPRIS (noctalia, playerctl) iterated the live `Metadata` map on the
+D-Bus goroutine while `Server.Update` wrote it: an unrecoverable
+`concurrent map iteration and map write`, and stale keys that made a track with no
+album show the previous track's. It now installs a fresh map per store. **Running
+`go mod vendor` silently reverts this** — re-apply it, or `internal/mpris`
+`TestMetadata*` will start failing and `go test -race ./internal/mpris` will flake.
+
 ## Layout
 
 ```

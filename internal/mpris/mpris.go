@@ -24,6 +24,9 @@ const (
 	// running instances don't collide on the same well-known name (shells discover
 	// any name under the org.mpris.MediaPlayer2.* prefix).
 	busNameBase = "org.mpris.MediaPlayer2.ytmusic"
+	// noTrackPath is the spec's mpris:trackid for "nothing is playing". Metadata
+	// still has to carry a valid object path, so it cannot just be omitted.
+	noTrackPath = "/org/mpris/MediaPlayer2/TrackList/NoTrack"
 )
 
 // Handlers are the control callbacks invoked from the D-Bus goroutine. They must
@@ -323,27 +326,39 @@ func (s *Server) Update(n Now) {
 }
 
 // metadata builds the xesam/mpris metadata dict for the current track.
+//
+// Every key is written on every update, including the empty ones. prop.Properties
+// merges each Set into one long-lived map (see storeMapIntoMap) and never deletes
+// keys, so omitting a field leaves the previous track's value in place: playing a
+// track with no album after one with an album showed the old album and artist, and
+// stopping playback left the whole dict on screen.
 func (s *Server) metadata(n Now, newTrack bool) map[string]dbus.Variant {
 	if !n.HasTrack {
 		s.trackPath = ""
-		return map[string]dbus.Variant{}
+		return map[string]dbus.Variant{
+			// The spec's sentinel for "no track"; an empty path is not a valid o.
+			"mpris:trackid": dbus.MakeVariant(dbus.ObjectPath(noTrackPath)),
+			"mpris:length":  dbus.MakeVariant(int64(0)),
+			"xesam:title":   dbus.MakeVariant(""),
+			"xesam:artist":  dbus.MakeVariant([]string{}),
+			"xesam:album":   dbus.MakeVariant(""),
+		}
 	}
 	if newTrack || s.trackPath == "" {
 		s.trackSeq++
 		s.trackPath = dbus.ObjectPath(fmt.Sprintf("/org/ytmusic/track/%d", s.trackSeq))
 	}
-	m := map[string]dbus.Variant{
+	artists := []string{}
+	if n.Artist != "" {
+		artists = []string{n.Artist}
+	}
+	return map[string]dbus.Variant{
 		"mpris:trackid": dbus.MakeVariant(s.trackPath),
 		"mpris:length":  dbus.MakeVariant(n.LengthUS),
 		"xesam:title":   dbus.MakeVariant(n.Title),
+		"xesam:artist":  dbus.MakeVariant(artists),
+		"xesam:album":   dbus.MakeVariant(n.Album),
 	}
-	if n.Artist != "" {
-		m["xesam:artist"] = dbus.MakeVariant([]string{n.Artist})
-	}
-	if n.Album != "" {
-		m["xesam:album"] = dbus.MakeVariant(n.Album)
-	}
-	return m
 }
 
 // Seeked emits the MPRIS Seeked signal with the new absolute position (µs).

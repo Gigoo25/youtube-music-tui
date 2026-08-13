@@ -47,7 +47,14 @@ func TestVolumeSetDoesNotBlockUpdate(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		s.Update(Now{HasTrack: true, Title: "T", Status: "Playing", PositionUS: 1, Volume: 0.9})
+		// No track fields: this must exercise the prop.mut hand-off, not the
+		// Metadata write. Setting Metadata here also trips a godbus race that has
+		// nothing to do with the deadlock under test — prop.Properties merges each
+		// Set into one long-lived map and hands that same map to the encoder, so a
+		// map-valued property is read unlocked while the next Set mutates it.
+		// PlaybackStatus and Volume take the same prop.mut, so they prove the same
+		// thing without the noise.
+		s.Update(Now{Status: "Playing", PositionUS: 1, Volume: 0.9})
 		close(done)
 	}()
 	select {

@@ -178,9 +178,11 @@ func storeMapIntoInterface(dest, src reflect.Value) error {
 }
 
 func storeMapIntoMap(dest, src reflect.Value) error {
-	if dest.IsNil() {
-		dest.Set(reflect.MakeMap(dest.Type()))
-	}
+	// Install a fresh map rather than merging into the existing one. Merging both
+	// leaked stale keys across successive stores and left the previous map (already
+	// handed to the encoder by prop.emitChange and by Get/GetAll replies) being
+	// mutated while an unlocked goroutine iterated it.
+	dest.Set(reflect.MakeMapWithSize(dest.Type(), src.Len()))
 	keys := src.MapKeys()
 	for _, key := range keys {
 		dkey := key.Convert(dest.Type().Key())
