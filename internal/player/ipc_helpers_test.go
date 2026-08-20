@@ -9,6 +9,13 @@ import (
 	"time"
 )
 
+func closeTestResource(t *testing.T, resource interface{ Close() error }) {
+	t.Helper()
+	if err := resource.Close(); err != nil {
+		t.Errorf("close test resource: %v", err)
+	}
+}
+
 func TestSocketPathForUsesRuntimeDirectory(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", dir)
@@ -53,18 +60,24 @@ func TestDialWithRetryConnectsAndAborts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close() //nolint:errcheck
+	defer closeTestResource(t, ln)
+	accepted := make(chan struct{})
 	go func() {
-		conn, _ := ln.Accept()
-		if conn != nil {
-			conn.Close() //nolint:errcheck
+		conn, err := ln.Accept()
+		if err != nil {
+			t.Errorf("accept test connection: %v", err)
+			close(accepted)
+			return
 		}
+		closeTestResource(t, conn)
+		close(accepted)
 	}()
 	conn, err := dialWithRetry(path, 3, time.Millisecond, make(chan struct{}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn.Close() //nolint:errcheck
+	closeTestResource(t, conn)
+	<-accepted
 
 	abort := make(chan struct{})
 	close(abort)
@@ -76,8 +89,8 @@ func TestDialWithRetryConnectsAndAborts(t *testing.T) {
 func TestWriteLoopWritesQueuedCommand(t *testing.T) {
 	p := scanPlayer()
 	left, right := net.Pipe()
-	defer left.Close()  //nolint:errcheck
-	defer right.Close() //nolint:errcheck
+	defer closeTestResource(t, left)
+	defer closeTestResource(t, right)
 	p.conn = left
 	go p.writeLoop()
 	p.sendCh <- []byte("command\n")
@@ -91,8 +104,8 @@ func TestAdoptConnAfterCloseDoesNotInstallConnection(t *testing.T) {
 	p := scanPlayer()
 	close(p.closed)
 	left, right := net.Pipe()
-	defer left.Close()  //nolint:errcheck
-	defer right.Close() //nolint:errcheck
+	defer closeTestResource(t, left)
+	defer closeTestResource(t, right)
 	p.adoptConn(left)
 	p.mu.Lock()
 	defer p.mu.Unlock()
