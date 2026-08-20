@@ -480,19 +480,9 @@ func extractURL(ctx context.Context, videoID string) (url string, resolved bool,
 	// Drop the `tv` client from yt-dlp's default client set: it adds ~0.5s of
 	// extraction latency and isn't needed for audio. The remaining default
 	// clients still resolve a bestaudio stream.
-	//
-	// Format order matters: YouTube now answers 403 to the large/unbounded GETs
-	// ffmpeg issues for progressive googlevideo URLs unless the request carries
-	// a proof-of-origin token, so a resolve that succeeds still fails to play.
-	// HLS is served in small segments and stays playable, so prefer it and keep
-	// progressive audio only as a last resort.
-	// ponytail: the HLS fallback can be a 144p muxed rendition (mpv runs
-	// --no-video, so only the extra bitrate is wasted). Revisit if yt-dlp gains
-	// a PO-token provider here.
 	out, err := exec.CommandContext(ctx, ytdlp,
 		"--extractor-args", "youtube:player_client=default,-tv",
-		"-f", "bestaudio[protocol^=m3u8]/best[protocol^=m3u8]/bestaudio",
-		"-g", ytURL).Output()
+		"-f", "bestaudio", "-g", ytURL).Output()
 	if err != nil {
 		// Output() stashes stderr on ExitError; surface its tail so age-gated,
 		// geo-blocked and bot-check failures stay distinguishable in the UI.
