@@ -53,18 +53,18 @@ func TestDialWithRetryConnectsAndAborts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer ln.Close() //nolint:errcheck
 	go func() {
 		conn, _ := ln.Accept()
 		if conn != nil {
-			conn.Close()
+			conn.Close() //nolint:errcheck
 		}
 	}()
 	conn, err := dialWithRetry(path, 3, time.Millisecond, make(chan struct{}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn.Close()
+	conn.Close() //nolint:errcheck
 
 	abort := make(chan struct{})
 	close(abort)
@@ -76,8 +76,8 @@ func TestDialWithRetryConnectsAndAborts(t *testing.T) {
 func TestWriteLoopWritesQueuedCommand(t *testing.T) {
 	p := scanPlayer()
 	left, right := net.Pipe()
-	defer left.Close()
-	defer right.Close()
+	defer left.Close()  //nolint:errcheck
+	defer right.Close() //nolint:errcheck
 	p.conn = left
 	go p.writeLoop()
 	p.sendCh <- []byte("command\n")
@@ -91,8 +91,8 @@ func TestAdoptConnAfterCloseDoesNotInstallConnection(t *testing.T) {
 	p := scanPlayer()
 	close(p.closed)
 	left, right := net.Pipe()
-	defer left.Close()
-	defer right.Close()
+	defer left.Close()  //nolint:errcheck
+	defer right.Close() //nolint:errcheck
 	p.adoptConn(left)
 	p.mu.Lock()
 	defer p.mu.Unlock()
