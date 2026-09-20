@@ -2047,6 +2047,11 @@ func (m *model) activateView(v view) {
 	m.clearFilter()
 	// Direct navigation (sidebar, 1-6, ?) abandons any contextual return path.
 	m.viewStack = nil
+	// Help is reachable from the sidebar as well as "?"; remember where the user
+	// was so closing it with "?" returns there instead of falling back to Home.
+	if v == viewHelp && m.activeView != viewHelp {
+		m.viewStack = append(m.viewStack, m.activeView)
+	}
 	m.activeView = v
 	m.navCursor = navIndexOf(v)
 	m.focus = focusPanel
