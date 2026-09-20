@@ -2403,15 +2403,27 @@ func (m *model) prefetchNext() {
 // to keep playing.
 func (m *model) nextTrack() tea.Cmd {
 	if len(m.queue) == 0 {
+		// Nothing left to advance to (the playing entry may have been deleted
+		// from the queue). Clear the phantom now-playing state instead of leaving
+		// a dead track pinned to the bar and MPRIS; auto-continue still gets a
+		// chance to keep playing.
+		if m.hasCurrent {
+			if m.cfg.AutoContinue {
+				return m.continueRadio()
+			}
+			m.hasCurrent = false
+			m.setStatus("queue ended")
+		}
 		return nil
 	}
 	switch m.repeat {
 	case repeatOne:
-		if m.hasCurrent {
+		// queuePos == -1 is normal after the playing entry was deleted from the
+		// queue, and playAt(-1) is a no-op — take the slot that shifted into its
+		// place instead.
+		if m.hasCurrent && m.queuePos >= 0 {
 			m.playAt(m.queuePos)
 		} else {
-			// The playing entry was removed from the queue (queuePos may be -1);
-			// resume with the track that shifted into its slot.
 			m.playAt(m.queuePos + 1)
 		}
 	case repeatAll:
@@ -2491,12 +2503,22 @@ func (m *model) handlePlaybackFailure(errMsg string) tea.Cmd {
 		return nil
 	}
 	if m.queuePos < 0 || m.queuePos >= len(m.queue) {
-		// The playing entry was deleted from the queue (queuePos == -1 is normal
-		// here). Recover by advancing into the queue rather than stopping dead.
 		m.setError(errMsg)
 		if len(m.queue) == 0 {
+			// Nothing left to advance to: drop the phantom now-playing state
+			// instead of leaving a dead track on the bar and MPRIS.
+			m.hasCurrent = false
 			return nil
 		}
+		// The playing entry was deleted from the queue (queuePos == -1 is normal
+		// here). Recover by advancing into the queue rather than stopping dead.
+		return m.nextTrack()
+	}
+	if m.current.ID != m.queue[m.queuePos].ID {
+		// The playing entry was deleted while it played, so queuePos points at a
+		// neighbour. Retrying would reload that neighbour and seek it to this
+		// track's position — advance instead.
+		m.setError(errMsg)
 		return m.nextTrack()
 	}
 	if !m.player.Alive() {
