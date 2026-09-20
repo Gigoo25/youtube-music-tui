@@ -127,11 +127,12 @@ func parseArtistSongs(root any) []Track {
 	const limit = 20
 	var out []Track
 	seen := map[string]bool{}
-	walkRenderers(root, "musicResponsiveListItemRenderer", func(r map[string]any) {
+	walkRenderersUntil(root, "musicResponsiveListItemRenderer", func(r map[string]any) bool {
 		if len(out) >= limit {
-			return
+			return false
 		}
 		addTrack(extractTrack(r), &out, seen)
+		return true
 	})
 	return out
 }
@@ -209,13 +210,13 @@ func cleanArtist(s string) string {
 func parseArtistAlbums(root any, limit int) []AlbumRef {
 	var out []AlbumRef
 	seen := map[string]bool{}
-	walkRenderers(root, "musicTwoRowItemRenderer", func(r map[string]any) {
+	walkRenderersUntil(root, "musicTwoRowItemRenderer", func(r map[string]any) bool {
 		if len(out) >= limit {
-			return
+			return false
 		}
 		id := str(dig(r, "navigationEndpoint", "browseEndpoint", "browseId"))
 		if !strings.HasPrefix(id, "MPREb") || seen[id] {
-			return
+			return true
 		}
 		var a AlbumRef
 		a.ID = id
@@ -223,7 +224,7 @@ func parseArtistAlbums(root any, limit int) []AlbumRef {
 			a.Title = sanitizeDisplay(str(dig(runs[0], "text")))
 		}
 		if a.Title == "" {
-			return
+			return true
 		}
 		// Subtitle is "Album • 2021" / "Single • 2019", or "Artist • 2021" on
 		// discography pages: pull the year, plus the artist when the leading
@@ -242,6 +243,7 @@ func parseArtistAlbums(root any, limit int) []AlbumRef {
 		}
 		seen[id] = true
 		out = append(out, a)
+		return true
 	})
 	return out
 }

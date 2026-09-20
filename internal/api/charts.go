@@ -132,6 +132,33 @@ func walkRenderers(node any, key string, fn func(map[string]any)) {
 	walkRenderersMulti(node, map[string]func(map[string]any){key: fn})
 }
 
+// walkRenderersUntil is walkRenderers with early exit: fn returns false to stop
+// the traversal. The capped artist parsers use it so a large page isn't walked
+// to the end after the limit is reached.
+func walkRenderersUntil(node any, key string, fn func(map[string]any) bool) bool {
+	switch v := node.(type) {
+	case map[string]any:
+		for _, k := range sortedKeys(v) {
+			child := v[k]
+			if k == key {
+				if m, ok := child.(map[string]any); ok && !fn(m) {
+					return false
+				}
+			}
+			if !walkRenderersUntil(child, key, fn) {
+				return false
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if !walkRenderersUntil(child, key, fn) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // walkRenderersMulti is walkRenderers for several renderer keys at once: it
 // descends the decoded JSON a single time and invokes the matching handler for
 // each key it encounters. Avoids re-walking a large response once per key.

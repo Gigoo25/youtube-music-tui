@@ -119,3 +119,23 @@ func TestFindSearchContinuationEmptyPayload(t *testing.T) {
 		t.Fatalf("findSearchContinuation = %q, want empty", got)
 	}
 }
+
+// TestWalkRenderersUntilStops: the capped artist parsers rely on the early exit
+// so a large page isn't walked to the end after the limit is reached.
+func TestWalkRenderersUntilStops(t *testing.T) {
+	payload := map[string]any{
+		"contents": []any{
+			map[string]any{"row": map[string]any{"n": "1"}},
+			map[string]any{"row": map[string]any{"n": "2"}},
+			map[string]any{"row": map[string]any{"n": "3"}},
+		},
+	}
+	var got []string
+	walkRenderersUntil(payload, "row", func(r map[string]any) bool {
+		got = append(got, str(r["n"]))
+		return len(got) < 2
+	})
+	if len(got) != 2 || got[0] != "1" || got[1] != "2" {
+		t.Fatalf("walkRenderersUntil visited %v, want [1 2] and then stop", got)
+	}
+}
