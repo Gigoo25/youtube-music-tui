@@ -740,8 +740,10 @@ func (m *model) filterActive() bool {
 	return m.filter != "" && m.filterableView()
 }
 
+// matchStr reports whether s contains q. q must already be lower-cased: the
+// callers below lower the filter query once per list, not once per track field.
 func matchStr(s, q string) bool {
-	return strings.Contains(strings.ToLower(s), strings.ToLower(q))
+	return strings.Contains(strings.ToLower(s), q)
 }
 
 func matchTrack(t api.Track, q string) bool {
@@ -753,9 +755,10 @@ func (m *model) filt(src []api.Track) []api.Track {
 	if !m.filterActive() {
 		return src
 	}
+	q := strings.ToLower(m.filter)
 	out := make([]api.Track, 0, len(src))
 	for _, t := range src {
-		if matchTrack(t, m.filter) {
+		if matchTrack(t, q) {
 			out = append(out, t)
 		}
 	}
@@ -767,9 +770,10 @@ func (m *model) filtAlbums(src []api.AlbumRef) []api.AlbumRef {
 	if !m.filterActive() {
 		return src
 	}
+	q := strings.ToLower(m.filter)
 	out := make([]api.AlbumRef, 0, len(src))
 	for _, a := range src {
-		if matchStr(a.Title, m.filter) || matchStr(a.Artist, m.filter) {
+		if matchStr(a.Title, q) || matchStr(a.Artist, q) {
 			out = append(out, a)
 		}
 	}
@@ -781,9 +785,10 @@ func (m *model) filtHistory(src []config.HistoryEntry) []config.HistoryEntry {
 	if !m.filterActive() {
 		return src
 	}
+	q := strings.ToLower(m.filter)
 	out := make([]config.HistoryEntry, 0, len(src))
 	for _, e := range src {
-		if matchTrack(e.Track, m.filter) {
+		if matchTrack(e.Track, q) {
 			out = append(out, e)
 		}
 	}
@@ -795,8 +800,10 @@ func (m *model) filtHistory(src []config.HistoryEntry) []config.HistoryEntry {
 // "play from here").
 func (m *model) trackVisibleIndices(src []api.Track) []int {
 	out := make([]int, 0, len(src))
+	active := m.filterActive()
+	q := strings.ToLower(m.filter)
 	for i, t := range src {
-		if !m.filterActive() || matchTrack(t, m.filter) {
+		if !active || matchTrack(t, q) {
 			out = append(out, i)
 		}
 	}
