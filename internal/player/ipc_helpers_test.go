@@ -19,12 +19,34 @@ func closeTestResource(t *testing.T, resource interface{ Close() error }) {
 func TestSocketPathForUsesRuntimeDirectory(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", dir)
-	if got := socketPathFor(); filepath.Dir(got) != dir || !strings.HasSuffix(got, ".sock") {
+	got, cleanup := socketPathFor()
+	if filepath.Dir(got) != dir || !strings.HasSuffix(got, ".sock") {
 		t.Fatalf("socketPathFor = %q", got)
 	}
+	if cleanup != "" {
+		t.Fatalf("cleanup dir = %q, want empty when XDG_RUNTIME_DIR is set", cleanup)
+	}
+}
+
+// TestSocketPathForFallbackIsPrivate: with no XDG_RUNTIME_DIR the socket must
+// not land directly in the shared temp dir — the mpv IPC socket accepts
+// arbitrary commands, so it lives in a private 0700 directory instead.
+func TestSocketPathForFallbackIsPrivate(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
-	if got := socketPathFor(); filepath.Dir(got) != os.TempDir() {
-		t.Fatalf("socketPathFor fallback = %q", got)
+	got, cleanup := socketPathFor()
+	if cleanup == "" {
+		t.Fatalf("socketPathFor fallback = %q, want a private temp dir", got)
+	}
+	defer os.RemoveAll(cleanup) //nolint:errcheck
+	if filepath.Dir(got) != cleanup {
+		t.Fatalf("socket %q is not inside its private dir %q", got, cleanup)
+	}
+	fi, err := os.Stat(cleanup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("private dir mode = %o, want 0700", perm)
 	}
 }
 

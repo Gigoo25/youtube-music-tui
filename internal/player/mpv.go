@@ -21,17 +21,24 @@ import (
 // is abandoned, so a hung extraction can't pin the player in "loading" forever.
 const loadTimeout = 60 * time.Second
 
-// socketPathFor returns a per-process IPC socket path. The mpv IPC socket
-// accepts arbitrary commands (including `run`, i.e. code execution), so it goes
-// in $XDG_RUNTIME_DIR — a per-user 0700 directory — rather than the shared /tmp,
-// where another local user could connect if the umask allowed it. The pid suffix
-// keeps multiple instances from colliding.
-func socketPathFor() string {
+// socketPathFor returns a per-process IPC socket path plus a directory to clean
+// up on shutdown ("" when nothing was created). The mpv IPC socket accepts
+// arbitrary commands (including `run`, i.e. code execution), so it goes in
+// $XDG_RUNTIME_DIR — a per-user 0700 directory — rather than the shared /tmp,
+// where another local user could connect if the umask allowed it. Without a
+// runtime dir a private 0700 directory is created under the temp dir instead of
+// falling back to the shared one; the pid suffix keeps instances from colliding.
+func socketPathFor() (sockPath, cleanupDir string) {
 	dir := os.Getenv("XDG_RUNTIME_DIR")
-	if dir == "" {
-		dir = os.TempDir()
+	if dir != "" {
+		return filepath.Join(dir, fmt.Sprintf("ytmusic-mpv-%d.sock", os.Getpid())), ""
 	}
-	return filepath.Join(dir, fmt.Sprintf("ytmusic-mpv-%d.sock", os.Getpid()))
+	tmp, err := os.MkdirTemp(os.TempDir(), "ytmusic-mpv-")
+	if err != nil {
+		// Last resort: still better than no socket at all.
+		return filepath.Join(os.TempDir(), fmt.Sprintf("ytmusic-mpv-%d.sock", os.Getpid())), ""
+	}
+	return filepath.Join(tmp, fmt.Sprintf("mpv-%d.sock", os.Getpid())), tmp
 }
 
 type State struct {
@@ -48,6 +55,7 @@ type Player struct {
 	cmd          *exec.Cmd
 	procMu       sync.Mutex // serializes mpv process kill/spawn (recover vs Close)
 	sockPath     string
+	cleanupDir   string // private temp dir for the socket ("" when XDG_RUNTIME_DIR was used)
 	conn         net.Conn
 	mu           sync.Mutex         // protects state, conn, loadGen, loadCancel, playingID, urlCache, inflight
 	sendCh       chan []byte        // serialized writes
@@ -163,22 +171,26 @@ func spawnMPV(sockPath string) (*exec.Cmd, error) {
 
 // New starts mpv and restores the given initial volume (0–150) once connected.
 func New(volume float64) (*Player, error) {
-	sockPath := socketPathFor()
+	sockPath, cleanupDir := socketPathFor()
 	os.Remove(sockPath) //nolint:errcheck
 
 	cmd, err := spawnMPV(sockPath)
 	if err != nil {
+		if cleanupDir != "" {
+			os.RemoveAll(cleanupDir) //nolint:errcheck
+		}
 		return nil, err
 	}
 
 	p := &Player{
-		cmd:       cmd,
-		sockPath:  sockPath,
-		sendCh:    make(chan []byte, 64),
-		done:      make(chan struct{}, 1),
-		closed:    make(chan struct{}),
-		alive:     true,
-		spawnedAt: time.Now(),
+		cmd:        cmd,
+		sockPath:   sockPath,
+		cleanupDir: cleanupDir,
+		sendCh:     make(chan []byte, 64),
+		done:       make(chan struct{}, 1),
+		closed:     make(chan struct{}),
+		alive:      true,
+		spawnedAt:  time.Now(),
 		state: State{
 			Volume: volume,
 			Idle:   true,
@@ -188,6 +200,9 @@ func New(volume float64) (*Player, error) {
 	conn, err := dialWithRetry(sockPath, 30, 100*time.Millisecond, p.closed)
 	if err != nil {
 		reap(cmd)
+		if cleanupDir != "" {
+			os.RemoveAll(cleanupDir) //nolint:errcheck
+		}
 		return nil, fmt.Errorf("connect mpv IPC: %w", err)
 	}
 	p.conn = conn
@@ -948,5 +963,8 @@ func (p *Player) Close() {
 		reap(p.cmd)
 		p.procMu.Unlock()
 		os.Remove(p.sockPath) //nolint:errcheck
+		if p.cleanupDir != "" {
+			os.RemoveAll(p.cleanupDir) //nolint:errcheck
+		}
 	})
 }
