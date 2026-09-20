@@ -1684,6 +1684,7 @@ func (m *model) refreshListenAgain() {
 func (m *model) loadHomeQuickPicks() tea.Cmd {
 	m.homeQPLoading = true
 	m.homeQPErr = ""
+	m.homeQPAt = time.Now() // starts the retry cooldown (see the tick handler)
 	seed := ""
 	if len(m.cfg.History) > 0 {
 		seed = m.cfg.History[0].Track.ID

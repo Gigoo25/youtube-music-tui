@@ -93,3 +93,18 @@ func TestHelpScrollsToLastBinding(t *testing.T) {
 		t.Fatal("help cannot scroll to its last binding")
 	}
 }
+
+// TestLoadHomeQuickPicksStartsRetryCooldown: the tick's retry gate compares
+// time.Since(homeQPAt) against 30s, so the fetch must stamp it. Without the
+// stamp the zero time makes the gate always true and a failing fetch is
+// retried on every tick instead of at most every 30 seconds.
+func TestLoadHomeQuickPicksStartsRetryCooldown(t *testing.T) {
+	m := newTestModel()
+
+	if cmd := m.loadHomeQuickPicks(); cmd == nil {
+		t.Fatal("loadHomeQuickPicks returned no command")
+	}
+	if m.homeQPAt.IsZero() {
+		t.Fatal("homeQPAt was not stamped by loadHomeQuickPicks")
+	}
+}
