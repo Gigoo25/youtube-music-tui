@@ -18,7 +18,6 @@ func TestCancelledContextAbortsRequest(t *testing.T) {
 	cancel()
 
 	calls := map[string]func() error{
-		"Search":          func() error { _, err := c.Search(ctx, "q"); return err },
 		"SearchSongs":     func() error { _, err := c.SearchSongs(ctx, "q"); return err },
 		"SearchSongsPage": func() error { _, _, err := c.SearchSongsPage(ctx, "q", ""); return err },
 		"Trending":        func() error { _, err := c.Trending(ctx); return err },

@@ -45,18 +45,6 @@ func (c *Client) clientCtx() map[string]any {
 	}
 }
 
-func (c *Client) Search(ctx context.Context, query string) ([]Track, error) {
-	payload := c.clientCtx()
-	payload["query"] = query
-	payload["params"] = "EgWKAQIIAWoKEAoQAxAEEAkQBQ==" // songs filter
-
-	body, err := c.post(ctx, "search", payload)
-	if err != nil {
-		return nil, err
-	}
-	return parseSearchResponse(body)
-}
-
 func (c *Client) post(ctx context.Context, endpoint string, payload map[string]any) ([]byte, error) {
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -85,33 +73,6 @@ func (c *Client) post(ctx context.Context, endpoint string, payload map[string]a
 		return nil, fmt.Errorf("innertube %s: %s", endpoint, resp.Status)
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
-}
-
-func parseSearchResponse(data []byte) ([]Track, error) {
-	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
-		return nil, err
-	}
-
-	var tracks []Track
-	tabs := digSlice(dig(root, "contents", "tabbedSearchResultsRenderer", "tabs"))
-	for _, tab := range tabs {
-		contents := digSlice(dig(tab, "tabRenderer", "content", "sectionListRenderer", "contents"))
-		for _, section := range contents {
-			items := digSlice(dig(section, "musicShelfRenderer", "contents"))
-			for _, item := range items {
-				r := dig(item, "musicResponsiveListItemRenderer")
-				if r == nil {
-					continue
-				}
-				t := extractTrack(r.(map[string]any))
-				if t.ID != "" && t.Title != "" {
-					tracks = append(tracks, t)
-				}
-			}
-		}
-	}
-	return tracks, nil
 }
 
 func extractTrack(r map[string]any) Track {
