@@ -407,6 +407,15 @@ func (m *model) Init() tea.Cmd {
 	m.refreshListenAgain()
 	if len(m.queue) > 0 {
 		m.setStatus(fmt.Sprintf("restored %d queued tracks — press space to resume", len(m.queue)))
+		// Warm the track a space-press will resume: prefetching only resolves a
+		// URL, it never starts audio, so launch → play stays instant.
+		if m.player != nil {
+			idx := m.queuePos
+			if idx < 0 || idx >= len(m.queue) {
+				idx = 0
+			}
+			m.player.Prefetch(m.queue[idx].ID)
+		}
 	}
 	return tea.Batch(
 		textinput.Blink,
