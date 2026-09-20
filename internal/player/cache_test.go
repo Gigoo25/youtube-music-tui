@@ -1,6 +1,7 @@
 package player
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -161,5 +162,26 @@ func TestCacheNilMapHandled(t *testing.T) {
 
 	if _, ok := p.cacheGet("vid"); !ok {
 		t.Fatal("cachePut on nil map must initialize the map")
+	}
+}
+
+// TestCacheCapEvictsOldest: the cache is capped so the per-put expiry sweep
+// stays bounded however long a session runs. The newest entry must survive.
+func TestCacheCapEvictsOldest(t *testing.T) {
+	p := scanPlayer()
+	defer p.baseCancel()
+
+	for i := range maxURLCache + 10 {
+		p.cachePut(fmt.Sprintf("vid-%d", i), "http://stream.example/x")
+	}
+
+	p.mu.Lock()
+	n := len(p.urlCache)
+	p.mu.Unlock()
+	if n > maxURLCache {
+		t.Fatalf("cache holds %d entries, want <= %d", n, maxURLCache)
+	}
+	if _, ok := p.cacheGet(fmt.Sprintf("vid-%d", maxURLCache+9)); !ok {
+		t.Fatal("newest entry must survive cap eviction")
 	}
 }

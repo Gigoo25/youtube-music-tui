@@ -90,6 +90,11 @@ type cachedURL struct {
 
 const urlTTL = 30 * time.Minute
 
+// maxURLCache caps the resolved-URL cache. Prefetching only needs the next few
+// tracks; the cap keeps the per-put eviction sweep bounded no matter how long
+// the session runs.
+const maxURLCache = 64
+
 type ipcCmd struct {
 	Command []any `json:"command"`
 }
@@ -442,13 +447,28 @@ func (p *Player) cachePut(videoID, url string) {
 		p.urlCache = make(map[string]cachedURL)
 	}
 	// Evict expired entries so a long session doesn't grow the cache unbounded
-	// (stale entries are otherwise only skipped on read, never removed).
+	// (stale entries are otherwise only skipped on read, never removed). The
+	// cache is capped below, so this sweep is O(maxURLCache), not O(session).
 	for id, c := range p.urlCache {
 		if time.Since(c.at) > urlTTL {
 			delete(p.urlCache, id)
 		}
 	}
 	p.urlCache[videoID] = cachedURL{url: url, at: time.Now()}
+	// Still over cap (nothing expired): drop the oldest entry so a session that
+	// resolves thousands of tracks can't grow the map without bound.
+	for len(p.urlCache) > maxURLCache {
+		oldest, oldestAt := "", time.Time{}
+		for id, c := range p.urlCache {
+			if oldest == "" || c.at.Before(oldestAt) {
+				oldest, oldestAt = id, c.at
+			}
+		}
+		if oldest == "" {
+			break
+		}
+		delete(p.urlCache, oldest)
+	}
 }
 
 // errNoYtdlp marks a resolve failure caused by yt-dlp being absent from PATH,
