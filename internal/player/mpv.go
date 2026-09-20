@@ -576,6 +576,9 @@ func (p *Player) VolumeDown() float64 { return p.nudgeVolume(-5) }
 func (p *Player) nudgeVolume(delta float64) float64 {
 	p.mu.Lock()
 	vol := clampVolume(p.state.Volume + delta)
+	// Track the target immediately: a second press before mpv's property-change
+	// arrives would otherwise read the old level and compute the same target.
+	p.state.Volume = vol
 	p.mu.Unlock()
 	p.send([]any{"set_property", "volume", vol})
 	return vol

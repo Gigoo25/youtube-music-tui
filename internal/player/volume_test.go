@@ -144,6 +144,25 @@ func TestSetVolumeClampsBeforeSending(t *testing.T) {
 	}
 }
 
+// TestVolumeUpAccumulatesWithoutObserver: VolumeUp tracks the target it just
+// sent. Two presses faster than mpv's property-change round trip must add 10,
+// not compute the same target twice from the stale observed level.
+func TestVolumeUpAccumulatesWithoutObserver(t *testing.T) {
+	p := scanPlayer()
+	defer p.baseCancel()
+
+	p.mu.Lock()
+	p.state.Volume = 50
+	p.mu.Unlock()
+
+	if got := p.VolumeUp(); got != 55 {
+		t.Fatalf("first VolumeUp = %v, want 55", got)
+	}
+	if got := p.VolumeUp(); got != 60 {
+		t.Fatalf("second VolumeUp = %v, want 60 (must accumulate)", got)
+	}
+}
+
 // unmarshalCmd decodes a raw IPC JSON line into an ipcCmd. Helper so the test
 // bodies stay focused on what they're asserting.
 func unmarshalCmd(b []byte, cmd *ipcCmd) error {
