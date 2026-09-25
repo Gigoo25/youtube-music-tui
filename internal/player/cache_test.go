@@ -185,3 +185,23 @@ func TestCacheCapEvictsOldest(t *testing.T) {
 		t.Fatal("newest entry must survive cap eviction")
 	}
 }
+
+// TestInvalidateDropsCachedURL: the TUI's stall retry promises a fresh stream
+// URL. If Invalidate left the entry in place, Load would hit the cache and hand
+// mpv the very URL that just stalled.
+func TestInvalidateDropsCachedURL(t *testing.T) {
+	p := scanPlayer()
+	defer p.baseCancel()
+
+	p.cachePut("vid", "http://stream.example/stalled")
+	p.cachePut("other", "http://stream.example/ok")
+	p.Invalidate("vid")
+
+	if _, ok := p.cacheGet("vid"); ok {
+		t.Fatal("Invalidate must drop the cached URL")
+	}
+	if _, ok := p.cacheGet("other"); !ok {
+		t.Fatal("Invalidate must not touch other entries")
+	}
+	p.Invalidate("never-cached") // no-op, must not panic
+}

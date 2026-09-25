@@ -64,3 +64,27 @@ func TestPlaybackFailureEmptyQueueClearsCurrent(t *testing.T) {
 		t.Fatalf("status = %q, want the failure message preserved", m.status)
 	}
 }
+
+// TestRepeatOneAfterDeletingPlayingLastTrack: deleting the playing entry steps
+// queuePos back onto its predecessor. Repeat-one must not then "repeat" that
+// predecessor — with nothing after the deleted slot, the queue has ended.
+func TestRepeatOneAfterDeletingPlayingLastTrack(t *testing.T) {
+	m := newTestModel()
+	m.queue = []api.Track{{ID: "a", Title: "A"}} // "b" was playing at index 1 and got deleted
+	m.queuePos = 0
+	m.current = api.Track{ID: "b", Title: "B"}
+	m.hasCurrent = true
+	m.repeat = repeatOne
+
+	// The old code called playAt(0) here, replaying "a" (and, with the nil test
+	// player, panicking).
+	if cmd := m.nextTrack(); cmd != nil {
+		t.Fatal("nextTrack returned a command with auto-continue off")
+	}
+	if m.hasCurrent {
+		t.Fatal("repeat-one replayed the deleted track's predecessor instead of ending")
+	}
+	if m.status != "queue ended" {
+		t.Fatalf("status = %q, want %q", m.status, "queue ended")
+	}
+}

@@ -39,3 +39,18 @@ func TestNextShuffleIdxNeverRepeatsCurrent(t *testing.T) {
 		}
 	}
 }
+
+// TestNextShuffleIdxAfterDeletingPlaying: once the playing entry is deleted,
+// queuePos points at a neighbour that isn't playing. Shuffle must be free to
+// pick it — with one track left, excluding it wrongly reported "nothing left".
+func TestNextShuffleIdxAfterDeletingPlaying(t *testing.T) {
+	m := newTestModel()
+	m.queue = []api.Track{{ID: "a"}} // "b" was playing and got deleted
+	m.queuePos = 0
+	m.current = api.Track{ID: "b"}
+	m.hasCurrent = true
+
+	if got := m.nextShuffleIdx(); got != 0 {
+		t.Fatalf("nextShuffleIdx() = %d, want 0 (the remaining track)", got)
+	}
+}

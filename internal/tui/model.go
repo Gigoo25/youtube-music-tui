@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -184,6 +185,7 @@ type model struct {
 	pendingSeek float64   // resume position to apply once a reloaded track is playing
 	retryID     string    // track id the retry budget applies to
 	retries     int       // failed attempts for retryID since it last played cleanly
+	retryFrom   float64   // position the last retry resumed at; progress is measured from here
 	stallPos    float64   // last observed position (stall watchdog)
 	stallAt     time.Time // when stallPos last advanced
 
@@ -198,6 +200,12 @@ type model struct {
 	sbCache string
 	scKey   shortcutsKey
 	scCache string
+
+	// mouse: geometry of the last frame, which list item each panel body line
+	// shows (-1 = none; see hit), and the previous click for double-clicks.
+	lay       layout
+	panelHits []int
+	click     lastClick
 
 	// debounced config persistence: mutations mark dirty; the tick flushes after
 	// configSaveDelay so favoriting/queue churn doesn't re-marshal+write on every
@@ -469,7 +477,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// A track that has played cleanly for a while earns its retry budget
 		// back (so one hiccup an hour ago doesn't turn the next into a skip).
-		if m.retries > 0 && m.hasCurrent && m.current.ID == m.retryID && m.playerState.Position > 30 {
+		// Measured from where the retry resumed: a mid-track retry seeks straight
+		// past 30s, and counting that as clean play would retry the same failure
+		// forever instead of ever skipping.
+		if m.retries > 0 && m.hasCurrent && m.current.ID == m.retryID && m.playerState.Position > m.retryFrom+30 {
 			m.retries = 0
 		}
 		if c := m.watchdogCheck(); c != nil {
@@ -528,7 +539,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case mprisSetVolMsg:
-		vol := msg.level * 100
+		// The player clamps to 0–150; mirror that so the bar never shows a level
+		// mpv refused.
+		vol := min(max(msg.level*100, 0), 150)
 		m.player.SetVolume(vol)
 		m.playerState.Volume = vol // don't let the shortcuts bar lag a tick behind
 		return m, nil
@@ -536,6 +549,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case autoContinueMsg:
 		if !m.hasCurrent || m.current.ID != msg.seed {
 			return m, nil // the user started something else while the request was in flight
+		}
+		if superseded(msg.err) {
+			// A second advance (n pressed again) replaced this fetch with one for the
+			// same seed. Clearing hasCurrent here would make that one drop its result.
+			return m, nil
 		}
 		if msg.err != nil {
 			// Nothing is playing any more; hasCurrent was only held true so the
@@ -574,9 +592,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.gen != m.randomGen {
 			return m, nil // the user asked for something else while this was in flight
 		}
-		// Search (the random source) lives in the secret-blocked ytmusic.go, so its
-		// results are cleaned here rather than at the API boundary.
-		tracks := api.CleanTracks(msg.tracks)
+		tracks := msg.tracks // SearchSongs already cleans at the API boundary
 		if msg.err != nil {
 			m.setError("random failed: " + msg.err.Error())
 		} else if len(tracks) == 0 {
@@ -589,6 +605,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case radioDoneMsg:
 		if !m.hasCurrent || msg.seed != m.current.ID {
 			return m, nil // the seed track changed while the request was in flight
+		}
+		if superseded(msg.err) {
+			return m, nil // R pressed again: the newer request for this seed reports
 		}
 		if msg.err != nil {
 			m.setError("radio failed: " + msg.err.Error())
@@ -664,7 +683,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.setError("search failed: " + msg.err.Error())
 		} else {
-			m.searchResults = api.CleanTracks(msg.tracks)
+			m.searchResults = msg.tracks // SearchSongsPage already cleans
 			m.searchContinuation = msg.next
 			m.searchCursor = 0
 			if len(msg.tracks) == 0 {
@@ -692,7 +711,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for _, t := range m.searchResults {
 			seen[t.ID] = true
 		}
-		for _, t := range api.CleanTracks(msg.tracks) {
+		for _, t := range msg.tracks {
 			if t.ID != "" && !seen[t.ID] {
 				m.searchResults = append(m.searchResults, t)
 				seen[t.ID] = true
@@ -704,6 +723,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
 	}
 
 	// Forward any other message to the active text input (e.g. paste, cursor
@@ -884,6 +906,67 @@ func (m *model) clampActiveCursor() {
 	}
 }
 
+// clearFilterKeepSelection drops the filter while the user stays in the view,
+// moving the cursor from its filtered row to the same item in the full list so
+// esc doesn't throw away their place. A filter matching nothing lands on 0.
+func (m *model) clearFilterKeepSelection() {
+	cp := m.activeCursorPtr()
+	idx := 0
+	if cp != nil {
+		if vis := m.visibleIndices(); *cp >= 0 && *cp < len(vis) {
+			idx = vis[*cp]
+		}
+	}
+	m.clearFilter()
+	if cp != nil {
+		*cp = idx
+		m.clampActiveCursor()
+	}
+}
+
+// visibleIndices maps each filtered row of the active view to its index in the
+// unfiltered list (flat across sections for Home and Artist) — the inverse of
+// what the filter hides.
+func (m *model) visibleIndices() []int {
+	switch m.activeView {
+	case viewHome:
+		out := m.trackVisibleIndices(m.homeListenAgain)
+		for _, i := range m.trackVisibleIndices(m.homeQuickPicks) {
+			out = append(out, len(m.homeListenAgain)+i)
+		}
+		return out
+	case viewQueue:
+		return m.trackVisibleIndices(m.queue)
+	case viewFavorites:
+		return m.trackVisibleIndices(m.cfg.Favorites)
+	case viewHistory:
+		q := strings.ToLower(m.filter)
+		var out []int
+		for i, e := range m.cfg.History {
+			if !m.filterActive() || matchTrack(e.Track, q) {
+				out = append(out, i)
+			}
+		}
+		return out
+	case viewAlbum:
+		return m.trackVisibleIndices(m.albumTracks)
+	case viewArtist:
+		out := m.trackVisibleIndices(m.artistSongs)
+		q := strings.ToLower(m.filter)
+		for i, a := range m.artistAlbums {
+			if !m.filterActive() || matchStr(a.Title, q) || matchStr(a.Artist, q) {
+				out = append(out, len(m.artistSongs)+i)
+			}
+		}
+		return out
+	case viewPlaylistDetail:
+		if pl := m.cfg.PlaylistByName(m.openPlaylist); pl != nil {
+			return m.trackVisibleIndices(pl.Tracks)
+		}
+	}
+	return nil
+}
+
 // clearFilter drops any active filter (called when leaving a view).
 func (m *model) clearFilter() {
 	m.filter = ""
@@ -1010,10 +1093,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.filterInput.Blur()
 			return m, nil
 		case "esc":
-			m.clearFilter()
-			if cp := m.activeCursorPtr(); cp != nil {
-				*cp = 0
-			}
+			m.clearFilterKeepSelection()
 			return m, nil
 		}
 		var cmd tea.Cmd
@@ -1202,10 +1282,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		// An applied local filter clears first, before any navigation.
 		if m.filter != "" {
-			m.clearFilter()
-			if cp := m.activeCursorPtr(); cp != nil {
-				*cp = 0
-			}
+			m.clearFilterKeepSelection()
 			return m, nil
 		}
 		if m.backFromContextual() {
@@ -1285,12 +1362,14 @@ func (m *model) popView() view {
 }
 
 // backFromContextual steps a contextual view back to the screen it was opened
-// from: album/artist/genre-picker → the view stack, playlist detail → the
+// from: album/artist/genre-picker/help → the view stack, playlist detail → the
 // playlist list, the add-to-playlist picker → its origin view. Returns false
 // when the active view is a top-level screen (nothing to step back from).
 func (m *model) backFromContextual() bool {
 	switch m.activeView {
-	case viewAlbum, viewArtist, viewGenres:
+	case viewAlbum, viewArtist, viewGenres, viewHelp:
+		// Help is contextual too: both "?" and its sidebar entry push the view it
+		// was opened from, so h/esc return there just like "?" does.
 		m.clearFilter()
 		m.activeView = m.popView()
 	case viewPlaylistDetail:
@@ -1386,9 +1465,17 @@ func (m *model) handlePlaylistDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.enqueue(pl.Tracks[vis[m.plDetailCursor]])
 		}
 	case "p":
-		if m.plDetailCursor < len(vis) {
-			m.playNow(pl.Tracks[vis[m.plDetailCursor]])
+		// Play the playlist from the selected track, replacing the queue — the
+		// same as p on an album (and on the Playlists list, which starts at the top).
+		if len(pl.Tracks) == 0 {
+			return m, nil
 		}
+		start := 0
+		if m.plDetailCursor < len(vis) {
+			start = vis[m.plDetailCursor]
+		}
+		m.replaceQueue(pl.Tracks, start)
+		m.setStatus(fmt.Sprintf("queue replaced with playlist %q (%d tracks)", pl.Name, len(pl.Tracks)))
 	case "e":
 		// Queues the whole playlist, so it deliberately sits outside the
 		// cursor-range checks — a filter matching nothing must not disable it.
@@ -1713,7 +1800,10 @@ func (m *model) loadHomeQuickPicks() tea.Cmd {
 		if seed != "" {
 			tracks, err = client.Related(ctx, seed)
 		}
-		if err == nil && len(tracks) == 0 {
+		// A failed Related falls back too: the seed is the newest history entry,
+		// so a seed Related keeps failing on (a removed video, say) would otherwise
+		// leave Quick Picks broken through every retry until something else plays.
+		if len(tracks) == 0 && ctx.Err() == nil {
 			tracks, err = client.Trending(ctx)
 		}
 		return homeQuickPicksMsg{tracks: tracks, err: err}
@@ -1982,7 +2072,7 @@ func (m *model) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.refreshListenAgain() // Listen Again is built from history
 			m.markConfigDirty()
 			m.clampActiveCursor()
-			m.setStatus("removed from history")
+			m.setStatus("removed from history: " + e.Track.Title)
 		}
 	case "c":
 		if len(m.cfg.History) == 0 {
@@ -1994,10 +2084,9 @@ func (m *model) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cfg.History = nil
 			m.historyCursor = 0
 			// Listen Again is built from history — rebuild it so Home matches.
+			// No Home cursor clamp here: homeLen() would apply History's filter, and
+			// activateView re-clamps (filter cleared) whenever Home is reopened.
 			m.refreshListenAgain()
-			if m.homeCursor >= m.homeLen() {
-				m.homeCursor = 0
-			}
 			m.markConfigDirty()
 			m.setStatus("history cleared")
 		}
@@ -2134,21 +2223,26 @@ func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	switch msg.String() {
-	case "J":
-		if !m.filterActive() {
-			m.moveQueueItem(m.queueCursor, m.queueCursor+1)
+	case "J", "K":
+		if m.filterActive() {
+			// Reordering a filtered view would swap with hidden neighbours.
+			m.setError("clear the filter (esc) to reorder")
+			return m, nil
 		}
-	case "K":
-		if !m.filterActive() {
-			m.moveQueueItem(m.queueCursor, m.queueCursor-1)
+		to := m.queueCursor + 1
+		if msg.String() == "K" {
+			to = m.queueCursor - 1
 		}
-	case "enter":
+		m.moveQueueItem(m.queueCursor, to)
+	case "enter", "p":
+		// Everything here is already queued, so "queue" and "play now" coincide.
 		if m.queueCursor < len(vis) {
 			m.playAt(vis[m.queueCursor])
 		}
 	case "d", "x":
 		if m.queueCursor < len(vis) {
 			removed := vis[m.queueCursor]
+			title := m.queue[removed].Title
 			m.queue = append(m.queue[:removed], m.queue[removed+1:]...)
 			// Keep queuePos pointing at the same playing track.
 			switch {
@@ -2166,7 +2260,7 @@ func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.clampActiveCursor() // keep cursor in range of the (refiltered) list
 			m.prefetchNext()      // the upcoming tracks may have shifted — re-warm them
 			m.markConfigDirty()
-			m.setStatus("removed from queue")
+			m.setStatus("removed from queue: " + title)
 		}
 	case ".":
 		// Jump the cursor to the now-playing track.
@@ -2237,11 +2331,15 @@ func (m *model) handleFavKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "d", "x":
 		// Remove from favorites (f is the global toggle handled above).
 		if m.favCursor < len(favs) {
-			m.cfg.ToggleFavorite(favs[m.favCursor])
+			t := favs[m.favCursor]
+			m.cfg.ToggleFavorite(t)
 			m.markConfigDirty()
 			m.clampActiveCursor()
-			m.setStatus("removed from favorites")
+			m.setStatus("removed from favorites: " + t.Title)
 		}
+	case "e":
+		// Whole list, like e on an album or playlist (a filter doesn't narrow it).
+		m.enqueueAll(m.cfg.Favorites)
 	}
 	return m, nil
 }
@@ -2438,16 +2536,16 @@ func (m *model) nextTrack() tea.Cmd {
 		}
 		return nil
 	}
-	switch m.repeat {
+	mode := m.repeat
+	if mode == repeatOne && !m.currentAtQueuePos() {
+		// The playing entry was deleted from the queue: queuePos now points at its
+		// predecessor (or -1), and replaying that would repeat a song the user
+		// never picked. Advance like repeat-off into the slot that shifted in.
+		mode = repeatOff
+	}
+	switch mode {
 	case repeatOne:
-		// queuePos == -1 is normal after the playing entry was deleted from the
-		// queue, and playAt(-1) is a no-op — take the slot that shifted into its
-		// place instead.
-		if m.hasCurrent && m.queuePos >= 0 {
-			m.playAt(m.queuePos)
-		} else {
-			m.playAt(m.queuePos + 1)
-		}
+		m.playAt(m.queuePos)
 	case repeatAll:
 		next := (m.queuePos + 1) % len(m.queue)
 		if m.shuffle {
@@ -2478,18 +2576,37 @@ func (m *model) nextTrack() tea.Cmd {
 	return nil
 }
 
+// superseded reports whether err only means a newer request in the same lane
+// cancelled this one (see reqCtx) — not a failure worth surfacing.
+func superseded(err error) bool {
+	return errors.Is(err, context.Canceled)
+}
+
+// currentAtQueuePos reports whether queuePos still holds the playing track. It
+// doesn't after the playing entry is deleted: queuePos steps back onto its
+// predecessor so the next advance lands on the slot that shifted in.
+func (m *model) currentAtQueuePos() bool {
+	return m.hasCurrent && m.queuePos >= 0 && m.queuePos < len(m.queue) &&
+		m.queue[m.queuePos].ID == m.current.ID
+}
+
 // nextShuffleIdx picks a random queue index other than the one playing so
 // shuffle never repeats a track back-to-back. Maps [0,n-1) onto the queue minus
 // the current slot (no rejection loop); falls back to a plain random pick when
-// the playing entry isn't in the queue (queuePos out of range). Returns -1 when
+// the playing entry isn't in the queue (it was deleted). Returns -1 when
 // the queue holds no other track; the caller decides what that means.
 func (m *model) nextShuffleIdx() int {
 	n := len(m.queue)
-	if n <= 1 {
-		return -1 // no other track to pick — the caller decides what that means
+	if n == 0 {
+		return -1
 	}
-	if m.queuePos < 0 || m.queuePos >= n {
+	// The playing entry was deleted (queuePos is -1 or a neighbour): every queued
+	// track is "another track", including the one queuePos now points at.
+	if m.queuePos < 0 || m.queuePos >= n || (m.hasCurrent && m.queue[m.queuePos].ID != m.current.ID) {
 		return rand.Intn(n)
+	}
+	if n == 1 {
+		return -1 // no other track to pick — the caller decides what that means
 	}
 	idx := rand.Intn(n - 1)
 	if idx >= m.queuePos {
@@ -2555,9 +2672,14 @@ func (m *model) handlePlaybackFailure(errMsg string) tea.Cmd {
 		m.retries++
 		pos := m.playerState.Position
 		m.setStatus("stream failed — retrying…")
+		// A stall (watchdog) leaves the URL cached, unlike an mpv stream error —
+		// drop it so the retry really resolves a fresh one.
+		m.player.Invalidate(m.current.ID)
 		m.playAt(m.queuePos)
+		m.retryFrom = 0
 		if pos > 5 {
 			m.pendingSeek = pos // mid-track failure: resume there, don't restart
+			m.retryFrom = pos
 		}
 		return nil
 	}

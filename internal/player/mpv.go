@@ -455,6 +455,16 @@ func (p *Player) cacheGet(videoID string) (string, bool) {
 	return p.cachedLocked(videoID)
 }
 
+// Invalidate drops videoID's cached stream URL so the next Load resolves a fresh
+// one. The stream-error path does this itself; failures mpv never reports as an
+// error (a stall the TUI's watchdog detects) need it from the caller, or the
+// retry would replay the same dead URL.
+func (p *Player) Invalidate(videoID string) {
+	p.mu.Lock()
+	delete(p.urlCache, videoID)
+	p.mu.Unlock()
+}
+
 func (p *Player) cachePut(videoID, url string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

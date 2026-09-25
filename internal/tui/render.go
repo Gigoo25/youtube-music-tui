@@ -160,6 +160,13 @@ func (m *model) View() string {
 		panelW = 1
 	}
 
+	m.lay.sidebarW, m.lay.innerW, m.lay.contentH = sidebarW, innerW, contentH
+	m.lay.progressY = -1
+	if nowbar != "" {
+		// Rows: top border, content, status line, now-bar info, then the bar.
+		m.lay.progressY = 1 + contentH + lipgloss.Height(status) + 1
+	}
+
 	sidebar := m.renderSidebar(sidebarW, contentH)
 	panel := padToHeight(m.renderPanel(panelW, contentH), contentH)
 	body := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, panel)
@@ -286,13 +293,17 @@ func (m *model) buildSidebar(w, h int) string {
 // renderPanel renders the active view's content, with a naming prompt or
 // local-filter line on top when one is active.
 func (m *model) renderPanel(w, h int) string {
+	m.panelHits = m.panelHits[:0]
+	m.lay.panelBodyY = 1 // below the shell's top border
 	if m.naming {
 		nl := m.renderNamingLine(w)
+		m.lay.panelBodyY += lipgloss.Height(nl)
 		body := m.renderPanelBody(w, h-lipgloss.Height(nl))
 		return lipgloss.JoinVertical(lipgloss.Left, nl, body)
 	}
 	if m.filtering || m.filter != "" {
 		fl := m.renderFilterLine(w)
+		m.lay.panelBodyY += lipgloss.Height(fl)
 		body := m.renderPanelBody(w, h-lipgloss.Height(fl))
 		return lipgloss.JoinVertical(lipgloss.Left, fl, body)
 	}
@@ -347,10 +358,9 @@ func (m *model) renderPanelBody(w, h int) string {
 }
 
 // renderPlaylistDetail lists the tracks of one saved playlist (standard track
-// rows). Per-track actions match the other list views: enter queues the
-// selected track, p plays it now, e appends the whole playlist, d removes the
-// selected track from the playlist. (Whole-playlist p=replace / e=append lives
-// on the Playlists list view, not here.)
+// rows). Actions mirror the album view: enter queues the selected track, p
+// replaces the queue with the playlist starting at it, e appends the whole
+// playlist, d removes the selected track from the playlist.
 func (m *model) renderPlaylistDetail(w, h int) string {
 	pl := m.cfg.PlaylistByName(m.openPlaylist)
 	if pl == nil {
@@ -374,6 +384,7 @@ func (m *model) renderPlaylistDetail(w, h int) string {
 	}
 	focused := m.focus == focusPanel
 	start, end := windowBounds(m.plDetailCursor, len(vis), listH)
+	m.hitRange(lipgloss.Height(heading), start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		rows = append(rows, m.renderResultRow(i+1, pl.Tracks[vis[i]], i == m.plDetailCursor, focused, w, false))
@@ -394,6 +405,7 @@ func (m *model) renderPlaylistPick(w, h int) string {
 	}
 	focused := m.focus == focusPanel
 	start, end := windowBounds(m.pickCursor, len(pls)+1, listH)
+	m.hitRange(lipgloss.Height(heading), start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		label := "+ New playlist…"
@@ -423,6 +435,7 @@ func (m *model) renderPlaylists(w, h int) string {
 	}
 	focused := m.focus == focusPanel
 	start, end := windowBounds(m.playlistCursor, len(pls), listH)
+	m.hitRange(lipgloss.Height(heading), start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		pl := pls[i]
@@ -445,6 +458,7 @@ func (m *model) renderGenres(w, h int) string {
 	}
 	focused := m.focus == focusPanel
 	start, end := windowBounds(m.genreCursor, len(items), listH)
+	m.hitRange(lipgloss.Height(heading), start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		rows = append(rows, listRow("", items[i], "", i == m.genreCursor, focused, w))
@@ -475,6 +489,7 @@ func (m *model) renderAlbum(w, h int) string {
 	}
 	focused := m.focus == focusPanel
 	start, end := windowBounds(m.albumCursor, len(tracks), listH)
+	m.hitRange(lipgloss.Height(heading), start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		rows = append(rows, m.renderResultRow(i+1, tracks[i], i == m.albumCursor, focused, w, false))
@@ -525,6 +540,7 @@ func (m *model) renderHome(w, h int) string {
 		rows = append(rows, styleDim.Render(truncate("  Nothing yet — play a song and it'll show up here.", w)))
 	}
 	for i := max(start-laFirst, 0); i < min(end-laFirst, len(listenAgain)); i++ {
+		m.hit(len(rows), i)
 		rows = append(rows, m.renderResultRow(i+1, listenAgain[i], i == m.homeCursor, focused, w, false))
 	}
 
@@ -542,6 +558,7 @@ func (m *model) renderHome(w, h int) string {
 		}
 	}
 	for i := max(start-qpFirst, 0); i < min(end-qpFirst, len(quickPicks)); i++ {
+		m.hit(len(rows), len(listenAgain)+i)
 		rows = append(rows, m.renderResultRow(i+1, quickPicks[i], len(listenAgain)+i == m.homeCursor, focused, w, false))
 	}
 
@@ -599,12 +616,14 @@ func (m *model) renderArtist(w, h int) string {
 		rows = append(rows, styleSecondaryBold.Render(iconPlay+" Top Songs"))
 	}
 	for i := max(start-sFirst, 0); i < min(end-sFirst, len(songs)); i++ {
+		m.hit(lipgloss.Height(heading)+len(rows), i)
 		rows = append(rows, m.renderResultRow(i+1, songs[i], i == m.artistCursor, focused, w, false))
 	}
 	if len(albums) > 0 && vis(aHead) {
 		rows = append(rows, styleSecondaryBold.Render(iconPlaylist+" Albums"))
 	}
 	for i := max(start-aFirst, 0); i < min(end-aFirst, len(albums)); i++ {
+		m.hit(lipgloss.Height(heading)+len(rows), len(songs)+i)
 		rows = append(rows, m.renderAlbumRefRow(i+1, albums[i], len(songs)+i == m.artistCursor, focused, w))
 	}
 
@@ -797,71 +816,79 @@ func (m *model) buildShortcutsBar(w int) string {
 		shortcut{"C", "auto-continue", m.cfg.AutoContinue},
 	)
 
-	// Context-specific actions.
+	// Context-specific actions. Song lists share one vocabulary: enter queues,
+	// p plays, e queues everything, d removes, and trackActs (f/a/A/P) act on the
+	// selected song — keep new views on the same labels.
+	nav := shortcut{"j/k", "move", false}
+	trackActs := []shortcut{
+		{"f", "fav", false}, {"a", "album", false},
+		{"A", "artist", false}, {"P", "to playlist", false},
+	}
 	if m.focus == focusSidebar {
-		segs = append(segs,
-			shortcut{"j/k", "move", false},
-			shortcut{"enter", "open", false},
-		)
+		segs = append(segs, nav, shortcut{"enter/l", "open", false})
 	} else {
 		switch m.activeView {
 		case viewHome:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
-				shortcut{"f", "fav", false}, shortcut{"a", "album", false},
-				shortcut{"A", "artist", false})
+			segs = append(segs, nav, shortcut{"enter", "queue", false},
+				shortcut{"p", "play now", false})
+			segs = append(segs, trackActs...)
 		case viewSearch:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
-				shortcut{"e", "queue all", false}, shortcut{"f", "fav", false},
-				shortcut{"a", "album", false}, shortcut{"A", "artist", false})
+			segs = append(segs, nav, shortcut{"enter", "queue", false},
+				shortcut{"p", "play now", false}, shortcut{"e", "queue all", false})
+			segs = append(segs, trackActs...)
+			segs = append(segs, shortcut{"/", "edit query", false})
+			if len(m.searchResults) > 0 {
+				segs = append(segs, shortcut{"esc", "clear results", false})
+			}
 		case viewQueue:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"J/K", "reorder", false},
-				shortcut{"enter", "play", false}, shortcut{"d", "remove", false},
+			segs = append(segs, nav, shortcut{"enter/p", "play", false},
+				shortcut{"J/K", "reorder", false}, shortcut{"d", "remove", false},
 				shortcut{".", "now playing", false}, shortcut{"c", "clear", false},
-				shortcut{"S", "save", false}, shortcut{"f", "fav", false},
-				shortcut{"a", "album", false}, shortcut{"A", "artist", false})
+				shortcut{"S", "save as playlist", false})
+			segs = append(segs, trackActs...)
 		case viewFavorites:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
-				shortcut{"d", "remove", false},
-				shortcut{"f", "fav", false}, shortcut{"a", "album", false},
-				shortcut{"A", "artist", false})
+			segs = append(segs, nav, shortcut{"enter", "queue", false},
+				shortcut{"p", "play now", false}, shortcut{"e", "queue all", false},
+				shortcut{"d", "remove", false})
+			segs = append(segs, trackActs[1:]...) // f is d here
 		case viewHistory:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
-				shortcut{"d", "remove", false}, shortcut{"c", "clear history", false},
-				shortcut{"f", "fav", false},
-				shortcut{"a", "album", false}, shortcut{"A", "artist", false})
+			segs = append(segs, nav, shortcut{"enter", "queue", false},
+				shortcut{"p", "play now", false}, shortcut{"d", "remove", false},
+				shortcut{"c", "clear history", false})
+			segs = append(segs, trackActs...)
 		case viewAlbum:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "queue", false},
+			segs = append(segs, nav, shortcut{"enter", "queue", false},
 				shortcut{"p", "play album (replaces queue)", false},
-				shortcut{"e", "queue all", false}, shortcut{"f", "fav", false})
+				shortcut{"e", "queue all", false})
+			segs = append(segs, trackActs...)
 		case viewArtist:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter/l", "queue / open", false}, shortcut{"p", "play now", false},
-				shortcut{"e", "queue all", false}, shortcut{"f", "fav", false})
+			segs = append(segs, nav, shortcut{"enter", "queue / open album", false},
+				shortcut{"p", "play now", false}, shortcut{"e", "queue all", false})
+			segs = append(segs, trackActs...)
 		case viewPlaylists:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter/l", "view tracks", false},
+			segs = append(segs, nav, shortcut{"enter/l", "view tracks", false},
 				shortcut{"p", "play (replaces queue)", false},
-				shortcut{"e", "add to queue", false},
-				shortcut{"d", "delete", false})
+				shortcut{"e", "queue all", false}, shortcut{"d", "delete", false})
 		case viewPlaylistDetail:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "queue song", false}, shortcut{"p", "play now", false},
-				shortcut{"e", "queue all", false}, shortcut{"d", "remove", false},
-				shortcut{"esc", "back", false})
+			segs = append(segs, nav, shortcut{"enter", "queue", false},
+				shortcut{"p", "play playlist (replaces queue)", false}, shortcut{"e", "queue all", false},
+				shortcut{"d", "remove", false})
+			segs = append(segs, trackActs...)
 		case viewPlaylistPick:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "add", false}, shortcut{"esc", "cancel", false})
+			segs = append(segs, nav, shortcut{"enter", "add", false})
 		case viewGenres:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "pick & play", false}, shortcut{"esc", "cancel", false})
+			segs = append(segs, nav, shortcut{"enter", "pick & play", false})
+		case viewHelp:
+			segs = append(segs, shortcut{"j/k", "scroll", false})
 		}
-		segs = append(segs, shortcut{"h", "menu", false})
+		// h/esc mirror backFromContextual: contextual views step back to where
+		// they were opened from; top-level views hand focus to the sidebar.
+		switch m.activeView {
+		case viewAlbum, viewArtist, viewGenres, viewHelp, viewPlaylistDetail, viewPlaylistPick:
+			segs = append(segs, shortcut{"h/esc", "back", false})
+		default:
+			segs = append(segs, shortcut{"h", "menu", false})
+		}
 	}
 
 	// Discovery: "/" filters the current pane; global YouTube Music search lives on
@@ -1054,7 +1081,11 @@ func (m *model) renderSearch(w, h int) string {
 	if listH < 1 {
 		listH = 1
 	}
-	blocks = append(blocks, m.renderResultList(w, listH))
+	// The query box (heading below, then the bordered bar) is clickable too.
+	for l := lipgloss.Height(heading); l < lipgloss.Height(heading)+lipgloss.Height(bar); l++ {
+		m.hit(l, hitSearchBar)
+	}
+	blocks = append(blocks, m.renderResultList(w, listH, used))
 	if footer != "" {
 		blocks = append(blocks, footer)
 	}
@@ -1078,11 +1109,12 @@ func (m *model) renderSearchFooter(w int) string {
 	}
 }
 
-func (m *model) renderResultList(w, h int) string {
+func (m *model) renderResultList(w, h, top int) string {
 	if len(m.searchResults) == 0 {
 		return styleDim.Render("No results.")
 	}
 	start, end := windowBounds(m.searchCursor, len(m.searchResults), h)
+	m.hitRange(top, start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		t := m.searchResults[i]
@@ -1154,7 +1186,7 @@ func (m *model) renderTrackRow(n int, t api.Track, selected, focused bool, w int
 // ─── Queue screen ──────────────────────────────────────────────────────────────
 
 func (m *model) renderQueue(w, h int) string {
-	header := styleSecondaryBold.Render(truncate(fmt.Sprintf("%s Up next (%d tracks)", iconQueue, len(m.queue)), w))
+	header := styleSecondaryBold.Render(truncate(fmt.Sprintf("%s Queue (%d tracks)", iconQueue, len(m.queue)), w))
 	if len(m.queue) == 0 {
 		return lipgloss.JoinVertical(lipgloss.Left,
 			header,
@@ -1175,6 +1207,7 @@ func (m *model) renderQueue(w, h int) string {
 
 	focused := m.focus == focusPanel
 	start, end := windowBounds(m.queueCursor, len(vis), listH)
+	m.hitRange(lipgloss.Height(header), start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		orig := vis[i]
@@ -1213,6 +1246,7 @@ func (m *model) renderFavorites(w, h int) string {
 		listH = 1
 	}
 	start, end := windowBounds(m.favCursor, len(favs), listH)
+	m.hitRange(lipgloss.Height(heading), start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		rows = append(rows, m.renderResultRow(i+1, favs[i], i == m.favCursor, m.focus == focusPanel, w, true))
@@ -1223,7 +1257,7 @@ func (m *model) renderFavorites(w, h int) string {
 // ─── History screen ────────────────────────────────────────────────────────────
 
 func (m *model) renderHistory(w, h int) string {
-	heading := styleSecondaryBold.Render(iconHistory + " Recently Played")
+	heading := styleSecondaryBold.Render(iconHistory + " History")
 	if len(m.cfg.History) == 0 {
 		return lipgloss.JoinVertical(lipgloss.Left,
 			heading,
@@ -1243,6 +1277,7 @@ func (m *model) renderHistory(w, h int) string {
 	focused := m.focus == focusPanel
 	tsLayout := "Jan 2 15:04"
 	start, end := windowBounds(m.historyCursor, len(hist), listH)
+	m.hitRange(lipgloss.Height(heading), start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		e := hist[i]
@@ -1280,12 +1315,12 @@ var helpSections = []struct {
 		{"C", "auto-continue radio when the queue ends"},
 	}},
 	{"Queue & track", []helpBinding{
-		{"enter", "queue / play selected"},
-		{"p", "play now (album view: play album, replaces queue)"},
-		{"e", "queue all (album / artist / search / playlist)"},
+		{"enter", "queue selected (queue view: play it)"},
+		{"p", "play now (album / playlist: play it from here, replaces queue)"},
+		{"e", "queue all (search / favorites / album / artist / playlist)"},
 		{"f", "toggle favorite"},
 		{"d / x", "remove (queue / favorites / history / playlist)"},
-		{"J / K", "move track down / up in queue"},
+		{"J / K", "move track down / up in queue (not while filtered)"},
 		{".", "jump to now-playing (queue)"},
 		{"c", "clear queue / clear history (asks to confirm)"},
 	}},
@@ -1305,20 +1340,28 @@ var helpSections = []struct {
 		{"ctrl+d / ctrl+u", "scroll half page down / up"},
 		{"ctrl+f / ctrl+b", "scroll full page down / up"},
 		{"tab", "toggle sidebar / panel focus"},
-		{"h / esc", "step back (contextual view) / back to menu"},
+		{"h / esc", "step back (album / artist / playlist / help) or focus the menu"},
+		{"esc", "clear the filter, then search results, before stepping back"},
 	}},
 	{"Views & discovery", []helpBinding{
 		{"1-6", "jump to view (Home…Playlists)"},
 		{"2", "global YouTube Music search"},
 		{"ctrl+u / ctrl+w", "clear query / delete word back (while typing)"},
 		{"/", "filter the current pane (esc clears)"},
-		{"a", "open the track's album (Enter to play it)"},
+		{"a", "open the track's album (p plays it)"},
 		{"A", "open the track's artist (top songs + albums)"},
 		{"z", "random song (pick a genre)"},
 	}},
+	{"Mouse", []helpBinding{
+		{"wheel", "scroll the pane under the pointer"},
+		{"click", "select a row (sidebar: open the view)"},
+		{"double-click", "play the song / open the playlist, album or genre"},
+		{"click bar", "seek (progress bar) / edit the query (search box)"},
+		{"shift+drag", "select text (most terminals)"},
+	}},
 	{"App", []helpBinding{
 		{"T", "cycle color theme"},
-		{"?", "this help"},
+		{"?", "this help (again, h or esc to close)"},
 		{"q", "quit"},
 	}},
 }
