@@ -184,6 +184,7 @@ type model struct {
 	pendingSeek float64   // resume position to apply once a reloaded track is playing
 	retryID     string    // track id the retry budget applies to
 	retries     int       // failed attempts for retryID since it last played cleanly
+	retryFrom   float64   // position the last retry resumed at; progress is measured from here
 	stallPos    float64   // last observed position (stall watchdog)
 	stallAt     time.Time // when stallPos last advanced
 
@@ -469,7 +470,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// A track that has played cleanly for a while earns its retry budget
 		// back (so one hiccup an hour ago doesn't turn the next into a skip).
-		if m.retries > 0 && m.hasCurrent && m.current.ID == m.retryID && m.playerState.Position > 30 {
+		// Measured from where the retry resumed: a mid-track retry seeks straight
+		// past 30s, and counting that as clean play would retry the same failure
+		// forever instead of ever skipping.
+		if m.retries > 0 && m.hasCurrent && m.current.ID == m.retryID && m.playerState.Position > m.retryFrom+30 {
 			m.retries = 0
 		}
 		if c := m.watchdogCheck(); c != nil {
@@ -1713,7 +1717,10 @@ func (m *model) loadHomeQuickPicks() tea.Cmd {
 		if seed != "" {
 			tracks, err = client.Related(ctx, seed)
 		}
-		if err == nil && len(tracks) == 0 {
+		// A failed Related falls back too: the seed is the newest history entry,
+		// so a seed Related keeps failing on (a removed video, say) would otherwise
+		// leave Quick Picks broken through every retry until something else plays.
+		if len(tracks) == 0 && ctx.Err() == nil {
 			tracks, err = client.Trending(ctx)
 		}
 		return homeQuickPicksMsg{tracks: tracks, err: err}
@@ -2438,16 +2445,16 @@ func (m *model) nextTrack() tea.Cmd {
 		}
 		return nil
 	}
-	switch m.repeat {
+	mode := m.repeat
+	if mode == repeatOne && !m.currentAtQueuePos() {
+		// The playing entry was deleted from the queue: queuePos now points at its
+		// predecessor (or -1), and replaying that would repeat a song the user
+		// never picked. Advance like repeat-off into the slot that shifted in.
+		mode = repeatOff
+	}
+	switch mode {
 	case repeatOne:
-		// queuePos == -1 is normal after the playing entry was deleted from the
-		// queue, and playAt(-1) is a no-op — take the slot that shifted into its
-		// place instead.
-		if m.hasCurrent && m.queuePos >= 0 {
-			m.playAt(m.queuePos)
-		} else {
-			m.playAt(m.queuePos + 1)
-		}
+		m.playAt(m.queuePos)
 	case repeatAll:
 		next := (m.queuePos + 1) % len(m.queue)
 		if m.shuffle {
@@ -2476,6 +2483,14 @@ func (m *model) nextTrack() tea.Cmd {
 		}
 	}
 	return nil
+}
+
+// currentAtQueuePos reports whether queuePos still holds the playing track. It
+// doesn't after the playing entry is deleted: queuePos steps back onto its
+// predecessor so the next advance lands on the slot that shifted in.
+func (m *model) currentAtQueuePos() bool {
+	return m.hasCurrent && m.queuePos >= 0 && m.queuePos < len(m.queue) &&
+		m.queue[m.queuePos].ID == m.current.ID
 }
 
 // nextShuffleIdx picks a random queue index other than the one playing so
@@ -2555,9 +2570,14 @@ func (m *model) handlePlaybackFailure(errMsg string) tea.Cmd {
 		m.retries++
 		pos := m.playerState.Position
 		m.setStatus("stream failed — retrying…")
+		// A stall (watchdog) leaves the URL cached, unlike an mpv stream error —
+		// drop it so the retry really resolves a fresh one.
+		m.player.Invalidate(m.current.ID)
 		m.playAt(m.queuePos)
+		m.retryFrom = 0
 		if pos > 5 {
 			m.pendingSeek = pos // mid-track failure: resume there, don't restart
+			m.retryFrom = pos
 		}
 		return nil
 	}
