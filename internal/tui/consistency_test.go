@@ -76,3 +76,47 @@ func TestQueueReorderWhileFilteredExplains(t *testing.T) {
 		t.Fatalf("status = %q, want a hint to clear the filter", m.status)
 	}
 }
+
+// TestEscClearingFilterKeepsSelection: esc drops the filter but must leave the
+// cursor on the same track in the full list, not jump back to the top — both
+// from an applied filter and while still typing it.
+func TestEscClearingFilterKeepsSelection(t *testing.T) {
+	for _, typing := range []bool{false, true} {
+		m := newTestModel()
+		m.queue = []api.Track{{ID: "a", Title: "Alpha"}, {ID: "b", Title: "Beta"},
+			{ID: "c", Title: "Gamma"}, {ID: "d", Title: "Delta"}}
+		m.activateView(viewQueue)
+		press(m, "/")
+		for _, r := range "ta" {
+			press(m, string(r))
+		}
+		if !typing {
+			press(m, "enter")
+		}
+		// Filtered rows: Beta, Delta — select Delta. (While typing, j would be
+		// text, so set the cursor directly in both cases.)
+		m.queueCursor = 1
+		press(m, "esc")
+		if m.filter != "" {
+			t.Fatalf("typing=%v: esc left the filter %q", typing, m.filter)
+		}
+		if m.queueCursor != 3 {
+			t.Fatalf("typing=%v: cursor = %d after esc, want 3 (Delta)", typing, m.queueCursor)
+		}
+	}
+}
+
+// TestEscClearingFilterKeepsSelectionHome: Home's cursor is flat across both
+// sections, so a Quick Picks match must map past the Listen Again rows.
+func TestEscClearingFilterKeepsSelectionHome(t *testing.T) {
+	m := newTestModel()
+	m.homeListenAgain = []api.Track{{ID: "a", Title: "Alpha"}, {ID: "b", Title: "Beta"}}
+	m.homeQuickPicks = []api.Track{{ID: "c", Title: "Gamma"}, {ID: "d", Title: "Omega"}}
+	m.activeView, m.focus = viewHome, focusPanel
+	m.filter = "ga"  // matches Gamma, Omega
+	m.homeCursor = 1 // second match: Omega
+	press(m, "esc")
+	if m.homeCursor != 3 {
+		t.Fatalf("home cursor = %d after esc, want 3 (Omega)", m.homeCursor)
+	}
+}

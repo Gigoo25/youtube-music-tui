@@ -125,7 +125,7 @@ album, radio, random) runs in `tea.Cmd`s returning typed messages
   to the sidebar; `l`/`right` "open" the selection wherever something can be opened
   (sidebar entry, playlist → detail, artist album → album view). `1-6` jump to
   views. Track-list keys are uniform: `enter` queue, `p` play (album/playlist
-  views: replace queue; Queue: `enter`/`p` both play), `e` queue all, `d`/`x` remove, `f` fav, `P` add-to-
+  views: replace queue from the selection; Queue: `enter`/`p` both play), `e` queue all, `d`/`x` remove, `f` fav, `P` add-to-
   playlist, `/` filter — selection for global actions comes from `selectedTrack`
   (one source; `contextTrack` adds the now-playing fallback).
   The shortcuts bar lists these with the same labels in every song list

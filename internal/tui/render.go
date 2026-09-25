@@ -347,10 +347,9 @@ func (m *model) renderPanelBody(w, h int) string {
 }
 
 // renderPlaylistDetail lists the tracks of one saved playlist (standard track
-// rows). Per-track actions match the other list views: enter queues the
-// selected track, p plays it now, e appends the whole playlist, d removes the
-// selected track from the playlist. (Whole-playlist p=replace / e=append lives
-// on the Playlists list view, not here.)
+// rows). Actions mirror the album view: enter queues the selected track, p
+// replaces the queue with the playlist starting at it, e appends the whole
+// playlist, d removes the selected track from the playlist.
 func (m *model) renderPlaylistDetail(w, h int) string {
 	pl := m.cfg.PlaylistByName(m.openPlaylist)
 	if pl == nil {
@@ -852,7 +851,7 @@ func (m *model) buildShortcutsBar(w int) string {
 				shortcut{"e", "queue all", false}, shortcut{"d", "delete", false})
 		case viewPlaylistDetail:
 			segs = append(segs, nav, shortcut{"enter", "queue", false},
-				shortcut{"p", "play now", false}, shortcut{"e", "queue all", false},
+				shortcut{"p", "play playlist (replaces queue)", false}, shortcut{"e", "queue all", false},
 				shortcut{"d", "remove", false})
 			segs = append(segs, trackActs...)
 		case viewPlaylistPick:
@@ -1162,7 +1161,7 @@ func (m *model) renderTrackRow(n int, t api.Track, selected, focused bool, w int
 // ─── Queue screen ──────────────────────────────────────────────────────────────
 
 func (m *model) renderQueue(w, h int) string {
-	header := styleSecondaryBold.Render(truncate(fmt.Sprintf("%s Up next (%d tracks)", iconQueue, len(m.queue)), w))
+	header := styleSecondaryBold.Render(truncate(fmt.Sprintf("%s Queue (%d tracks)", iconQueue, len(m.queue)), w))
 	if len(m.queue) == 0 {
 		return lipgloss.JoinVertical(lipgloss.Left,
 			header,
@@ -1231,7 +1230,7 @@ func (m *model) renderFavorites(w, h int) string {
 // ─── History screen ────────────────────────────────────────────────────────────
 
 func (m *model) renderHistory(w, h int) string {
-	heading := styleSecondaryBold.Render(iconHistory + " Recently Played")
+	heading := styleSecondaryBold.Render(iconHistory + " History")
 	if len(m.cfg.History) == 0 {
 		return lipgloss.JoinVertical(lipgloss.Left,
 			heading,
@@ -1289,7 +1288,7 @@ var helpSections = []struct {
 	}},
 	{"Queue & track", []helpBinding{
 		{"enter", "queue selected (queue view: play it)"},
-		{"p", "play now (album view: play album, replaces queue)"},
+		{"p", "play now (album / playlist: play it from here, replaces queue)"},
 		{"e", "queue all (search / favorites / album / artist / playlist)"},
 		{"f", "toggle favorite"},
 		{"d / x", "remove (queue / favorites / history / playlist)"},

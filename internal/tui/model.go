@@ -897,6 +897,67 @@ func (m *model) clampActiveCursor() {
 	}
 }
 
+// clearFilterKeepSelection drops the filter while the user stays in the view,
+// moving the cursor from its filtered row to the same item in the full list so
+// esc doesn't throw away their place. A filter matching nothing lands on 0.
+func (m *model) clearFilterKeepSelection() {
+	cp := m.activeCursorPtr()
+	idx := 0
+	if cp != nil {
+		if vis := m.visibleIndices(); *cp >= 0 && *cp < len(vis) {
+			idx = vis[*cp]
+		}
+	}
+	m.clearFilter()
+	if cp != nil {
+		*cp = idx
+		m.clampActiveCursor()
+	}
+}
+
+// visibleIndices maps each filtered row of the active view to its index in the
+// unfiltered list (flat across sections for Home and Artist) — the inverse of
+// what the filter hides.
+func (m *model) visibleIndices() []int {
+	switch m.activeView {
+	case viewHome:
+		out := m.trackVisibleIndices(m.homeListenAgain)
+		for _, i := range m.trackVisibleIndices(m.homeQuickPicks) {
+			out = append(out, len(m.homeListenAgain)+i)
+		}
+		return out
+	case viewQueue:
+		return m.trackVisibleIndices(m.queue)
+	case viewFavorites:
+		return m.trackVisibleIndices(m.cfg.Favorites)
+	case viewHistory:
+		q := strings.ToLower(m.filter)
+		var out []int
+		for i, e := range m.cfg.History {
+			if !m.filterActive() || matchTrack(e.Track, q) {
+				out = append(out, i)
+			}
+		}
+		return out
+	case viewAlbum:
+		return m.trackVisibleIndices(m.albumTracks)
+	case viewArtist:
+		out := m.trackVisibleIndices(m.artistSongs)
+		q := strings.ToLower(m.filter)
+		for i, a := range m.artistAlbums {
+			if !m.filterActive() || matchStr(a.Title, q) || matchStr(a.Artist, q) {
+				out = append(out, len(m.artistSongs)+i)
+			}
+		}
+		return out
+	case viewPlaylistDetail:
+		if pl := m.cfg.PlaylistByName(m.openPlaylist); pl != nil {
+			return m.trackVisibleIndices(pl.Tracks)
+		}
+	}
+	return nil
+}
+
 // clearFilter drops any active filter (called when leaving a view).
 func (m *model) clearFilter() {
 	m.filter = ""
@@ -1023,10 +1084,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.filterInput.Blur()
 			return m, nil
 		case "esc":
-			m.clearFilter()
-			if cp := m.activeCursorPtr(); cp != nil {
-				*cp = 0
-			}
+			m.clearFilterKeepSelection()
 			return m, nil
 		}
 		var cmd tea.Cmd
@@ -1215,10 +1273,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		// An applied local filter clears first, before any navigation.
 		if m.filter != "" {
-			m.clearFilter()
-			if cp := m.activeCursorPtr(); cp != nil {
-				*cp = 0
-			}
+			m.clearFilterKeepSelection()
 			return m, nil
 		}
 		if m.backFromContextual() {
@@ -1401,9 +1456,17 @@ func (m *model) handlePlaylistDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.enqueue(pl.Tracks[vis[m.plDetailCursor]])
 		}
 	case "p":
-		if m.plDetailCursor < len(vis) {
-			m.playNow(pl.Tracks[vis[m.plDetailCursor]])
+		// Play the playlist from the selected track, replacing the queue — the
+		// same as p on an album (and on the Playlists list, which starts at the top).
+		if len(pl.Tracks) == 0 {
+			return m, nil
 		}
+		start := 0
+		if m.plDetailCursor < len(vis) {
+			start = vis[m.plDetailCursor]
+		}
+		m.replaceQueue(pl.Tracks, start)
+		m.setStatus(fmt.Sprintf("queue replaced with playlist %q (%d tracks)", pl.Name, len(pl.Tracks)))
 	case "e":
 		// Queues the whole playlist, so it deliberately sits outside the
 		// cursor-range checks — a filter matching nothing must not disable it.
