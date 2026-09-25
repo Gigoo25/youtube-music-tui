@@ -160,6 +160,13 @@ func (m *model) View() string {
 		panelW = 1
 	}
 
+	m.lay.sidebarW, m.lay.innerW, m.lay.contentH = sidebarW, innerW, contentH
+	m.lay.progressY = -1
+	if nowbar != "" {
+		// Rows: top border, content, status line, now-bar info, then the bar.
+		m.lay.progressY = 1 + contentH + lipgloss.Height(status) + 1
+	}
+
 	sidebar := m.renderSidebar(sidebarW, contentH)
 	panel := padToHeight(m.renderPanel(panelW, contentH), contentH)
 	body := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, panel)
@@ -286,13 +293,17 @@ func (m *model) buildSidebar(w, h int) string {
 // renderPanel renders the active view's content, with a naming prompt or
 // local-filter line on top when one is active.
 func (m *model) renderPanel(w, h int) string {
+	m.panelHits = m.panelHits[:0]
+	m.lay.panelBodyY = 1 // below the shell's top border
 	if m.naming {
 		nl := m.renderNamingLine(w)
+		m.lay.panelBodyY += lipgloss.Height(nl)
 		body := m.renderPanelBody(w, h-lipgloss.Height(nl))
 		return lipgloss.JoinVertical(lipgloss.Left, nl, body)
 	}
 	if m.filtering || m.filter != "" {
 		fl := m.renderFilterLine(w)
+		m.lay.panelBodyY += lipgloss.Height(fl)
 		body := m.renderPanelBody(w, h-lipgloss.Height(fl))
 		return lipgloss.JoinVertical(lipgloss.Left, fl, body)
 	}
@@ -373,6 +384,7 @@ func (m *model) renderPlaylistDetail(w, h int) string {
 	}
 	focused := m.focus == focusPanel
 	start, end := windowBounds(m.plDetailCursor, len(vis), listH)
+	m.hitRange(lipgloss.Height(heading), start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		rows = append(rows, m.renderResultRow(i+1, pl.Tracks[vis[i]], i == m.plDetailCursor, focused, w, false))
@@ -393,6 +405,7 @@ func (m *model) renderPlaylistPick(w, h int) string {
 	}
 	focused := m.focus == focusPanel
 	start, end := windowBounds(m.pickCursor, len(pls)+1, listH)
+	m.hitRange(lipgloss.Height(heading), start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		label := "+ New playlist…"
@@ -422,6 +435,7 @@ func (m *model) renderPlaylists(w, h int) string {
 	}
 	focused := m.focus == focusPanel
 	start, end := windowBounds(m.playlistCursor, len(pls), listH)
+	m.hitRange(lipgloss.Height(heading), start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		pl := pls[i]
@@ -444,6 +458,7 @@ func (m *model) renderGenres(w, h int) string {
 	}
 	focused := m.focus == focusPanel
 	start, end := windowBounds(m.genreCursor, len(items), listH)
+	m.hitRange(lipgloss.Height(heading), start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		rows = append(rows, listRow("", items[i], "", i == m.genreCursor, focused, w))
@@ -474,6 +489,7 @@ func (m *model) renderAlbum(w, h int) string {
 	}
 	focused := m.focus == focusPanel
 	start, end := windowBounds(m.albumCursor, len(tracks), listH)
+	m.hitRange(lipgloss.Height(heading), start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		rows = append(rows, m.renderResultRow(i+1, tracks[i], i == m.albumCursor, focused, w, false))
@@ -524,6 +540,7 @@ func (m *model) renderHome(w, h int) string {
 		rows = append(rows, styleDim.Render(truncate("  Nothing yet — play a song and it'll show up here.", w)))
 	}
 	for i := max(start-laFirst, 0); i < min(end-laFirst, len(listenAgain)); i++ {
+		m.hit(len(rows), i)
 		rows = append(rows, m.renderResultRow(i+1, listenAgain[i], i == m.homeCursor, focused, w, false))
 	}
 
@@ -541,6 +558,7 @@ func (m *model) renderHome(w, h int) string {
 		}
 	}
 	for i := max(start-qpFirst, 0); i < min(end-qpFirst, len(quickPicks)); i++ {
+		m.hit(len(rows), len(listenAgain)+i)
 		rows = append(rows, m.renderResultRow(i+1, quickPicks[i], len(listenAgain)+i == m.homeCursor, focused, w, false))
 	}
 
@@ -598,12 +616,14 @@ func (m *model) renderArtist(w, h int) string {
 		rows = append(rows, styleSecondaryBold.Render(iconPlay+" Top Songs"))
 	}
 	for i := max(start-sFirst, 0); i < min(end-sFirst, len(songs)); i++ {
+		m.hit(lipgloss.Height(heading)+len(rows), i)
 		rows = append(rows, m.renderResultRow(i+1, songs[i], i == m.artistCursor, focused, w, false))
 	}
 	if len(albums) > 0 && vis(aHead) {
 		rows = append(rows, styleSecondaryBold.Render(iconPlaylist+" Albums"))
 	}
 	for i := max(start-aFirst, 0); i < min(end-aFirst, len(albums)); i++ {
+		m.hit(lipgloss.Height(heading)+len(rows), len(songs)+i)
 		rows = append(rows, m.renderAlbumRefRow(i+1, albums[i], len(songs)+i == m.artistCursor, focused, w))
 	}
 
@@ -1061,7 +1081,11 @@ func (m *model) renderSearch(w, h int) string {
 	if listH < 1 {
 		listH = 1
 	}
-	blocks = append(blocks, m.renderResultList(w, listH))
+	// The query box (heading below, then the bordered bar) is clickable too.
+	for l := lipgloss.Height(heading); l < lipgloss.Height(heading)+lipgloss.Height(bar); l++ {
+		m.hit(l, hitSearchBar)
+	}
+	blocks = append(blocks, m.renderResultList(w, listH, used))
 	if footer != "" {
 		blocks = append(blocks, footer)
 	}
@@ -1085,11 +1109,12 @@ func (m *model) renderSearchFooter(w int) string {
 	}
 }
 
-func (m *model) renderResultList(w, h int) string {
+func (m *model) renderResultList(w, h, top int) string {
 	if len(m.searchResults) == 0 {
 		return styleDim.Render("No results.")
 	}
 	start, end := windowBounds(m.searchCursor, len(m.searchResults), h)
+	m.hitRange(top, start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		t := m.searchResults[i]
@@ -1182,6 +1207,7 @@ func (m *model) renderQueue(w, h int) string {
 
 	focused := m.focus == focusPanel
 	start, end := windowBounds(m.queueCursor, len(vis), listH)
+	m.hitRange(lipgloss.Height(header), start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		orig := vis[i]
@@ -1220,6 +1246,7 @@ func (m *model) renderFavorites(w, h int) string {
 		listH = 1
 	}
 	start, end := windowBounds(m.favCursor, len(favs), listH)
+	m.hitRange(lipgloss.Height(heading), start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		rows = append(rows, m.renderResultRow(i+1, favs[i], i == m.favCursor, m.focus == focusPanel, w, true))
@@ -1250,6 +1277,7 @@ func (m *model) renderHistory(w, h int) string {
 	focused := m.focus == focusPanel
 	tsLayout := "Jan 2 15:04"
 	start, end := windowBounds(m.historyCursor, len(hist), listH)
+	m.hitRange(lipgloss.Height(heading), start, end)
 	var rows []string
 	for i := start; i < end; i++ {
 		e := hist[i]
@@ -1323,6 +1351,13 @@ var helpSections = []struct {
 		{"a", "open the track's album (p plays it)"},
 		{"A", "open the track's artist (top songs + albums)"},
 		{"z", "random song (pick a genre)"},
+	}},
+	{"Mouse", []helpBinding{
+		{"wheel", "scroll the pane under the pointer"},
+		{"click", "select a row (sidebar: open the view)"},
+		{"double-click", "play the song / open the playlist, album or genre"},
+		{"click bar", "seek (progress bar) / edit the query (search box)"},
+		{"shift+drag", "select text (most terminals)"},
 	}},
 	{"App", []helpBinding{
 		{"T", "cycle color theme"},

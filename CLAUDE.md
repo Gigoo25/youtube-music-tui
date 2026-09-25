@@ -131,6 +131,13 @@ album, radio, random) runs in `tea.Cmd`s returning typed messages
   The shortcuts bar lists these with the same labels in every song list
   (`trackActs` in `buildShortcutsBar`), and its `h` hint reads "back" exactly
   where `backFromContextual` applies.
+- **Mouse** (`mouse.go`, cell-motion reporting enabled in main.go): wheel
+  scrolls the pane under the pointer, click selects (sidebar: opens),
+  double-click runs the row's primary action, clicks on the progress bar seek.
+  All of it is routed through the key handlers. List renderers record which
+  item each panel line shows via `hit`/`hitRange`, and `View` records the frame
+  geometry in `m.lay`. A new list view must call `hitRange` after its
+  `windowBounds`, or its rows won't be clickable.
 - **Selection rendering**: the focused pane's selected row gets a full-width inverse
   highlight; unfocused/secondary selection gets a subtle marker. Use
   display-width-aware helpers (`truncate2`, `padRight`) for any styled/ANSI row —

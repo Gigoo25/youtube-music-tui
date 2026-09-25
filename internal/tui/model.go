@@ -201,6 +201,12 @@ type model struct {
 	scKey   shortcutsKey
 	scCache string
 
+	// mouse: geometry of the last frame, which list item each panel body line
+	// shows (-1 = none; see hit), and the previous click for double-clicks.
+	lay       layout
+	panelHits []int
+	click     lastClick
+
 	// debounced config persistence: mutations mark dirty; the tick flushes after
 	// configSaveDelay so favoriting/queue churn doesn't re-marshal+write on every
 	// action. main.go does a final Save() on exit, so nothing is lost on quit.
@@ -717,6 +723,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
 	}
 
 	// Forward any other message to the active text input (e.g. paste, cursor

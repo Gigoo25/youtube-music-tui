@@ -63,7 +63,8 @@ func TestRenderHelpFitsAndShowsQuit(t *testing.T) {
 			t.Fatalf("%v: help width %d > %d", size, lipgloss.Width(out), size[0])
 		}
 	}
-	if !strings.Contains(m.renderHelp(100, 60), "quit") {
+	// Tall enough for every row plus the box's two border lines.
+	if !strings.Contains(m.renderHelp(100, helpRowCount()+2), "quit") {
 		t.Fatal("tall help should reach the App section")
 	}
 }
