@@ -71,11 +71,9 @@ var themes = []theme{
 	},
 	{
 		// sainnhe/gruvbox-material, dark "medium" background with the "material"
-		// foreground. Roles follow the Neovim colorscheme rather than classic
-		// gruvbox: selection/statusline (PmenuSel, TabLineSel, lualine normal)
-		// are dark text on grey2, titles are orange, blue is left out.
-		name: "gruvbox-material", primary: "#A89984", secondary: "#E78A4E", text: "#D4BE98",
-		accent: "#D8A657", dim: "#928374", errc: "#EA6962", success: "#A9B665",
+		// foreground: gruvbox's hues, softened.
+		name: "gruvbox-material", primary: "#7DAEA3", secondary: "#D8A657", text: "#D4BE98",
+		accent: "#E78A4E", dim: "#928374", errc: "#EA6962", success: "#A9B665",
 		warning: "#D8A657", bg: "#282828",
 	},
 	{
