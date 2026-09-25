@@ -120,14 +120,17 @@ album, radio, random) runs in `tea.Cmd`s returning typed messages
   glyph (`viewIcon`). Nerd Font required; glyphs are width-1 so the layout aligns.
 - **Focus model**: `focusSidebar` / `focusPanel`. `tab` toggles focus. Unified
   back/open rules (keep them consistent when adding views): `h`/`left`/`esc` step a
-  *contextual* view (Album/Artist/Genres/PlaylistDetail/PlaylistPick) back to where
+  *contextual* view (Album/Artist/Genres/PlaylistDetail/PlaylistPick/Help) back to where
   it was opened from (`backFromContextual`), and return a *top-level* view's focus
   to the sidebar; `l`/`right` "open" the selection wherever something can be opened
   (sidebar entry, playlist → detail, artist album → album view). `1-6` jump to
   views. Track-list keys are uniform: `enter` queue, `p` play (album/playlist
-  views: replace queue), `e` queue all, `d`/`x` remove, `f` fav, `P` add-to-
+  views: replace queue; Queue: `enter`/`p` both play), `e` queue all, `d`/`x` remove, `f` fav, `P` add-to-
   playlist, `/` filter — selection for global actions comes from `selectedTrack`
   (one source; `contextTrack` adds the now-playing fallback).
+  The shortcuts bar lists these with the same labels in every song list
+  (`trackActs` in `buildShortcutsBar`), and its `h` hint reads "back" exactly
+  where `backFromContextual` applies.
 - **Selection rendering**: the focused pane's selected row gets a full-width inverse
   highlight; unfocused/secondary selection gets a subtle marker. Use
   display-width-aware helpers (`truncate2`, `padRight`) for any styled/ANSI row —

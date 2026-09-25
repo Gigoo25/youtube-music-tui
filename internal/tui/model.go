@@ -1298,12 +1298,14 @@ func (m *model) popView() view {
 }
 
 // backFromContextual steps a contextual view back to the screen it was opened
-// from: album/artist/genre-picker → the view stack, playlist detail → the
+// from: album/artist/genre-picker/help → the view stack, playlist detail → the
 // playlist list, the add-to-playlist picker → its origin view. Returns false
 // when the active view is a top-level screen (nothing to step back from).
 func (m *model) backFromContextual() bool {
 	switch m.activeView {
-	case viewAlbum, viewArtist, viewGenres:
+	case viewAlbum, viewArtist, viewGenres, viewHelp:
+		// Help is contextual too: both "?" and its sidebar entry push the view it
+		// was opened from, so h/esc return there just like "?" does.
 		m.clearFilter()
 		m.activeView = m.popView()
 	case viewPlaylistDetail:
@@ -1998,7 +2000,7 @@ func (m *model) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.refreshListenAgain() // Listen Again is built from history
 			m.markConfigDirty()
 			m.clampActiveCursor()
-			m.setStatus("removed from history")
+			m.setStatus("removed from history: " + e.Track.Title)
 		}
 	case "c":
 		if len(m.cfg.History) == 0 {
@@ -2149,21 +2151,26 @@ func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	switch msg.String() {
-	case "J":
-		if !m.filterActive() {
-			m.moveQueueItem(m.queueCursor, m.queueCursor+1)
+	case "J", "K":
+		if m.filterActive() {
+			// Reordering a filtered view would swap with hidden neighbours.
+			m.setError("clear the filter (esc) to reorder")
+			return m, nil
 		}
-	case "K":
-		if !m.filterActive() {
-			m.moveQueueItem(m.queueCursor, m.queueCursor-1)
+		to := m.queueCursor + 1
+		if msg.String() == "K" {
+			to = m.queueCursor - 1
 		}
-	case "enter":
+		m.moveQueueItem(m.queueCursor, to)
+	case "enter", "p":
+		// Everything here is already queued, so "queue" and "play now" coincide.
 		if m.queueCursor < len(vis) {
 			m.playAt(vis[m.queueCursor])
 		}
 	case "d", "x":
 		if m.queueCursor < len(vis) {
 			removed := vis[m.queueCursor]
+			title := m.queue[removed].Title
 			m.queue = append(m.queue[:removed], m.queue[removed+1:]...)
 			// Keep queuePos pointing at the same playing track.
 			switch {
@@ -2181,7 +2188,7 @@ func (m *model) handleQueueKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.clampActiveCursor() // keep cursor in range of the (refiltered) list
 			m.prefetchNext()      // the upcoming tracks may have shifted — re-warm them
 			m.markConfigDirty()
-			m.setStatus("removed from queue")
+			m.setStatus("removed from queue: " + title)
 		}
 	case ".":
 		// Jump the cursor to the now-playing track.
@@ -2252,11 +2259,15 @@ func (m *model) handleFavKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "d", "x":
 		// Remove from favorites (f is the global toggle handled above).
 		if m.favCursor < len(favs) {
-			m.cfg.ToggleFavorite(favs[m.favCursor])
+			t := favs[m.favCursor]
+			m.cfg.ToggleFavorite(t)
 			m.markConfigDirty()
 			m.clampActiveCursor()
-			m.setStatus("removed from favorites")
+			m.setStatus("removed from favorites: " + t.Title)
 		}
+	case "e":
+		// Whole list, like e on an album or playlist (a filter doesn't narrow it).
+		m.enqueueAll(m.cfg.Favorites)
 	}
 	return m, nil
 }

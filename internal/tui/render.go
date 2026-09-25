@@ -797,71 +797,79 @@ func (m *model) buildShortcutsBar(w int) string {
 		shortcut{"C", "auto-continue", m.cfg.AutoContinue},
 	)
 
-	// Context-specific actions.
+	// Context-specific actions. Song lists share one vocabulary: enter queues,
+	// p plays, e queues everything, d removes, and trackActs (f/a/A/P) act on the
+	// selected song — keep new views on the same labels.
+	nav := shortcut{"j/k", "move", false}
+	trackActs := []shortcut{
+		{"f", "fav", false}, {"a", "album", false},
+		{"A", "artist", false}, {"P", "to playlist", false},
+	}
 	if m.focus == focusSidebar {
-		segs = append(segs,
-			shortcut{"j/k", "move", false},
-			shortcut{"enter", "open", false},
-		)
+		segs = append(segs, nav, shortcut{"enter/l", "open", false})
 	} else {
 		switch m.activeView {
 		case viewHome:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
-				shortcut{"f", "fav", false}, shortcut{"a", "album", false},
-				shortcut{"A", "artist", false})
+			segs = append(segs, nav, shortcut{"enter", "queue", false},
+				shortcut{"p", "play now", false})
+			segs = append(segs, trackActs...)
 		case viewSearch:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
-				shortcut{"e", "queue all", false}, shortcut{"f", "fav", false},
-				shortcut{"a", "album", false}, shortcut{"A", "artist", false})
+			segs = append(segs, nav, shortcut{"enter", "queue", false},
+				shortcut{"p", "play now", false}, shortcut{"e", "queue all", false})
+			segs = append(segs, trackActs...)
+			segs = append(segs, shortcut{"/", "edit query", false})
+			if len(m.searchResults) > 0 {
+				segs = append(segs, shortcut{"esc", "clear results", false})
+			}
 		case viewQueue:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"J/K", "reorder", false},
-				shortcut{"enter", "play", false}, shortcut{"d", "remove", false},
+			segs = append(segs, nav, shortcut{"enter/p", "play", false},
+				shortcut{"J/K", "reorder", false}, shortcut{"d", "remove", false},
 				shortcut{".", "now playing", false}, shortcut{"c", "clear", false},
-				shortcut{"S", "save", false}, shortcut{"f", "fav", false},
-				shortcut{"a", "album", false}, shortcut{"A", "artist", false})
+				shortcut{"S", "save as playlist", false})
+			segs = append(segs, trackActs...)
 		case viewFavorites:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
-				shortcut{"d", "remove", false},
-				shortcut{"f", "fav", false}, shortcut{"a", "album", false},
-				shortcut{"A", "artist", false})
+			segs = append(segs, nav, shortcut{"enter", "queue", false},
+				shortcut{"p", "play now", false}, shortcut{"e", "queue all", false},
+				shortcut{"d", "remove", false})
+			segs = append(segs, trackActs[1:]...) // f is d here
 		case viewHistory:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "queue", false}, shortcut{"p", "play now", false},
-				shortcut{"d", "remove", false}, shortcut{"c", "clear history", false},
-				shortcut{"f", "fav", false},
-				shortcut{"a", "album", false}, shortcut{"A", "artist", false})
+			segs = append(segs, nav, shortcut{"enter", "queue", false},
+				shortcut{"p", "play now", false}, shortcut{"d", "remove", false},
+				shortcut{"c", "clear history", false})
+			segs = append(segs, trackActs...)
 		case viewAlbum:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "queue", false},
+			segs = append(segs, nav, shortcut{"enter", "queue", false},
 				shortcut{"p", "play album (replaces queue)", false},
-				shortcut{"e", "queue all", false}, shortcut{"f", "fav", false})
+				shortcut{"e", "queue all", false})
+			segs = append(segs, trackActs...)
 		case viewArtist:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter/l", "queue / open", false}, shortcut{"p", "play now", false},
-				shortcut{"e", "queue all", false}, shortcut{"f", "fav", false})
+			segs = append(segs, nav, shortcut{"enter", "queue / open album", false},
+				shortcut{"p", "play now", false}, shortcut{"e", "queue all", false})
+			segs = append(segs, trackActs...)
 		case viewPlaylists:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter/l", "view tracks", false},
+			segs = append(segs, nav, shortcut{"enter/l", "view tracks", false},
 				shortcut{"p", "play (replaces queue)", false},
-				shortcut{"e", "add to queue", false},
-				shortcut{"d", "delete", false})
+				shortcut{"e", "queue all", false}, shortcut{"d", "delete", false})
 		case viewPlaylistDetail:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "queue song", false}, shortcut{"p", "play now", false},
-				shortcut{"e", "queue all", false}, shortcut{"d", "remove", false},
-				shortcut{"esc", "back", false})
+			segs = append(segs, nav, shortcut{"enter", "queue", false},
+				shortcut{"p", "play now", false}, shortcut{"e", "queue all", false},
+				shortcut{"d", "remove", false})
+			segs = append(segs, trackActs...)
 		case viewPlaylistPick:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "add", false}, shortcut{"esc", "cancel", false})
+			segs = append(segs, nav, shortcut{"enter", "add", false})
 		case viewGenres:
-			segs = append(segs, shortcut{"j/k", "move", false},
-				shortcut{"enter", "pick & play", false}, shortcut{"esc", "cancel", false})
+			segs = append(segs, nav, shortcut{"enter", "pick & play", false})
+		case viewHelp:
+			segs = append(segs, shortcut{"j/k", "scroll", false})
 		}
-		segs = append(segs, shortcut{"h", "menu", false})
+		// h/esc mirror backFromContextual: contextual views step back to where
+		// they were opened from; top-level views hand focus to the sidebar.
+		switch m.activeView {
+		case viewAlbum, viewArtist, viewGenres, viewHelp, viewPlaylistDetail, viewPlaylistPick:
+			segs = append(segs, shortcut{"h/esc", "back", false})
+		default:
+			segs = append(segs, shortcut{"h", "menu", false})
+		}
 	}
 
 	// Discovery: "/" filters the current pane; global YouTube Music search lives on
@@ -1280,12 +1288,12 @@ var helpSections = []struct {
 		{"C", "auto-continue radio when the queue ends"},
 	}},
 	{"Queue & track", []helpBinding{
-		{"enter", "queue / play selected"},
+		{"enter", "queue selected (queue view: play it)"},
 		{"p", "play now (album view: play album, replaces queue)"},
-		{"e", "queue all (album / artist / search / playlist)"},
+		{"e", "queue all (search / favorites / album / artist / playlist)"},
 		{"f", "toggle favorite"},
 		{"d / x", "remove (queue / favorites / history / playlist)"},
-		{"J / K", "move track down / up in queue"},
+		{"J / K", "move track down / up in queue (not while filtered)"},
 		{".", "jump to now-playing (queue)"},
 		{"c", "clear queue / clear history (asks to confirm)"},
 	}},
@@ -1305,20 +1313,21 @@ var helpSections = []struct {
 		{"ctrl+d / ctrl+u", "scroll half page down / up"},
 		{"ctrl+f / ctrl+b", "scroll full page down / up"},
 		{"tab", "toggle sidebar / panel focus"},
-		{"h / esc", "step back (contextual view) / back to menu"},
+		{"h / esc", "step back (album / artist / playlist / help) or focus the menu"},
+		{"esc", "clear the filter, then search results, before stepping back"},
 	}},
 	{"Views & discovery", []helpBinding{
 		{"1-6", "jump to view (Home…Playlists)"},
 		{"2", "global YouTube Music search"},
 		{"ctrl+u / ctrl+w", "clear query / delete word back (while typing)"},
 		{"/", "filter the current pane (esc clears)"},
-		{"a", "open the track's album (Enter to play it)"},
+		{"a", "open the track's album (p plays it)"},
 		{"A", "open the track's artist (top songs + albums)"},
 		{"z", "random song (pick a genre)"},
 	}},
 	{"App", []helpBinding{
 		{"T", "cycle color theme"},
-		{"?", "this help"},
+		{"?", "this help (again, h or esc to close)"},
 		{"q", "quit"},
 	}},
 }
