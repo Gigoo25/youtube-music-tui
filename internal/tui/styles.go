@@ -70,6 +70,13 @@ var themes = []theme{
 		warning: "#FABD2F", bg: "#282828",
 	},
 	{
+		// sainnhe/gruvbox-material, dark "medium" background with the "material"
+		// foreground: gruvbox's hues, softened.
+		name: "gruvbox-material", primary: "#7DAEA3", secondary: "#D8A657", text: "#D4BE98",
+		accent: "#E78A4E", dim: "#928374", errc: "#EA6962", success: "#A9B665",
+		warning: "#D8A657", bg: "#282828",
+	},
+	{
 		name: "catppuccin", primary: "#89B4FA", secondary: "#CBA6F7", text: "#CDD6F4",
 		accent: "#F9E2AF", dim: "#6C7086", errc: "#F38BA8", success: "#A6E3A1",
 		warning: "#FAB387", bg: "#1E1E2E",
