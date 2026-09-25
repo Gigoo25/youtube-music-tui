@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -106,5 +107,35 @@ func TestLoadHomeQuickPicksStartsRetryCooldown(t *testing.T) {
 	}
 	if m.homeQPAt.IsZero() {
 		t.Fatal("homeQPAt was not stamped by loadHomeQuickPicks")
+	}
+}
+
+// TestSupersededAutoContinueKeepsCurrent: pressing n twice at the end of the
+// queue cancels the first auto-continue fetch. Its context.Canceled reply must
+// not clear hasCurrent, or the second fetch (same seed) gets dropped as stale.
+func TestSupersededAutoContinueKeepsCurrent(t *testing.T) {
+	m := newTestModel()
+	m.current = api.Track{ID: "seed"}
+	m.hasCurrent = true
+
+	m.Update(autoContinueMsg{seed: "seed", err: fmt.Errorf("post: %w", context.Canceled)})
+	if !m.hasCurrent {
+		t.Fatal("a superseded auto-continue fetch cleared hasCurrent")
+	}
+	if m.statusErr {
+		t.Fatalf("a superseded fetch surfaced an error: %q", m.status)
+	}
+}
+
+// TestSupersededRadioIsSilent: R pressed twice cancels the first fetch; its
+// cancellation must not flash "radio failed: context canceled".
+func TestSupersededRadioIsSilent(t *testing.T) {
+	m := newTestModel()
+	m.current = api.Track{ID: "seed"}
+	m.hasCurrent = true
+
+	m.Update(radioDoneMsg{seed: "seed", err: context.Canceled})
+	if m.statusErr {
+		t.Fatalf("a superseded radio fetch surfaced an error: %q", m.status)
 	}
 }

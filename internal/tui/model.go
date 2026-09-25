@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -532,7 +533,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case mprisSetVolMsg:
-		vol := msg.level * 100
+		// The player clamps to 0–150; mirror that so the bar never shows a level
+		// mpv refused.
+		vol := min(max(msg.level*100, 0), 150)
 		m.player.SetVolume(vol)
 		m.playerState.Volume = vol // don't let the shortcuts bar lag a tick behind
 		return m, nil
@@ -540,6 +543,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case autoContinueMsg:
 		if !m.hasCurrent || m.current.ID != msg.seed {
 			return m, nil // the user started something else while the request was in flight
+		}
+		if superseded(msg.err) {
+			// A second advance (n pressed again) replaced this fetch with one for the
+			// same seed. Clearing hasCurrent here would make that one drop its result.
+			return m, nil
 		}
 		if msg.err != nil {
 			// Nothing is playing any more; hasCurrent was only held true so the
@@ -578,9 +586,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.gen != m.randomGen {
 			return m, nil // the user asked for something else while this was in flight
 		}
-		// Search (the random source) lives in the secret-blocked ytmusic.go, so its
-		// results are cleaned here rather than at the API boundary.
-		tracks := api.CleanTracks(msg.tracks)
+		tracks := msg.tracks // SearchSongs already cleans at the API boundary
 		if msg.err != nil {
 			m.setError("random failed: " + msg.err.Error())
 		} else if len(tracks) == 0 {
@@ -593,6 +599,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case radioDoneMsg:
 		if !m.hasCurrent || msg.seed != m.current.ID {
 			return m, nil // the seed track changed while the request was in flight
+		}
+		if superseded(msg.err) {
+			return m, nil // R pressed again: the newer request for this seed reports
 		}
 		if msg.err != nil {
 			m.setError("radio failed: " + msg.err.Error())
@@ -668,7 +677,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.setError("search failed: " + msg.err.Error())
 		} else {
-			m.searchResults = api.CleanTracks(msg.tracks)
+			m.searchResults = msg.tracks // SearchSongsPage already cleans
 			m.searchContinuation = msg.next
 			m.searchCursor = 0
 			if len(msg.tracks) == 0 {
@@ -696,7 +705,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for _, t := range m.searchResults {
 			seen[t.ID] = true
 		}
-		for _, t := range api.CleanTracks(msg.tracks) {
+		for _, t := range msg.tracks {
 			if t.ID != "" && !seen[t.ID] {
 				m.searchResults = append(m.searchResults, t)
 				seen[t.ID] = true
@@ -2001,10 +2010,9 @@ func (m *model) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cfg.History = nil
 			m.historyCursor = 0
 			// Listen Again is built from history — rebuild it so Home matches.
+			// No Home cursor clamp here: homeLen() would apply History's filter, and
+			// activateView re-clamps (filter cleared) whenever Home is reopened.
 			m.refreshListenAgain()
-			if m.homeCursor >= m.homeLen() {
-				m.homeCursor = 0
-			}
 			m.markConfigDirty()
 			m.setStatus("history cleared")
 		}
@@ -2485,6 +2493,12 @@ func (m *model) nextTrack() tea.Cmd {
 	return nil
 }
 
+// superseded reports whether err only means a newer request in the same lane
+// cancelled this one (see reqCtx) — not a failure worth surfacing.
+func superseded(err error) bool {
+	return errors.Is(err, context.Canceled)
+}
+
 // currentAtQueuePos reports whether queuePos still holds the playing track. It
 // doesn't after the playing entry is deleted: queuePos steps back onto its
 // predecessor so the next advance lands on the slot that shifted in.
@@ -2496,15 +2510,20 @@ func (m *model) currentAtQueuePos() bool {
 // nextShuffleIdx picks a random queue index other than the one playing so
 // shuffle never repeats a track back-to-back. Maps [0,n-1) onto the queue minus
 // the current slot (no rejection loop); falls back to a plain random pick when
-// the playing entry isn't in the queue (queuePos out of range). Returns -1 when
+// the playing entry isn't in the queue (it was deleted). Returns -1 when
 // the queue holds no other track; the caller decides what that means.
 func (m *model) nextShuffleIdx() int {
 	n := len(m.queue)
-	if n <= 1 {
-		return -1 // no other track to pick — the caller decides what that means
+	if n == 0 {
+		return -1
 	}
-	if m.queuePos < 0 || m.queuePos >= n {
+	// The playing entry was deleted (queuePos is -1 or a neighbour): every queued
+	// track is "another track", including the one queuePos now points at.
+	if m.queuePos < 0 || m.queuePos >= n || (m.hasCurrent && m.queue[m.queuePos].ID != m.current.ID) {
 		return rand.Intn(n)
+	}
+	if n == 1 {
+		return -1 // no other track to pick — the caller decides what that means
 	}
 	idx := rand.Intn(n - 1)
 	if idx >= m.queuePos {
