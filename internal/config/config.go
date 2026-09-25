@@ -53,6 +53,16 @@ func (c *Config) rebuildFavSet() {
 	}
 }
 
+// ColorsPath is the optional colors.json next to config.json: a palette the
+// UI turns into its "desktop" theme. The app never writes it.
+func ColorsPath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "ytmusic", "colors.json")
+}
+
 func Load() (*Config, error) {
 	dir, err := os.UserConfigDir()
 	if err != nil {
