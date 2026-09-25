@@ -20,7 +20,7 @@ A reimplementation of [involvex/youtube-music-cli](https://github.com/involvex/y
 - **Favorites & history**, persisted locally (no account, no cookies, no tracking)
 - **Local filtering** of any list with `/`
 - **MPRIS**: media keys, `playerctl`, and desktop now-playing integration (in-process D-Bus server)
-- **6 color themes** (everforest, tokyo-night, nord, gruvbox, catppuccin, dracula), cycle with `T`
+- **7 color themes** (everforest, tokyo-night, nord, gruvbox, gruvbox-material, catppuccin, dracula), cycle with `T`
 - **Instant track advance**: upcoming stream URLs are prefetched in the background
 
 ## Requirements
