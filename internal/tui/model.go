@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"slices"
 	"strings"
 	"time"
 
@@ -2439,11 +2440,19 @@ func (m *model) playNow(t api.Track) {
 		m.playAt(idx)
 		return
 	}
-	m.queue = append([]api.Track{t}, m.queue...)
-	if m.queueCursor > 0 {
+	// Insert right after the playing track, not at the head: at the head, the
+	// next advance would restart the queue from its top.
+	at := 0
+	if m.currentAtQueuePos() {
+		at = m.queuePos + 1
+	} else if m.queuePos > 0 {
+		at = min(m.queuePos, len(m.queue))
+	}
+	m.queue = slices.Insert(m.queue, at, t)
+	if m.queueCursor >= at && len(m.queue) > 1 {
 		m.queueCursor++
 	}
-	m.playAt(0)
+	m.playAt(at)
 }
 
 // replaceQueue swaps the queue for a copy of ts and starts playing at start.
