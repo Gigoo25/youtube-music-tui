@@ -1464,7 +1464,9 @@ func (m *model) openPlaylistPicker(t api.Track) {
 func (m *model) handlePlaylistDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	pl := m.cfg.PlaylistByName(m.openPlaylist)
 	if pl == nil {
-		m.activeView = viewPlaylists
+		// Deleted out from under the view: step back the normal way, so the
+		// filter is cleared and the sidebar cursor follows.
+		m.backFromContextual()
 		return m, nil
 	}
 	// vis maps filtered rows back to playlist indices ("/" works here like in
@@ -2786,8 +2788,10 @@ func (m *model) prevTrack() {
 		return
 	}
 	// Restart current track if more than 3s in; otherwise go to previous.
+	// SeekAbs, not a relative seek by the cached position: that is up to one
+	// tick stale, so the restart could land a fraction of a second in.
 	if m.playerState.Position > 3 {
-		m.player.Seek(-m.playerState.Position)
+		m.player.SeekAbs(0)
 		return
 	}
 	if m.queuePos > 0 {
