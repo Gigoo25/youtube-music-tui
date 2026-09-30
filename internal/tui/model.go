@@ -652,6 +652,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case homeQuickPicksMsg:
+		if superseded(msg.err) {
+			return m, nil // a newer Quick Picks load cancelled this one and owns the state
+		}
 		m.homeQPLoading = false
 		if msg.err != nil {
 			m.homeQPErr = msg.err.Error()
