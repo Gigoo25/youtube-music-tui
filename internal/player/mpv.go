@@ -305,6 +305,9 @@ func (p *Player) beginLoad(videoID string) (int, context.Context) {
 
 func (p *Player) Load(videoID string) {
 	gen, ctx := p.beginLoad(videoID)
+	// mpv keeps pause across loadfile: picking a track while paused would load
+	// it silently paused. Playing something new means playing it.
+	p.send([]any{"set_property", "pause", false})
 
 	// Cache hit (prefetched while the previous track played): skip yt-dlp and
 	// hand the URL straight to mpv — the common auto-advance path is instant.
