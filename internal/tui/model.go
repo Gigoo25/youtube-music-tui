@@ -2790,7 +2790,7 @@ func (m *model) prevTrack() {
 	if m.queuePos > 0 {
 		m.playAt(m.queuePos - 1)
 	} else {
-		m.player.Seek(-m.playerState.Position)
+		m.player.SeekAbs(0)
 	}
 }
 
