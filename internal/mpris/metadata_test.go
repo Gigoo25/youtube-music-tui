@@ -107,3 +107,23 @@ func TestMetadataReusesTrackidForLateDuration(t *testing.T) {
 		t.Error("a new track reused the previous trackid")
 	}
 }
+
+// TestMetadataNewTrackidForSameTextDifferentID: two versions of a song can share
+// title/artist/album; switching between them is still a new track.
+func TestMetadataNewTrackidForSameTextDifferentID(t *testing.T) {
+	if _, err := dbus.SessionBus(); err != nil {
+		t.Skip("no session bus:", err)
+	}
+	s, err := New(Handlers{})
+	if err != nil {
+		t.Fatal("New:", err)
+	}
+	defer s.Close()
+
+	s.Update(Now{HasTrack: true, ID: "a", Title: "A", Status: "Playing"})
+	first := metaNow(t, s)["mpris:trackid"].Value()
+	s.Update(Now{HasTrack: true, ID: "b", Title: "A", Status: "Playing"})
+	if metaNow(t, s)["mpris:trackid"].Value() == first {
+		t.Error("a different video with the same title reused the previous trackid")
+	}
+}

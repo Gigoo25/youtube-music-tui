@@ -51,6 +51,7 @@ type Handlers struct {
 // Now is a snapshot of player state pushed by the model each tick.
 type Now struct {
 	HasTrack   bool
+	ID         string // source video id; part of the track identity
 	Title      string
 	Artist     string
 	Album      string
@@ -68,7 +69,7 @@ type Server struct {
 
 	// Change-detection state, written only by Update (see its comment).
 	trackSeq  int
-	lastKey   string // track identity (title/artist/album) for Metadata change detection
+	lastKey   string // track identity (id/title/artist/album) for Metadata change detection
 	lastLen   int64  // last published mpris:length; arrives a beat after the track
 	lastStat  string
 	lastVol   float64
@@ -293,7 +294,9 @@ func (s *Server) Update(n Now) {
 	// ponytail: no lock — Update is called only from the bubbletea Update goroutine.
 
 	// Metadata: rebuild + emit only when the track identity changes.
-	key := n.Title + "\x00" + n.Artist + "\x00" + n.Album
+	// The id is part of it: two versions of a song (album cut, single) can share
+	// title/artist/album, and switching between them is still a new track.
+	key := n.ID + "\x00" + n.Title + "\x00" + n.Artist + "\x00" + n.Album
 	if !n.HasTrack {
 		key = ""
 	}

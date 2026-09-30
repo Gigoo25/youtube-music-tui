@@ -68,6 +68,7 @@ func (m *model) pushMPRIS() {
 	}
 	m.mpris.Update(mpris.Now{
 		HasTrack:   m.hasCurrent,
+		ID:         m.current.ID,
 		Title:      m.current.Title,
 		Artist:     m.current.Artist,
 		Album:      m.current.Album,
