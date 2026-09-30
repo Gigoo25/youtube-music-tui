@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/Gigoo25/youtube-music-tui/internal/api"
 	"github.com/Gigoo25/youtube-music-tui/internal/player"
@@ -19,21 +20,9 @@ func truncate(s string, max int) string {
 	if max <= 0 {
 		return ""
 	}
-	if lipgloss.Width(s) <= max {
-		return s
-	}
-	if max == 1 {
-		return "…"
-	}
-	w := 0
-	for i, r := range s {
-		rw := lipgloss.Width(string(r))
-		if w+rw > max-1 {
-			return s[:i] + "…"
-		}
-		w += rw
-	}
-	return s
+	// One pass over s with the same grapheme widths lipgloss.Width uses; the
+	// per-rune lipgloss.Width loop this replaced allocated a string per rune.
+	return ansi.Truncate(s, max, "…")
 }
 
 // fmtDur formats seconds as M:SS.
