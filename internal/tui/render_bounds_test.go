@@ -125,3 +125,15 @@ func TestHelpScrollsFromFirstPress(t *testing.T) {
 		t.Fatalf("helpCursor 0 and 1 render the same first row (%q): help does not scroll on the first press", first)
 	}
 }
+
+// TestHelpScrollClampsOffset: j past the bottom must not grow helpCursor
+// beyond what renders, or k needs that many presses before the view moves.
+func TestHelpScrollClampsOffset(t *testing.T) {
+	m := newTestModel()
+	h := helpRowCount() / 2
+	m.helpCursor = helpRowCount() + 50
+	m.renderHelp(80, h)
+	if want := helpRowCount() - (h - 2); m.helpCursor != want {
+		t.Fatalf("helpCursor = %d after render, want clamped to %d", m.helpCursor, want)
+	}
+}

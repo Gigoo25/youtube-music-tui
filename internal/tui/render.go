@@ -1410,6 +1410,9 @@ func (m *model) renderHelp(w, h int) string {
 	if start < 0 {
 		start = 0
 	}
+	// Write the clamp back: j past the bottom would otherwise grow the offset
+	// unseen, and k would take that many presses before the view moved again.
+	m.helpCursor = start
 	end := start + bodyH
 	if end > len(rows) {
 		end = len(rows)
