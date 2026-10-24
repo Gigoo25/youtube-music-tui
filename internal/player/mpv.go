@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -57,7 +58,7 @@ type Player struct {
 	sockPath     string
 	cleanupDir   string // private temp dir for the socket ("" when XDG_RUNTIME_DIR was used)
 	conn         net.Conn
-	mu           sync.Mutex         // protects state, conn, loadGen, loadCancel, playingID, urlCache, inflight
+	mu           sync.Mutex         // protects state, conn, loadGen, loadCancel, playingID, urlCache, inflight, resolvingGen, deferred
 	sendCh       chan []byte        // serialized writes
 	loadGen      int                // epoch token: cancels stale async loads
 	loadCancel   context.CancelFunc // cancels the in-flight load's yt-dlp, if any
@@ -73,6 +74,9 @@ type Player struct {
 	urlCache     map[string]cachedURL       // videoID -> resolved stream URL (prefetch)
 	inflight     map[string]inflightResolve // videoID -> cancel + claim generation
 	inflightFIFO []string                   // claim order, oldest first (eviction queue)
+	resolvingGen int                        // loadGen of the Load still resolving its URL (0: none)
+	deferred     []string                   // Prefetch ids held back until that resolve finishes
+	notifyFn     atomic.Pointer[func()]     // SetNotify callback
 	done         chan struct{}              // signalled on natural end-of-file
 	closed       chan struct{}              // closed once on shutdown
 	closeOnce    sync.Once
@@ -82,10 +86,13 @@ type Player struct {
 
 // inflightResolve is one claimed resolve slot. gen distinguishes successive
 // claims of the same videoID so a goroutine whose claim was already evicted
-// can't cancel its replacement on the way out.
+// can't cancel its replacement on the way out. done is closed once the resolve
+// has finished (after a successful result is cached), so a Load of the same id
+// can wait on it instead of starting over.
 type inflightResolve struct {
 	cancel context.CancelFunc
 	gen    int
+	done   chan struct{}
 }
 
 // cachedURL is a yt-dlp-resolved stream URL with the time it was resolved.
@@ -290,6 +297,8 @@ func (p *Player) beginLoad(videoID string) (int, context.Context) {
 		p.loadCancel() // kill any in-flight yt-dlp from the superseded load
 	}
 	p.loadGen++
+	// Hold back prefetches until this load has its URL (see endResolveLocked).
+	p.resolvingGen = p.loadGen
 	ctx, cancel := context.WithTimeout(p.baseCtx, loadTimeout)
 	p.loadCancel = cancel
 	p.state.Position = 0
@@ -303,6 +312,26 @@ func (p *Player) beginLoad(videoID string) (int, context.Context) {
 	return p.loadGen, ctx
 }
 
+// endResolveLocked marks load gen's URL resolve as finished and returns the
+// prefetches deferred behind it, for the caller to start once p.mu is released.
+// A superseded load returns nothing: the newer one owns the deferred list.
+// Caller holds p.mu.
+func (p *Player) endResolveLocked(gen int) []string {
+	if p.resolvingGen != gen {
+		return nil
+	}
+	p.resolvingGen = 0
+	ids := p.deferred
+	p.deferred = nil
+	return ids
+}
+
+func (p *Player) startDeferred(ids []string) {
+	for _, id := range ids {
+		p.Prefetch(id)
+	}
+}
+
 func (p *Player) Load(videoID string) {
 	gen, ctx := p.beginLoad(videoID)
 	// mpv keeps pause across loadfile: picking a track while paused would load
@@ -313,8 +342,8 @@ func (p *Player) Load(videoID string) {
 	// hand the URL straight to mpv — the common auto-advance path is instant.
 	if url, ok := p.cacheGet(videoID); ok {
 		p.mu.Lock()
-		defer p.mu.Unlock()
 		if gen != p.loadGen {
+			p.mu.Unlock()
 			return // a newer Load or a Stop superseded this one while we read the cache
 		}
 		if p.loadCancel != nil {
@@ -323,6 +352,9 @@ func (p *Player) Load(videoID string) {
 		}
 		p.pendingID = videoID
 		p.send([]any{"loadfile", url, "replace"})
+		ids := p.endResolveLocked(gen)
+		p.mu.Unlock()
+		p.startDeferred(ids)
 		return
 	}
 
@@ -332,39 +364,84 @@ func (p *Player) Load(videoID string) {
 	// ending; the loadfile below restarts playback when the URL arrives.)
 	p.send([]any{"stop"})
 
+	join, joinGen := p.joinResolve(videoID)
+
 	go func() {
-		// Deliberately not deduped against an in-flight Prefetch of the same id:
-		// a load must deliver loadfile as soon as its URL resolves, and waiting on
-		// the prefetch would need per-id signaling. Worst case is one extra
-		// resolve when a track is played while its prefetch is still running.
-		url, resolved, err := extractURL(ctx, videoID)
-		if resolved {
-			p.cachePut(videoID, url)
+		url, ok := p.awaitResolve(ctx, videoID, join, joinGen)
+		var err error
+		if !ok {
+			var resolved bool
+			url, resolved, err = extractURL(ctx, videoID)
+			if resolved {
+				p.cachePut(videoID, url)
+			}
 		}
 
 		// The epoch check and the loadfile must be one critical section: a Stop()
 		// or newer Load() slipping between them would be undone by this send.
 		p.mu.Lock()
-		defer p.mu.Unlock()
-		if gen != p.loadGen {
-			return // a newer load superseded this one
-		}
-		if p.loadCancel != nil {
-			p.loadCancel() // extraction is done either way; release its ctx timer
-			p.loadCancel = nil
-		}
-		if err != nil {
-			p.state.Loading = false
-			if errors.Is(err, errNoYtdlp) {
-				p.lastErr = "yt-dlp not found in PATH"
-			} else {
-				p.lastErr = "could not resolve stream: " + err.Error()
-			}
-			return
-		}
-		p.pendingID = videoID
-		p.send([]any{"loadfile", url, "replace"})
+		ids := p.endResolveLocked(gen)
+		p.finishLoadLocked(gen, videoID, url, err)
+		p.mu.Unlock()
+		p.startDeferred(ids)
 	}()
+}
+
+// finishLoadLocked delivers a resolved load to mpv, or records why it failed.
+// A load superseded by a newer one (or a Stop) does nothing. Caller holds p.mu.
+func (p *Player) finishLoadLocked(gen int, videoID, url string, err error) {
+	if gen != p.loadGen {
+		return // a newer load superseded this one
+	}
+	if p.loadCancel != nil {
+		p.loadCancel() // extraction is done either way; release its ctx timer
+		p.loadCancel = nil
+	}
+	if err != nil {
+		p.state.Loading = false
+		if errors.Is(err, errNoYtdlp) {
+			p.lastErr = "yt-dlp not found in PATH"
+		} else {
+			p.lastErr = "could not resolve stream: " + err.Error()
+		}
+		p.notify()
+		return
+	}
+	p.pendingID = videoID
+	p.send([]any{"loadfile", url, "replace"})
+}
+
+// joinResolve hands a Load the in-flight prefetch of videoID, if there is one,
+// so the load picks up its head start instead of spawning a second yt-dlp. The
+// claim is pinned — taken out of the eviction queue — because the prefetches
+// that playAt queues right behind the load would otherwise evict it.
+func (p *Player) joinResolve(videoID string) (<-chan struct{}, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	r, ok := p.inflight[videoID]
+	if !ok {
+		return nil, 0
+	}
+	p.inflightFIFO = slices.DeleteFunc(p.inflightFIFO, func(id string) bool { return id == videoID })
+	return r.done, r.gen
+}
+
+// awaitResolve waits for a joined resolve and returns its cached URL. ok is
+// false when there was nothing to join or the resolve failed, and the caller
+// resolves on its own (which, after a cancel, fails fast with ctx's error). A
+// load that is superseded while waiting cancels the pinned resolve, which is no
+// longer capped or evictable.
+func (p *Player) awaitResolve(ctx context.Context, videoID string, join <-chan struct{}, joinGen int) (string, bool) {
+	if join == nil {
+		return "", false
+	}
+	select {
+	case <-join:
+		return p.cacheGet(videoID)
+	case <-ctx.Done():
+		p.releaseResolve(videoID, joinGen)
+		return "", false
+	}
 }
 
 // Prefetch resolves a stream URL in the background and caches it so a later
@@ -373,18 +450,21 @@ func (p *Player) Load(videoID string) {
 // rapid re-triggers (e.g. queue reordering) never spawn duplicate yt-dlp
 // processes for the same video — which would otherwise multiply requests to
 // YouTube and risk rate limiting. Concurrency is capped at maxInflightResolves.
+// While a Load is resolving its own URL the prefetch is deferred until that
+// finishes, so warm-ups don't compete with the track the user is waiting on.
 func (p *Player) Prefetch(videoID string) {
 	if videoID == "" {
 		return
 	}
 	// Own timeout, deliberately not tied to loadCancel: a prefetch warms a future
 	// track and must survive the current load being superseded.
-	ctx, gen, ok := p.claimResolve(videoID)
+	ctx, gen, done, ok := p.claimResolve(videoID)
 	if !ok {
 		return
 	}
 	go func() {
 		defer p.releaseResolve(videoID, gen)
+		defer close(done) // after the cachePut: a joined Load reads the cache on wake
 		if url, resolved, _ := extractURL(ctx, videoID); resolved {
 			p.cachePut(videoID, url)
 		}
@@ -397,20 +477,30 @@ func (p *Player) Prefetch(videoID string) {
 // dozens running for the full loadTimeout. When the cap is reached the oldest
 // resolve is cancelled rather than the new one refused: the newest request
 // reflects where the user actually is, and a superseded warm-up is wasted work.
+// The deferred list is capped the same way, newest kept.
 const maxInflightResolves = 3
 
 // claimResolve reserves a resolve slot for videoID, returning the context the
-// resolve must run under. It returns false when the URL is already cached or
-// another resolve for the same id is already running, so each video is resolved
-// at most once at a time.
-func (p *Player) claimResolve(videoID string) (context.Context, int, bool) {
+// resolve must run under and the channel to close when it finishes. It returns
+// false when the URL is already cached, another resolve for the same id is
+// already running, or a Load is resolving (the id is deferred instead), so each
+// video is resolved at most once at a time.
+func (p *Player) claimResolve(videoID string) (context.Context, int, chan struct{}, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, ok := p.cachedLocked(videoID); ok {
-		return nil, 0, false // already resolved and still fresh
+		return nil, 0, nil, false // already resolved and still fresh
 	}
 	if _, ok := p.inflight[videoID]; ok {
-		return nil, 0, false
+		return nil, 0, nil, false
+	}
+	if p.resolvingGen != 0 {
+		p.deferred = slices.DeleteFunc(p.deferred, func(id string) bool { return id == videoID })
+		p.deferred = append(p.deferred, videoID)
+		if n := len(p.deferred); n > maxInflightResolves {
+			p.deferred = slices.Delete(p.deferred, 0, n-maxInflightResolves)
+		}
+		return nil, 0, nil, false
 	}
 	if p.inflight == nil {
 		p.inflight = make(map[string]inflightResolve)
@@ -419,10 +509,11 @@ func (p *Player) claimResolve(videoID string) (context.Context, int, bool) {
 		p.dropResolveLocked(p.inflightFIFO[0])
 	}
 	ctx, cancel := context.WithTimeout(p.baseCtx, loadTimeout)
+	done := make(chan struct{})
 	p.resolveSeq++
-	p.inflight[videoID] = inflightResolve{cancel: cancel, gen: p.resolveSeq}
+	p.inflight[videoID] = inflightResolve{cancel: cancel, gen: p.resolveSeq, done: done}
 	p.inflightFIFO = append(p.inflightFIFO, videoID)
-	return ctx, p.resolveSeq, true
+	return ctx, p.resolveSeq, done, true
 }
 
 // releaseResolve drops videoID's claim only when it is still the claim gen
@@ -644,8 +735,21 @@ func (p *Player) Stop() {
 		p.loadCancel = nil
 	}
 	p.loadGen++
+	p.resolvingGen = 0 // nothing is loading now: later prefetches run straight away
+	p.deferred = nil
 	p.state.Loading = false
 	p.send([]any{"stop"})
+}
+
+// SetNotify registers fn to be called, on its own goroutine, when a track ends
+// or playback fails, so the UI can react at once instead of on its next poll.
+func (p *Player) SetNotify(fn func()) { p.notifyFn.Store(&fn) }
+
+// notify fires the SetNotify callback. Lock-free, so it is safe under p.mu.
+func (p *Player) notify() {
+	if fn := p.notifyFn.Load(); fn != nil {
+		go (*fn)()
+	}
 }
 
 // SetTitle sets mpv's force-media-title so the stream shows a clean track name
@@ -784,6 +888,7 @@ func (p *Player) readLoop() {
 	p.state.Loading = false
 	p.lastErr = "audio engine failed — restart the app"
 	p.mu.Unlock()
+	p.notify()
 }
 
 // scan consumes IPC events from one connection until it drops.
@@ -809,6 +914,7 @@ func (p *Player) scan(conn net.Conn) {
 				case p.done <- struct{}{}:
 				default:
 				}
+				p.notify()
 			case "error":
 				// mpv couldn't play the stream (expired URL, network, bad format).
 				// Drop the cached URL for this track so a retry resolves a fresh
@@ -818,6 +924,7 @@ func (p *Player) scan(conn net.Conn) {
 				p.lastErr = "playback failed (stream error)"
 				delete(p.urlCache, p.playingID)
 				p.mu.Unlock()
+				p.notify()
 			}
 			continue
 
@@ -923,6 +1030,7 @@ func (p *Player) recover() bool {
 				p.mu.Unlock()
 				p.procMu.Unlock()
 				p.adoptConn(conn)
+				p.notify()
 				return true
 			}
 			reap(cmd)
