@@ -64,6 +64,8 @@ func run() error {
 	// Cell-motion mouse reporting: wheel and clicks (motion only while a button
 	// is held). Terminals still select text with shift held.
 	prog := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	// Track ends and playback failures reach the queue at once, not on the next tick.
+	p.SetNotify(tui.PlayerNotify(prog.Send))
 
 	// Serve MPRIS in-process so media keys / shells (noctalia, playerctl) can
 	// drive playback. Non-fatal if there's no session bus or the name is taken.

@@ -88,3 +88,80 @@ func TestRepeatOneAfterDeletingPlayingLastTrack(t *testing.T) {
 		t.Fatalf("status = %q, want %q", m.status, "queue ended")
 	}
 }
+
+// TestTakeShuffleNextUsesPreroll: a shuffle advance plays the pick prefetchNext
+// warmed, and re-rolls once that pick has become the playing track.
+func TestTakeShuffleNextUsesPreroll(t *testing.T) {
+	m := newTestModel()
+	m.queue = []api.Track{{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "d"}}
+	m.queuePos = 0
+	m.current = m.queue[0]
+	m.hasCurrent = true
+
+	m.shuffleNextID = "c"
+	if i := m.takeShuffleNext(); i != 2 {
+		t.Fatalf("takeShuffleNext = %d, want the pre-rolled pick 2", i)
+	}
+	if m.shuffleNextID != "" {
+		t.Fatal("the pick must be consumed")
+	}
+	m.shuffleNextID = "a" // the playing track
+	if i := m.takeShuffleNext(); i <= 0 {
+		t.Fatalf("takeShuffleNext = %d, want a fresh pick other than the playing track", i)
+	}
+	m.shuffleNextID = "gone" // removed from the queue
+	if i := m.takeShuffleNext(); i <= 0 {
+		t.Fatalf("takeShuffleNext = %d, want a fresh pick", i)
+	}
+}
+
+// TestAutoContinueAheadOnLastTrack: the auto-continue batch is fetched once
+// while the last queued track plays, held rather than queued, and only then.
+func TestAutoContinueAheadOnLastTrack(t *testing.T) {
+	m := newTestModel()
+	m.cfg.AutoContinue = true
+	m.queue = []api.Track{{ID: "a"}, {ID: "b"}}
+	m.queuePos = 0
+	m.current = m.queue[0]
+	m.hasCurrent = true
+
+	if m.autoContinueAhead() != nil {
+		t.Fatal("not the last track: no lookahead")
+	}
+	m.queuePos = 1
+	m.current = m.queue[1]
+	if m.autoContinueAhead() == nil {
+		t.Fatal("last track: lookahead must fetch")
+	}
+	if m.autoContinueAhead() != nil {
+		t.Fatal("one lookahead per seed")
+	}
+	m.Update(autoAheadMsg{seed: "b", tracks: []api.Track{{ID: "b"}, {ID: "r1"}, {ID: ""}}})
+	if len(m.aheadTracks) != 1 || m.aheadTracks[0].ID != "r1" {
+		t.Fatalf("aheadTracks = %v, want just r1 (seed and empty ids dropped)", m.aheadTracks)
+	}
+	if len(m.queue) != 2 {
+		t.Fatal("the held batch must not be queued before the queue runs out")
+	}
+	m.Update(autoAheadMsg{seed: "stale", tracks: []api.Track{{ID: "x"}}})
+	if m.aheadTracks[0].ID != "r1" {
+		t.Fatal("a stale lookahead must be dropped")
+	}
+}
+
+// TestContinueRadioIgnoresOtherSeedsBatch: a held batch for a different track
+// isn't played; running out of queue fetches live instead.
+func TestContinueRadioIgnoresOtherSeedsBatch(t *testing.T) {
+	m := newTestModel()
+	m.cfg.AutoContinue = true
+	m.current = api.Track{ID: "a"}
+	m.hasCurrent = true
+	m.aheadSeed, m.aheadTracks = "other", []api.Track{{ID: "r1"}}
+
+	if m.continueRadio() == nil {
+		t.Fatal("want a live fetch")
+	}
+	if len(m.queue) != 0 {
+		t.Fatal("another seed's batch must not be queued")
+	}
+}

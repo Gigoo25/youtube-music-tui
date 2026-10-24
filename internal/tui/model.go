@@ -162,6 +162,14 @@ type model struct {
 	shuffle     bool
 	repeat      repeatMode
 
+	// shuffleNextID is the pre-rolled next shuffle pick, prefetched like the
+	// sequential next tracks so a shuffle advance is a cache hit.
+	shuffleNextID string
+	// aheadSeed/aheadTracks: the auto-continue batch fetched while the queue's
+	// last track (aheadSeed) plays, held back until the queue actually runs out.
+	aheadSeed   string
+	aheadTracks []api.Track
+
 	// favorites
 	favCursor int
 
@@ -258,6 +266,24 @@ type radioDoneMsg struct {
 	tracks []api.Track
 	seed   string // m.current.ID at dispatch; a changed current track drops the response
 	err    error
+}
+
+// autoAheadMsg carries the auto-continue batch fetched ahead of the queue
+// running out (see autoContinueAhead). It is held, not queued or played.
+type autoAheadMsg struct {
+	tracks []api.Track
+	seed   string
+	err    error
+}
+
+// playerEventMsg is sent by the player (via SetNotify) when a track ends or
+// playback fails, so the queue reacts without waiting for the next tick.
+type playerEventMsg struct{}
+
+// PlayerNotify builds the player's SetNotify callback, delivering playerEventMsg
+// into the bubbletea loop via send (Program.Send).
+func PlayerNotify(send func(tea.Msg)) func() {
+	return func() { send(playerEventMsg{}) }
 }
 
 // autoContinueMsg carries radio tracks fetched to keep playback going after the
@@ -467,25 +493,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		return m, nil
 
+	case playerEventMsg:
+		cmds := m.pollPlayer()
+		m.pushMPRIS()
+		return m, tea.Batch(cmds...)
+
 	case tickMsg:
-		var cmds []tea.Cmd
-		// Handle an automatic mpv respawn before refreshing the snapshot: the
-		// stale snapshot still holds the pre-crash position needed to resume.
-		if m.player.Restarted() {
-			m.resumeAfterRestart()
-		}
-		m.playerState = m.player.State()
-		if m.player.TrackEnded() {
-			if c := m.nextTrack(); c != nil {
-				cmds = append(cmds, c)
-			}
-		}
-		// React to stream-load/playback failures: retry once with a fresh URL,
-		// then skip — playback must never silently stop mid-queue.
-		if e := m.player.LoadError(); e != "" {
-			if c := m.handlePlaybackFailure(e); c != nil {
-				cmds = append(cmds, c)
-			}
+		cmds := m.pollPlayer()
+		if c := m.autoContinueAhead(); c != nil {
+			cmds = append(cmds, c)
 		}
 		// A track that has played cleanly for a while earns its retry budget
 		// back (so one hiccup an hour ago doesn't turn the next into a skip).
@@ -558,6 +574,29 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.playerState.Volume = vol // don't let the shortcuts bar lag a tick behind
 		return m, nil
 
+	case autoAheadMsg:
+		if msg.seed != m.aheadSeed || msg.err != nil {
+			// Stale, or failed: aheadSeed stays set so the tick doesn't refetch,
+			// and running out of queue falls back to a live fetch.
+			return m, nil
+		}
+		m.aheadTracks = nil
+		for _, t := range msg.tracks {
+			if t.ID != "" && t.ID != msg.seed {
+				m.aheadTracks = append(m.aheadTracks, t)
+			}
+		}
+		// Warm the track that will play first (appendNew skips queued ids).
+		for _, t := range m.aheadTracks {
+			if m.queueIndexOf(t.ID) < 0 {
+				if m.player != nil {
+					m.player.Prefetch(t.ID)
+				}
+				break
+			}
+		}
+		return m, nil
+
 	case autoContinueMsg:
 		if !m.hasCurrent || m.current.ID != msg.seed {
 			return m, nil // the user started something else while the request was in flight
@@ -574,28 +613,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setError("auto-continue failed: " + msg.err.Error())
 			return m, nil
 		}
-		// Related lives in explore.go (not the secret-blocked ytmusic.go), so its
-		// tracks are already clean. Drop the seed itself to avoid an instant repeat.
-		var tracks []api.Track
-		for _, t := range msg.tracks {
-			if t.ID != "" && t.ID != msg.seed {
-				tracks = append(tracks, t)
-			}
-		}
-		if len(tracks) == 0 {
-			m.hasCurrent = false
-			m.setError("auto-continue: nothing found")
-			return m, nil
-		}
-		start := len(m.queue)
-		added := m.appendNew(tracks)
-		if added == 0 {
-			m.hasCurrent = false
-			m.setError("auto-continue: nothing new found")
-			return m, nil
-		}
-		m.playAt(start)
-		m.setStatus(fmt.Sprintf("auto-continue: added %d tracks", added))
+		m.continueWith(msg.tracks, msg.seed)
 		// No nextTick here: the tick handler already re-arms the chain, and a
 		// second one would double every wakeup for the rest of the session.
 		return m, nil
@@ -1164,6 +1182,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "s":
 		m.shuffle = !m.shuffle
 		m.markConfigDirty()
+		m.shuffleNextID = ""
+		m.prefetchNext() // the upcoming track just changed: warm the new one
 		if m.shuffle {
 			m.setStatus("shuffle on")
 		} else {
@@ -2521,10 +2541,24 @@ func (m *model) playAt(idx int) {
 const prefetchAhead = 3
 
 // prefetchNext resolves the stream URLs of the next few tracks so upcoming Loads
-// are cache hits. Skipped under shuffle (unpredictable) and stops at the end of
-// the queue unless repeatAll will wrap.
+// are cache hits. Under shuffle it warms the pre-rolled pick instead; otherwise
+// it stops at the end of the queue unless repeatAll will wrap.
 func (m *model) prefetchNext() {
-	if m.player == nil || m.shuffle || len(m.queue) == 0 {
+	if m.player == nil || len(m.queue) == 0 {
+		return
+	}
+	if m.shuffle {
+		// Pre-roll the pick nextTrack will take, re-rolling one that has left the
+		// queue or is now the playing track.
+		if id := m.shuffleNextID; id == "" || (m.hasCurrent && id == m.current.ID) || m.queueIndexOf(id) < 0 {
+			m.shuffleNextID = ""
+			if i := m.nextShuffleIdx(); i >= 0 {
+				m.shuffleNextID = m.queue[i].ID
+			}
+		}
+		if m.shuffleNextID != "" {
+			m.player.Prefetch(m.shuffleNextID)
+		}
 		return
 	}
 	n := len(m.queue)
@@ -2575,7 +2609,7 @@ func (m *model) nextTrack() tea.Cmd {
 		next := (m.queuePos + 1) % len(m.queue)
 		if m.shuffle {
 			// -1 means "nothing else to pick": repeat-all on one track replays it.
-			if i := m.nextShuffleIdx(); i >= 0 {
+			if i := m.takeShuffleNext(); i >= 0 {
 				next = i
 			} else {
 				next = m.queuePos
@@ -2585,7 +2619,7 @@ func (m *model) nextTrack() tea.Cmd {
 	default:
 		next := -1
 		if m.shuffle {
-			next = m.nextShuffleIdx()
+			next = m.takeShuffleNext()
 		} else if m.queuePos+1 < len(m.queue) {
 			next = m.queuePos + 1
 		}
@@ -2613,6 +2647,20 @@ func superseded(err error) bool {
 func (m *model) currentAtQueuePos() bool {
 	return m.hasCurrent && m.queuePos >= 0 && m.queuePos < len(m.queue) &&
 		m.queue[m.queuePos].ID == m.current.ID
+}
+
+// takeShuffleNext consumes the pre-rolled shuffle pick (see prefetchNext) and
+// returns its queue index, or rolls a fresh one when the pick has left the queue
+// or is the playing track. -1 as for nextShuffleIdx.
+func (m *model) takeShuffleNext() int {
+	id := m.shuffleNextID
+	m.shuffleNextID = ""
+	if id != "" && (!m.hasCurrent || id != m.current.ID) {
+		if i := m.queueIndexOf(id); i >= 0 {
+			return i
+		}
+	}
+	return m.nextShuffleIdx()
 }
 
 // nextShuffleIdx picks a random queue index other than the one playing so
@@ -2645,6 +2693,14 @@ func (m *model) nextShuffleIdx() int {
 // the seed survives until the related tracks arrive.
 func (m *model) continueRadio() tea.Cmd {
 	seed := m.current.ID
+	// The batch was fetched while this track played: no network wait, and its
+	// first track's URL is already warm.
+	if m.aheadSeed == seed && len(m.aheadTracks) > 0 {
+		tracks := m.aheadTracks
+		m.aheadSeed, m.aheadTracks = "", nil
+		m.continueWith(tracks, seed)
+		return nil
+	}
 	m.setStatus("auto-continue: finding more…")
 	client := m.api
 	ctx := m.reqCtx("autocontinue")
@@ -2652,6 +2708,79 @@ func (m *model) continueRadio() tea.Cmd {
 		tracks, err := client.Related(ctx, seed)
 		return autoContinueMsg{tracks: tracks, seed: seed, err: err}
 	}
+}
+
+// continueWith queues an auto-continue batch fetched from seed and plays its
+// first new track.
+func (m *model) continueWith(batch []api.Track, seed string) {
+	// Related lives in explore.go (not the secret-blocked ytmusic.go), so its
+	// tracks are already clean. Drop the seed itself to avoid an instant repeat.
+	var tracks []api.Track
+	for _, t := range batch {
+		if t.ID != "" && t.ID != seed {
+			tracks = append(tracks, t)
+		}
+	}
+	if len(tracks) == 0 {
+		m.hasCurrent = false
+		m.setError("auto-continue: nothing found")
+		return
+	}
+	start := len(m.queue)
+	added := m.appendNew(tracks)
+	if added == 0 {
+		m.hasCurrent = false
+		m.setError("auto-continue: nothing new found")
+		return
+	}
+	m.playAt(start)
+	m.setStatus(fmt.Sprintf("auto-continue: added %d tracks", added))
+}
+
+// autoContinueAhead fetches the auto-continue batch while the queue's last
+// track is still playing, so running out of queue starts the next track from a
+// prefetched URL instead of waiting on Related and then yt-dlp. The batch is
+// held, not queued: anything the user queues before this track ends still
+// plays first. One fetch per seed; continueRadio consumes the result.
+func (m *model) autoContinueAhead() tea.Cmd {
+	if !m.cfg.AutoContinue || m.shuffle || m.repeat != repeatOff ||
+		!m.currentAtQueuePos() || m.queuePos != len(m.queue)-1 || m.aheadSeed == m.current.ID {
+		return nil
+	}
+	seed := m.current.ID
+	m.aheadSeed, m.aheadTracks = seed, nil
+	client := m.api
+	ctx := m.reqCtx("autoahead")
+	return func() tea.Msg {
+		tracks, err := client.Related(ctx, seed)
+		return autoAheadMsg{tracks: tracks, seed: seed, err: err}
+	}
+}
+
+// pollPlayer refreshes the player snapshot and reacts to its events: an mpv
+// respawn, a finished track, a load/playback failure. Runs on every tick and on
+// each playerEventMsg; every event is consumed once, so the two can't double up.
+func (m *model) pollPlayer() []tea.Cmd {
+	var cmds []tea.Cmd
+	// Handle an automatic mpv respawn before refreshing the snapshot: the
+	// stale snapshot still holds the pre-crash position needed to resume.
+	if m.player.Restarted() {
+		m.resumeAfterRestart()
+	}
+	m.playerState = m.player.State()
+	if m.player.TrackEnded() {
+		if c := m.nextTrack(); c != nil {
+			cmds = append(cmds, c)
+		}
+	}
+	// React to stream-load/playback failures: retry once with a fresh URL,
+	// then skip — playback must never silently stop mid-queue.
+	if e := m.player.LoadError(); e != "" {
+		if c := m.handlePlaybackFailure(e); c != nil {
+			cmds = append(cmds, c)
+		}
+	}
+	return cmds
 }
 
 // maxTrackRetries is how many times a failing track is reloaded (with a freshly
