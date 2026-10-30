@@ -2052,11 +2052,17 @@ func (m *model) playRandomGenre(seed string) tea.Cmd {
 	}
 }
 
-// startRadio fetches tracks related to the currently playing song; the result is
-// applied by startRadioQueue, which rebuilds the queue around that song.
+// startRadio fetches tracks related to the seed song; the result is applied by
+// startRadioQueue, which rebuilds the queue around that song. The seed is the
+// panel's selected song (cleared queue, played now) unless it is the one already
+// playing or nothing is selected — then it's the now-playing track.
 func (m *model) startRadio() tea.Cmd {
+	if t, ok := m.selectedTrack(); ok && m.focus == focusPanel && (!m.hasCurrent || t.ID != m.current.ID) {
+		m.replaceQueue([]api.Track{t}, 0)
+		m.markConfigDirty()
+	}
 	if !m.hasCurrent {
-		m.setError("nothing playing to start radio from")
+		m.setError("no song selected to start radio from")
 		return nil
 	}
 	id := m.current.ID

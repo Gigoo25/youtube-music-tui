@@ -1300,7 +1300,7 @@ var helpSections = []struct {
 		{"m", "mute / unmute"},
 		{"s", "toggle shuffle"},
 		{"r", "cycle repeat mode"},
-		{"R", "start radio from current track"},
+		{"R", "start radio from selected track (clears queue) or current"},
 		{"C", "auto-continue radio when the queue ends"},
 	}},
 	{"Queue & track", []helpBinding{
