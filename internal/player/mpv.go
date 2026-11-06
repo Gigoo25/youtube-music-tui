@@ -616,12 +616,15 @@ func extractURL(ctx context.Context, videoID string) (url string, resolved bool,
 		return "", false, errNoYtdlp
 	}
 
-	// Drop the `tv` client from yt-dlp's default client set: it adds ~0.5s of
-	// extraction latency and isn't needed for audio. The remaining default
-	// clients still resolve a bestaudio stream.
-	out, err := exec.CommandContext(ctx, ytdlp,
-		"--extractor-args", "youtube:player_client=default,-tv",
-		"-f", "bestaudio", "-g", ytURL).Output()
+	// Prefer the `visionos` client: its URLs play immediately at full quality
+	// (opus 251). yt-dlp's default TV clients (tv samsung, TVHTML5) return URLs
+	// that 403 until an `available_at` ~15s after resolve, so a cold play fails
+	// both the load and the fresh-URL retry. Fall back to the defaults (minus
+	// the slow `tv` client) only if visionos yields nothing.
+	out, err := ytdlpResolve(ctx, ytdlp, "visionos", ytURL)
+	if err != nil && ctx.Err() == nil {
+		out, err = ytdlpResolve(ctx, ytdlp, "default,-tv", ytURL)
+	}
 	if err != nil {
 		// Output() stashes stderr on ExitError; surface its tail so age-gated,
 		// geo-blocked and bot-check failures stay distinguishable in the UI.
@@ -638,6 +641,18 @@ func extractURL(ctx context.Context, videoID string) (url string, resolved bool,
 		return "", false, fmt.Errorf("yt-dlp returned no URL")
 	}
 	return url, true, nil
+}
+
+// ytdlpResolve runs yt-dlp with the given player clients and returns the
+// bestaudio stream URL output.
+func ytdlpResolve(ctx context.Context, ytdlp, clients, ytURL string) ([]byte, error) {
+	out, err := exec.CommandContext(ctx, ytdlp,
+		"--extractor-args", "youtube:player_client="+clients,
+		"-f", "bestaudio", "-g", ytURL).Output()
+	if err == nil && len(bytes.TrimSpace(out)) == 0 {
+		err = errors.New("yt-dlp returned no URL")
+	}
+	return out, err
 }
 
 // ytdlpReason condenses yt-dlp's stderr to its last non-empty line, capped so a
